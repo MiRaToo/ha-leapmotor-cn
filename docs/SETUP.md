@@ -1,7 +1,7 @@
 # 零跑汽车 → Home Assistant 接入指南
 
 > 把零跑(Leapmotor)汽车接进 HA:车况(GPS/电量/续航/胎压/门锁/充电/空调)+ 远程控制。
-> **不需要模拟器、不需要 root、不需要抓包** —— 在 HA 里输手机号 + 短信验证码即可。
+> **不需要模拟器、不需要 root** —— 在 HA 里输手机号 + 短信验证码即可。
 > 协议细节见 [PROTOCOL.md](PROTOCOL.md),开发者见 [DEVELOPMENT.md](DEVELOPMENT.md)。
 
 ## ⚠️ 第 0 步(必做):准备一个**子账号**
