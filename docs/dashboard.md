@@ -138,3 +138,75 @@ entities:
 > 想画"近 7 天电量曲线"直接用 `history-graph` 或 ApexCharts 选这几个实体即可。
 
 > 数据字段与信号表见 [PROTOCOL.md](PROTOCOL.md) §4 与 §5。
+
+
+## 行程记录(轨迹 + 每趟的数据)
+
+集成自己记录行程(原理与参数见 [trips.md](trips.md)),仪表盘上有两种看法:
+
+### 行程浏览卡片(推荐)
+
+```yaml
+type: custom:leapmotor-trips
+overlay_count: 5      # 可选: 叠加显示最近 5 段轨迹
+```
+
+左边是按天分组的行程列表(时间/时长/里程/能耗,补记与失联会标记),点一段就在右边地图上
+画出它的轨迹(起终点标记、断档虚线)与数据面板;支持"叠加最近 N 段"和两步确认删除。
+
+### 地图卡上的最近一段轨迹
+
+```yaml
+type: custom:leapmotor-map
+entity: device_tracker.ling_pao_c10_123456_che_liang_wei_zhi
+track_entity: sensor.ling_pao_c10_123456_xing_cheng_gui_ji   # 默认自动找, 可省
+```
+
+### 用 Jinja 自己拼一个"行程摘要"
+
+```yaml
+type: markdown
+title: 最近行程
+content: |
+  {% set a = state_attr('sensor.ling_pao_c10_123456_zui_jin_xing_cheng', '开始') %}
+  {% set b = state_attr('sensor.ling_pao_c10_123456_zui_jin_xing_cheng', '结束') %}
+  最近一段: {{ a }} → {{ b }}
+  里程 {{ states('sensor.ling_pao_c10_123456_zui_jin_xing_cheng') }} km,
+  耗电 {{ state_attr('sensor.ling_pao_c10_123456_zui_jin_xing_cheng', '耗电_kwh') }} kWh,
+  百公里 {{ state_attr('sensor.ling_pao_c10_123456_zui_jin_xing_cheng', '百公里能耗_kwh') }}
+
+  今日 {{ state_attr('sensor.ling_pao_c10_123456_xing_cheng_tong_ji', '今日') }}
+  近7天 {{ state_attr('sensor.ling_pao_c10_123456_xing_cheng_tong_ji', '近7天') }}
+```
+
+
+## App 风格控制卡(`custom:leapmotor-control`)
+
+集成自带一张"照着官方 App 主界面做"的控制卡:顶部车况(状态徽标 / 电量 / 续航 / 锁 / 更新时间;
+**增程车在总续航下方直接给出「纯电」「燃油」两个小胶囊**),中间是**车模**(点右下「胎压」按钮
+可在车模四角叠加四轮胎压,**按方位**显示、越界标黄/红),下面依次是四个圆钮(解锁·上锁 / 后备箱 /
+车窗 / 遮阳帘)、空调卡与位置卡、以及充电 / 座椅与加热 / 燃油(增程) / 行程 这几个**默认展开**的块。
+
+- **车窗**点圆钮后弹出一个**气泡**选四档(全开 / 微开 / 半开 / 关),点外部或选完自动收起;
+- **解锁、上锁、后备箱**都会**二次确认**;行驶中这些动作按钮禁用;
+- **位置卡**:在区域内显示区域名,不在任何区域时显示「**外出**」,并把驻车照片作为卡片背景
+  (照片只在泊车时拍一次, 上传晚的话集成会自动重试);
+- 空调卡用中文显示模式(制冷 / 制热 / 送风 / 除湿 / 自动 / 关),风扇图标即开关。
+
+```yaml
+type: custom:leapmotor-control
+# 只有一辆车时下面这些都可以省
+# device: <device_id 或该车任一实体 id>
+# name: 我的零跑
+# show: [hero, actions, climate, seats, charging, fuel, tires, trip, location]
+# compact: true          # 紧凑模式: 不显示胎压与行程
+# tire_range: [2.2, 2.6] # 胎压告警区间(bar), 留空则只显示数值
+# entities: {battery: sensor.xxx}   # 逐项手工覆盖
+```
+
+**它怎么认实体**:按"设备 + `translation_key`"—— 本集成所有实体都带稳定的机器键,所以卡片不怕
+改名/换语言;注册表读不到时会退化为按名字猜并在卡片顶部提示,也可以用 `entities` 手工指定。
+
+**多车型**:面板**按键解析到了没有显示** —— 纯电车不会出现"燃油"这一块,五座车不会出现二排/三排座椅,
+七座车的三排只显示加热(没有通风)。这正是集成后端"按能力位/车端信号决定实体是否存在"的延续:
+**后端是唯一判据,前端只做"有就画"**。

@@ -18,6 +18,12 @@ from homeassistant.config_entries import ConfigFlowResult
 
 from .api import LeapmotorClient, Session, new_device_id
 from .const import (
+    CONF_BATTERY_KWH,
+    CONF_LAUNCH_BOOST,
+    DEFAULT_BATTERY_KWH,
+    DEFAULT_LAUNCH_BOOST,
+    MAX_BATTERY_KWH,
+    MIN_BATTERY_KWH,
     CONF_DRIVING_POLL_SECONDS,
     DEFAULT_DRIVING_POLL_SECONDS,
     MIN_DRIVING_POLL_SECONDS,
@@ -42,7 +48,7 @@ SMS_TOO_OFTEN = 36        # 验证码发送频繁
 class LeapmotorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """手机号 + 验证码登录 → 换取车端 token → 建条目。"""
 
-    VERSION = 1
+    VERSION = 2      # v2: 行程记录(采样 6s / 停车 60s / 提速 / 电池容量)
 
     def __init__(self) -> None:
         self._phone = ""
@@ -240,15 +246,31 @@ class LeapmotorOptionsFlow(config_entries.OptionsFlow):
                         unit_of_measurement="秒",
                     )
                 ),
-                # 行驶中的轮询间隔(开车时位置/速度才有意义, 默认调快)
+                # 行程采样间隔: 行驶中的车况轮询(也是行程轨迹点的时间分辨率)。
+                # 官方 App 前台对同一个接口就是 6 秒一次, 所以默认 6s; 调大可省请求。
                 vol.Optional(
                     CONF_DRIVING_POLL_SECONDS,
                     default=opts.get(CONF_DRIVING_POLL_SECONDS, DEFAULT_DRIVING_POLL_SECONDS),
                 ): selector.NumberSelector(
                     selector.NumberSelectorConfig(
-                        min=MIN_DRIVING_POLL_SECONDS, max=600, step=10,
+                        min=MIN_DRIVING_POLL_SECONDS, max=300, step=1,
                         mode=selector.NumberSelectorMode.BOX,
                         unit_of_measurement="秒",
+                    )
+                ),
+                vol.Optional(
+                    CONF_LAUNCH_BOOST,
+                    default=opts.get(CONF_LAUNCH_BOOST, DEFAULT_LAUNCH_BOOST),
+                ): selector.BooleanSelector(),
+                # 电池可用容量: 只用于把 ΔSOC 折算成 kWh(行程耗电/能耗)
+                vol.Optional(
+                    CONF_BATTERY_KWH,
+                    default=opts.get(CONF_BATTERY_KWH, DEFAULT_BATTERY_KWH),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=MIN_BATTERY_KWH, max=MAX_BATTERY_KWH, step=0.1,
+                        mode=selector.NumberSelectorMode.BOX,
+                        unit_of_measurement="kWh",
                     )
                 ),
             }),

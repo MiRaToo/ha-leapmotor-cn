@@ -18,8 +18,11 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import (
     CarState,
     EP_VEHICLE_LIST,
+    choose_poll_seconds,
     command_failed,
+    is_reev,
     is_auth_error,
+    is_rate_limited,
     is_signature_error,
     LeapmotorClient,
     pick_poll_seconds,
@@ -28,6 +31,15 @@ from .api import (
     Vehicle,
 )
 from .const import (
+    CONF_BATTERY_KWH,
+    CONF_LAUNCH_BOOST,
+    DEFAULT_BATTERY_KWH,
+    DEFAULT_LAUNCH_BOOST,
+    HEAVY_REFRESH_SECONDS,
+    LAUNCH_BOOST_MAX_SECONDS,
+    PHOTO_RETRY_EVERY_SECONDS,
+    PHOTO_RETRY_WINDOW_SECONDS,
+    RATE_LIMIT_COOLDOWN_SECONDS,
     CONF_DRIVING_POLL_SECONDS,
     DEFAULT_DRIVING_POLL_SECONDS,
     MIN_DRIVING_POLL_SECONDS,
@@ -65,6 +77,10 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             k: v for k, v in entry.data.items() if k in Session.__dataclass_fields__
         })
         self.session.seal_key()          # 老条目也能补出密钥
+        # ⚠️ `_apply_options()` 会读 `self.trips`(行程记录器的电池容量), 所以这些字段
+        #    必须在它**之前**初始化 —— 这个顺序踩过坑: 曾经把它放在下面, 结果 `__init__`
+        #    第 79 行一调用就 AttributeError, 整个集成 setup_error。
+        self.trips = None                # 行程记录器(见 trips.py, 由 __init__.py 挂上)
         self._apply_options()
         self.client = LeapmotorClient(self.session)
         self.vin: str = entry.data.get("vin") or self.session.car_vin
@@ -78,7 +94,27 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.car_state_problem: str = ""
         self._last_renew = 0.0
         self._expiry_warned = False             # 只提醒一次(重新登录后复位)
-        self._last_heavy = 0.0                  # 上次拉"不常变"数据(配置/里程/能耗/照片)的时刻
+        self._plug_energy = {}                   # 增程车的电耗/油耗(见 _refresh_heavy)
+        self._last_heavy = 0.0                  # 上次拉"不常变"数据(配置/里程/能耗)的时刻
+        # ── 驻车照片(只在泊车时拍一次, 之后请求拿回同一张)──
+        self._photo_upload_ms = 0               # 上次取到的照片上传时刻(判"有没有新照片")
+        self._photo_odo = None                  # 上次取照片时的总里程(变了说明又动过车)
+        self._photo_retry_until = 0.0           # 迟到重试窗口的截止时刻
+        self._photo_last_try = 0.0              # 上次尝试取照片的时刻
+        self._photo_pending = False             # True = 地址有了但还没换成新照片(上传中)
+        self._photo_force = False               # 「刷新车况」按钮强制重取一次
+        # ── 轮询档位 ──
+        self._rate_limited_until = 0.0          # 限流/风控冷却截止时刻
+        self._launch_boost_until = 0.0          # 出发提速(解锁/上电/非P)的截止时刻
+        self._launch_hint_prev = False
+        self._prev_vehicle_state = None
+        # 首轮刷新只拉车况帧(见 __init__.py 的 async_setup_entry):
+        # 启动时别把里程/能耗/照片那 5~6 个请求也串起来 —— 网络慢的时候，每个请求最多等
+        # 20 秒超时，实测把 HA 启动拖了 4 分钟(bootstrap 连续 4 条 "Waiting for integrations")。
+        self.light_first_refresh = False
+        # 上一轮轮询实际花了多久(诊断用: 请求本身只要 0.2 秒, 若这里显示几十秒,
+        # 说明时间耗在 HA 的线程池排队上, 不是云端慢 —— 见「会话状态」传感器)。
+        self.last_cycle_seconds = 0.0
         # 命令后的临时状态: 车端上报新 collectTime 前, 实体以本地值为准
         self.overrides = StateOverrides()
         self._last_resp: dict | None = None     # 出问题那一次的原始响应(判会话失效)
@@ -89,6 +125,11 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     def _apply_options(self) -> None:
+        # 行程记录: 电池可用容量会影响耗电/能耗的折算, 选项一改就跟着改。
+        # 用 getattr 兜底 —— 这个函数在 __init__ 早期就会被调用, 属性顺序不该成为地雷。
+        if getattr(self, "trips", None) is not None:
+            self.trips.set_capacity(float(
+                self.entry.options.get(CONF_BATTERY_KWH) or DEFAULT_BATTERY_KWH))
         self.session.operate_pwd = str(self.entry.options.get(CONF_OPERATE_PWD) or "")
         self.session.operate_pwd_mode = str(
             self.entry.options.get(CONF_OPERATE_PWD_MODE) or DEFAULT_PWD_MODE
@@ -105,19 +146,28 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
           `session_problem` 里 —— 实体不该因为一次轮询失败就全部变 unavailable
         """
         self._apply_options()
+        t0 = time.monotonic()
         try:
-            return await self._collect()
-        except ConfigEntryAuthFailed:
-            raise
-        except Exception as err:  # noqa: BLE001
-            if is_auth_error(getattr(self, "_last_resp", None)):
-                self.session_problem = "账号会话已过期, 需要重新登录(发送短信验证码即可)"
-                raise ConfigEntryAuthFailed(self.session_problem) from err
-            self.session_problem = f"本轮刷新失败: {str(err)[:160]}"
-            if self.data:
-                log.warning("轮询失败, 沿用上一份数据: %s", err)
-                return {**self.data, "session_problem": self.session_problem}
-            raise UpdateFailed(str(err)) from err
+            try:
+                result = await self._collect()
+            except ConfigEntryAuthFailed:
+                raise
+            except Exception as err:  # noqa: BLE001
+                if is_auth_error(getattr(self, "_last_resp", None)):
+                    self.session_problem = "账号会话已过期, 需要重新登录(发送短信验证码即可)"
+                    raise ConfigEntryAuthFailed(self.session_problem) from err
+                self.session_problem = f"本轮刷新失败: {str(err)[:160]}"
+                if self.data:
+                    log.warning("轮询失败, 沿用上一份数据: %s", err)
+                    return {**self.data, "session_problem": self.session_problem}
+                raise UpdateFailed(str(err)) from err
+        finally:
+            # 诊断用: 请求本身约 0.2 秒; 这里常年几十秒说明慢在 HA 线程池排队
+            self.last_cycle_seconds = time.monotonic() - t0
+            if self.last_cycle_seconds > 60:
+                log.warning("本轮轮询耗时 %.0f 秒(请求本身约 0.2 秒; 多半是 HA 线程池排队)",
+                            self.last_cycle_seconds)
+        return result
 
     async def _collect(self, account_retried: bool = False) -> dict[str, Any]:
         self._last_resp = None
@@ -180,13 +230,99 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.session_problem = ""
         self.car_state_problem = ""
         self._last_renew = 0.0
-        await self._refresh_car_data()
-        self._adapt_poll_interval()
+        await self._refresh_car_data()      # 内部会重算轮询档位
         return self._build_result()
 
     async def _refresh_car_data(self) -> None:
-        """拉车端数据(配置/里程/能耗/照片/车况)。全部走**车端 token**, 与账号会话无关。"""
+        """拉车端数据。**车况帧是唯一每轮都拉的请求**, 其余按需。
+
+        取数策略(依据: 官方 App 6 秒轮询的只有车况接口, 里程/能耗/车图都是"进页面才拉"):
+          * **车况帧**: 行驶 6s / 停车 60s / 出发提速 6s(见 `_adapt_poll_interval`)——
+            行程记录的唯一必需请求
+          * **里程 / 能耗 / 配置**: 行驶中一律跳过; 停车时每 >= `HEAVY_REFRESH_SECONDS` 拉一次
+          * **驻车照片**: 只在"启动首次 / 新泊车事件 / 总里程较上次取照片时已变化 / 手动刷新"时拉
+            —— 照片只在泊车那一刻拍一次并异步上传, 重复请求只会拿回同一张;
+            用响应里的 `uploadTime` 判断**是否真的换了新照片**(见 `client.chassis_info`),
+            没换就在窗口期内重试几次, 仍没有则标记「待补」交给下一个重数据周期。
+        """
         await self._warn_before_expiry()
+        now = time.time()
+
+        # ── 车况帧(每轮必拉)──
+        #
+        # 两个坑(2026-09-27 深夜实测踩到):
+        #   1. `get_car_state` 对"被服务端拒收/没有 signalMap"的响应**不抛异常**,
+        #      而是回一个**空 CarState** —— 直接赋值会把好数据覆盖成一片 null
+        #      (表现为: 电量/续航/位置全变 unknown, 日志里却什么都没有)。
+        #   2. 刚重新交换过车端 token 的头一次请求最容易被拒(`302010205` 一族)。
+        # 所以: 空结果要重试一次(必要时换 token), 两次都拿不到就**沿用上一份**, 并把
+        # 原因写进 `car_state_problem`(会出现在「会话状态」传感器上, 不再静默)。
+        state = None
+        why = "未知原因"
+        for attempt in (1, 2):
+            try:
+                state = await self.hass.async_add_executor_job(
+                    self.client.get_car_state, self.vin)
+            except Exception as err:  # noqa: BLE001
+                state, why = None, f"{type(err).__name__}: {err}"
+            else:
+                if state is not None and state.raw:
+                    break
+                code = getattr(state, "resp_code", None)
+                why = f"响应里没有 signalMap(code={code})"
+                if is_rate_limited({"code": code}):
+                    self._enter_rate_limit("车况接口返回风控/限流提示")
+                    break
+            if attempt == 1:
+                log.warning("车况拉取为空(%s), 换一次车端 token 后重试", why)
+                try:
+                    if await self.hass.async_add_executor_job(
+                            functools.partial(self._renew_if_needed, force=True)):
+                        self._persist()
+                except Exception as err:  # noqa: BLE001
+                    log.warning("重试前换 token 异常: %s", err)
+        if state is not None and state.raw:
+            self.state = state
+            self.car_state_problem = ""
+        else:
+            self.car_state_problem = f"车况未取到({why})"
+            log.warning("本轮没取到车况, 沿用上一份数据: %s", why)
+
+        # ── 新泊车事件 → 打开照片重试窗口(照片此刻刚拍, 可能还没上传完)──
+        cur_state = self.state.vehicle_state if self.state else None
+        if self._prev_vehicle_state == "driving" and cur_state == "parked":
+            self._photo_retry_until = now + PHOTO_RETRY_WINDOW_SECONDS
+            self._photo_pending = True
+            log.debug("检测到新泊车事件 -> 打开驻车照片重试窗口(%ds)", PHOTO_RETRY_WINDOW_SECONDS)
+        if cur_state:
+            self._prev_vehicle_state = cur_state
+
+        # ── 重数据(里程/能耗/配置): 行驶中跳过, 停车时每 >=600s ──
+        #    (轻量首轮刷新期间一律跳过 —— 见 light_first_refresh 的说明)
+        driving = bool(self.state and (
+            self.state.vehicle_state == "driving" or (self.state.get("speed") or 0) > 0))
+        if not self.light_first_refresh:
+            if self._last_heavy == 0.0 or (not driving
+                                          and now - self._last_heavy >= HEAVY_REFRESH_SECONDS):
+                self._last_heavy = now
+                await self._refresh_heavy()
+
+            # ── 驻车照片(按需 + 迟到兜底)──
+            if self._photo_due(self.state, now):
+                await self._refresh_photo(self.state, now)
+
+        # ── 行程记录: 把这一帧喂给记录器(状态机/记账/轨迹都在里面)──
+        if self.trips is not None and self.state is not None:
+            try:
+                self.trips.process(self.state, now=now)
+            except Exception as err:  # noqa: BLE001
+                log.warning("行程记录处理异常: %s", err)
+
+        # ── 轮询档位: 每轮都要重算(以前只在首轮算, 导致"行驶中提速"从未生效)──
+        self._adapt_poll_interval()
+
+    async def _refresh_heavy(self) -> None:
+        """里程 / 能耗 / 配置 —— 变化慢, 只按需拉(见 `_refresh_car_data` 的说明)。"""
         config: dict[str, Any] = {}
         charge_plan: dict[str, Any] = {}
         try:
@@ -197,6 +333,13 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             log.debug("获取车辆配置失败: %s", err)
         self._config = config
         self._charge_plan = charge_plan
+        # 增程车: 顺带拉一次"电耗/油耗"(纯电车这接口没意义, 不请求)
+        if is_reev(self.state.signals if self.state is not None else {}):
+            try:
+                r = await self.hass.async_add_executor_job(self.client.get_plug_energy, self.vin)
+                self._plug_energy = (r.get("data") or {}) if isinstance(r, dict) else {}
+            except Exception as err:  # noqa: BLE001
+                log.debug("获取增程能耗(电耗/油耗)失败: %s", err)
         mileage: dict[str, Any] = {}
         energy: dict[str, Any] = {}
         try:
@@ -216,46 +359,69 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             log.debug("获取近 7 天里程失败: %s", err)
         self._mileage = mileage
         self._energy = energy
+
+    def _photo_due(self, st, now: float) -> bool:
+        """现在该不该去取驻车照片(按需, 不是每轮)。"""
+        if self._photo_force:
+            return True
+        if not self.parking_url:
+            return True                                   # 启动后还没拿到过
+        if now < self._photo_retry_until and now - self._photo_last_try >= PHOTO_RETRY_EVERY_SECONDS:
+            return True                                   # 新照片可能还在上传 -> 窗口内重试
+        odo = st.get("odometer") if st is not None else None
+        if odo is not None and self._photo_odo is not None and odo != self._photo_odo:
+            return True                                   # 车又动过 -> 可能拍了新照片
+        return False
+
+    async def _refresh_photo(self, st, now: float) -> None:
+        """取驻车照片。以 `uploadTime` 判断是否换了新照片 —— 这是"迟到兜底"的核心。"""
+        self._photo_last_try = now
+        self._photo_force = False
         try:
-            r = await self.hass.async_add_executor_job(self.client.get_chassis_picture, self.vin)
-            self.parking_url = ((r.get("data") or {}) if isinstance(r, dict) else {}).get("fileUrl") or ""
+            info = await self.hass.async_add_executor_job(self.client.chassis_info, self.vin)
         except Exception as err:  # noqa: BLE001
             log.debug("获取驻车照片失败: %s", err)
-        # 车况: GPS / 电量 / 续航 / 四轮胎压 / 门窗 / 充电 / 空调 —— 见 api.SIGNAL_IDS
-        #
-        # ⚠️ 两个坑(2026-09-27 深夜实测踩到):
-        #   1. `get_car_state` 对"被服务端拒收/没有 signalMap"的响应**不抛异常**,
-        #      而是回一个**空 CarState** —— 直接赋值会把好数据覆盖成一片 null
-        #      (表现为: 电量/续航/位置全变 unknown, 日志里却什么都没有)。
-        #   2. 刚重新交换过车端 token 的头一次请求最容易被拒(`302010205` 一族)。
-        # 所以: 空结果要重试一次(必要时换 token), 两次都拿不到就**沿用上一份**, 并把
-        # 原因写进 `car_state_problem`(会出现在「会话状态」传感器上, 不再静默)。
-        state = None
-        why = "未知原因"
-        for attempt in (1, 2):
-            try:
-                state = await self.hass.async_add_executor_job(
-                    self.client.get_car_state, self.vin)
-            except Exception as err:  # noqa: BLE001
-                state, why = None, f"{type(err).__name__}: {err}"
+            return
+        if is_rate_limited(info.get("raw") if isinstance(info, dict) else None):
+            self._enter_rate_limit("驻车照片接口返回风控/限流提示")
+            return
+        url = str(info.get("url") or "")
+        upload = int(info.get("upload_time_ms") or 0)
+        if url:
+            self.parking_url = url
+            if upload > self._photo_upload_ms:
+                if self._photo_upload_ms:
+                    log.debug("驻车照片已更新(uploadTime %s -> %s)", self._photo_upload_ms, upload)
+                self._photo_upload_ms = upload
+                self._photo_pending = False
+                self._photo_retry_until = 0.0
             else:
-                if state is not None and state.raw:
-                    break
-                why = "响应里没有 signalMap(车端 token 刚轮换时常被拒)"
-            if attempt == 1:
-                log.warning("车况拉取为空(%s), 换一次车端 token 后重试", why)
-                try:
-                    if await self.hass.async_add_executor_job(
-                            functools.partial(self._renew_if_needed, force=True)):
-                        self._persist()
-                except Exception as err:  # noqa: BLE001
-                    log.warning("重试前换 token 异常: %s", err)
-        if state is not None and state.raw:
-            self.state = state
-            self.car_state_problem = ""
+                # 地址有了, 但内容还是上一张 -> 车端可能还在上传
+                self._photo_pending = True
+                if now >= self._photo_retry_until:
+                    self._photo_retry_until = now + PHOTO_RETRY_WINDOW_SECONDS
         else:
-            self.car_state_problem = f"车况未取到({why})"
-            log.warning("本轮没取到车况, 沿用上一份数据: %s", why)
+            log.debug("驻车照片地址为空(车端可能还没上传完)")
+            self._photo_pending = True
+            if now >= self._photo_retry_until:
+                self._photo_retry_until = now + PHOTO_RETRY_WINDOW_SECONDS
+        if st is not None:
+            self._photo_odo = st.get("odometer")
+
+    def force_photo_refresh(self) -> None:
+        """「刷新车况」按钮: 强制重取一次照片与重数据(不管节流)。"""
+        self._photo_force = True
+        self._last_heavy = 0.0
+
+    def _enter_rate_limit(self, why: str) -> None:
+        """命中限流/风控 -> 退避一段时间(期间用慢档), 并写在诊断属性里。"""
+        now = time.time()
+        if now < self._rate_limited_until:
+            return
+        self._rate_limited_until = now + RATE_LIMIT_COOLDOWN_SECONDS
+        self.car_state_problem = (f"疑似被限流/风控, 已退避 "
+                                  f"{RATE_LIMIT_COOLDOWN_SECONDS // 60} 分钟({why})")
+        log.warning("疑似被限流/风控 -> 轮询退避 %d 秒: %s", RATE_LIMIT_COOLDOWN_SECONDS, why)
 
     def _build_result(self) -> dict[str, Any]:
         return {
@@ -264,32 +430,59 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "charge_plan": getattr(self, "_charge_plan", {}) or {},
             "mileage": getattr(self, "_mileage", {}) or {},
             "energy": getattr(self, "_energy", {}) or {},
+            "plug_energy": getattr(self, "_plug_energy", {}) or {},
             "state": self.state,
             "parking_url": self.parking_url,
             "last_result": self.last_result,
             "session_problem": self.session_problem,
             "car_state_problem": self.car_state_problem,
+            # 诊断: 每轮实际耗时(请求本身约 0.2s; 常年几十秒说明慢在 HA 线程池排队)
+            "cycle_seconds": round(self.last_cycle_seconds, 1),
         }
 
     def _adapt_poll_interval(self) -> None:
-        """按车辆状态切换轮询间隔: **行驶中快、停车慢**。
+        """四档轮询: 行驶 6s / 出发提速 6s / 限流退避 / 停车 60s。
 
-        参考 EU 版的双档轮询(它按"已锁+已驻车+未充电"判定安静后放慢)。这里:
-          * 行驶中(车辆状态=driving 或车速>0) → `driving_poll_seconds`(默认 60s)
-          * 其它(停车/充电/未锁) → `poll_seconds`(用户配置, 默认 300s)
+        决策逻辑在 `api.choose_poll_seconds`(纯函数, 有单测)。这里只负责算两个输入:
+          * `driving`: 车辆状态=driving 或车速>0
+          * `launch_boost`: 停车但**解锁 / 上电(ready) / 挡位非 P** —— 说明可能要出发了;
+            等价 EU 版 mate 的 PARKED_ALERT。为避免"解锁后一直不开车"长期高频, 提速最长
+            `LAUNCH_BOOST_MAX_SECONDS`(10 分钟), 且只在**刚出现**这个迹象时重新计时。
 
-        停车时**不停止轮询**: 车端休眠时本来就不上报, 停轮询只会让"车又动了"发现不了。
+        注意: 这个函数以前只在"首轮"被调用(被 `_collect` 的提前返回绕过), 导致"行驶中提速"
+        实际从未生效 —— 现在它在每轮 `_refresh_car_data()` 末尾都会跑。
         """
-        poll = int(self.entry.options.get(CONF_POLL_SECONDS) or DEFAULT_POLL_SECONDS)
-        fast = int(self.entry.options.get(CONF_DRIVING_POLL_SECONDS)
-                   or DEFAULT_DRIVING_POLL_SECONDS)
+        now = time.time()
+        opts = self.entry.options
+        parked = int(opts.get(CONF_POLL_SECONDS) or DEFAULT_POLL_SECONDS)
+        trip = int(opts.get(CONF_DRIVING_POLL_SECONDS) or DEFAULT_DRIVING_POLL_SECONDS)
+        boost_on = bool(opts.get(CONF_LAUNCH_BOOST, DEFAULT_LAUNCH_BOOST))
         st = self.state
         driving = bool(st and (st.vehicle_state == "driving" or (st.get("speed") or 0) > 0))
-        target = pick_poll_seconds(poll, fast, driving)
+
+        launch_hint = False
+        if boost_on and st is not None and not driving:
+            gear = st.get("gear")
+            gear_hint = gear is not None and gear not in (0, 2)
+            launch_hint = bool(st.locked is False or st.flag("ready") or gear_hint)
+        if launch_hint and not self._launch_hint_prev:
+            self._launch_boost_until = now + LAUNCH_BOOST_MAX_SECONDS
+            log.debug("可能要出发(解锁/上电/非 P) -> %d 秒内按行程采样间隔轮询",
+                      LAUNCH_BOOST_MAX_SECONDS)
+        if not boost_on:
+            self._launch_boost_until = 0.0
+        self._launch_hint_prev = launch_hint
+        boost_active = launch_hint and now < self._launch_boost_until
+        rate_limited = now < self._rate_limited_until
+
+        target = choose_poll_seconds(parked=parked, trip=trip, driving=driving,
+                                     launch_boost=boost_active, rate_limited=rate_limited)
         want = timedelta_seconds(target)
         if self.update_interval != want:
             self.update_interval = want
-            log.debug("轮询间隔 → %s 秒(%s)", target, "行驶中" if driving else "停车/其它")
+            why = ("限流退避" if rate_limited else "行驶中" if driving
+                   else "出发提速" if boost_active else "停车/充电")
+            log.debug("轮询间隔 -> %s 秒(%s)", target, why)
 
     def remember(self, key: str, value: Any) -> None:
         """命令成功后记下"我认为它现在是什么状态"(车端一上报新数据就自动失效)。"""

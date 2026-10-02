@@ -3,7 +3,8 @@
 架构: 纯 HTTP(不需要 MQTT、不需要附加组件)。
   config_flow 里: 手机号 + 短信验证码 → 车端交换 → 本地派生签名密钥
   coordinator: 轮询车辆信息, 车端 token 快过期时用账号 token 自动续期
-  www/: 自带一张「零跑车辆地图」卡片(高德底图, 见 docs/dashboard.md)
+  www/: 自带三张卡片 —— 「零跑车辆地图」(高德底图)、「零跑·行程浏览」(行程+轨迹)
+        与「零跑·车辆控制」(App 风格主界面), 见 docs/dashboard.md
 """
 
 from __future__ import annotations
@@ -15,32 +16,73 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
-from .const import DOMAIN, PLATFORMS
+from .const import DOMAIN, DEFAULT_POLL_SECONDS, PLATFORMS
 from .coordinator import LeapmotorCoordinator
 
 log = logging.getLogger(__name__)
 
-# 前端模块: 把 www/leapmotor-map.js 注册成全局卡片(用户无需手动放 www/ 或配资源)
-_CARD_FILE = "leapmotor-map.js"
-_CARD_URL = "/leapmotor-card/leapmotor-map.js"
-CARD_VERSION = "1.4.1"
+# 前端模块: 把 www/ 下的三张卡片注册成全局卡片(用户无需手动放 www/ 或配资源)。
+# CARD_VERSION 与各自 JS 文件头里的同名常量保持一致(改 JS 记得一起升, 好让浏览器拿到新文件)。
+CARD_VERSION = "1.5.0"            # leapmotor-map.js
+TRIPS_CARD_VERSION = "1.0.2"      # leapmotor-trips.js
+CONTROL_CARD_VERSION = "1.3.0"    # leapmotor-control.js
+_CARDS = (
+    ("leapmotor-map.js", "/leapmotor-card/leapmotor-map.js", CARD_VERSION),
+    ("leapmotor-trips.js", "/leapmotor-card/leapmotor-trips.js", TRIPS_CARD_VERSION),
+    ("leapmotor-control.js", "/leapmotor-card/leapmotor-control.js", CONTROL_CARD_VERSION),
+)
+_FRONTEND_KEY = "_frontend_registered"
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """配置条目迁移。
+
+    v1 → v2(行程记录): 轮询默认值改了语义 —— 停车 300→60 秒、行驶 60→6 秒,
+    并新增「出发提速」与「电池可用容量」。老条目里存的是旧默认值, 这里显式换成新默认,
+    免得升级后仍停在"停车 300 秒"(那样行程起点会晚最多 5 分钟才被发现)。
+    """
+    if entry.version >= 2:
+        return True
+    new = dict(entry.options)
+    from .const import (CONF_BATTERY_KWH, CONF_DRIVING_POLL_SECONDS, CONF_LAUNCH_BOOST,
+                        CONF_POLL_SECONDS, DEFAULT_BATTERY_KWH, DEFAULT_DRIVING_POLL_SECONDS,
+                        DEFAULT_LAUNCH_BOOST, DEFAULT_POLL_SECONDS)
+    if int(new.get(CONF_POLL_SECONDS) or 0) in (0, 300):
+        new[CONF_POLL_SECONDS] = DEFAULT_POLL_SECONDS
+    if int(new.get(CONF_DRIVING_POLL_SECONDS) or 0) in (0, 60):
+        new[CONF_DRIVING_POLL_SECONDS] = DEFAULT_DRIVING_POLL_SECONDS
+    new.setdefault(CONF_LAUNCH_BOOST, DEFAULT_LAUNCH_BOOST)
+    new.setdefault(CONF_BATTERY_KWH, DEFAULT_BATTERY_KWH)
+    hass.config_entries.async_update_entry(entry, options=new, version=2)
+    log.info("配置条目已迁移到 v2: 停车 %ss / 行程采样 %ss / 出发提速 %s",
+             new.get(CONF_POLL_SECONDS), new.get(CONF_DRIVING_POLL_SECONDS),
+             new.get(CONF_LAUNCH_BOOST))
+    return True
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
-    """注册自带的前端卡片。失败不影响集成本体。"""
+    """注册自带的前端卡片(幂等: 重复 setup 不会重复注册静态路径/资源)。失败不影响集成本体。"""
+    data = hass.data.setdefault(DOMAIN, {})
+    if data.get(_FRONTEND_KEY):
+        return True
+    # 先置位再注册: 静态路径重复注册在有些 HA 版本会直接抛错, 宁可失败后等下个版本修
+    data[_FRONTEND_KEY] = True
     try:
         from homeassistant.components.frontend import add_extra_js_url
         from homeassistant.components.http import StaticPathConfig
 
-        path = Path(__file__).parent / "www" / _CARD_FILE
+        base = Path(__file__).parent / "www"
         await hass.http.async_register_static_paths(
-            [StaticPathConfig(_CARD_URL, str(path), cache_headers=False)]
+            [StaticPathConfig(url, str(base / name), cache_headers=False)
+             for name, url, _ver in _CARDS]
         )
-        add_extra_js_url(hass, f"{_CARD_URL}?v={CARD_VERSION}")
-        await _ensure_lovelace_resource(hass, f"{_CARD_URL}?v={CARD_VERSION}")
-        log.debug("已注册地图卡片 %s", _CARD_URL)
+        for _name, url, ver in _CARDS:
+            versioned = f"{url}?v={ver}"
+            add_extra_js_url(hass, versioned)
+            await _ensure_lovelace_resource(hass, versioned)
+            log.debug("已注册卡片 %s", url)
     except Exception as err:  # noqa: BLE001
-        log.warning("地图卡片注册失败(不影响控车): %s", err)
+        log.warning("前端卡片注册失败(不影响控车): %s", err)
     return True
 
 
@@ -75,17 +117,48 @@ async def _ensure_lovelace_resource(hass: HomeAssistant, url: str) -> None:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = LeapmotorCoordinator(hass, entry)
+    # 首轮只拉车况帧: 里程/能耗/配置/照片留到下一个轮询周期。
+    # 实测教训: 网络慢时首轮那 10 来个请求(车况 + 换 token 重试 + 4 个重数据 + 照片)
+    # 每个都可能等满 20 秒超时, 把 HA 启动拖了 4 分钟; 而启动其实只需要"车况能用"。
+    coordinator.light_first_refresh = True
     try:
         await coordinator.async_config_entry_first_refresh()
     except ConfigEntryAuthFailed:
         raise
     except Exception as err:  # noqa: BLE001
         raise ConfigEntryNotReady(str(err)) from err
+    finally:
+        coordinator.light_first_refresh = False
+
+    # ── 行程记录器 ──
+    # 数据全部来自轮询帧(云端没有逐条行程接口, 见 trips.py 的模块说明);
+    # 挂在协调器上, 每轮 `_refresh_car_data()` 结束时喂一帧。
+    from .const import CONF_BATTERY_KWH, DEFAULT_BATTERY_KWH
+    from .trips import TripRecorder
+    recorder = TripRecorder(
+        hass, coordinator.vin,
+        capacity_kwh=float(entry.options.get(CONF_BATTERY_KWH) or DEFAULT_BATTERY_KWH),
+        poll_seconds_getter=lambda: (
+            int(coordinator.update_interval.total_seconds())
+            if coordinator.update_interval else DEFAULT_POLL_SECONDS),
+    )
+    await recorder.async_load()
+    coordinator.trips = recorder
+    _register_ws_api(hass)
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
+
+
+def _register_ws_api(hass: HomeAssistant) -> None:
+    """注册给前端卡片用的 WebSocket 命令(幂等)。"""
+    try:
+        from .ws_api import async_register as _reg
+        _reg(hass)
+    except Exception as err:  # noqa: BLE001
+        log.warning("注册行程 WebSocket 命令失败(卡片会退化成只读属性): %s", err)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

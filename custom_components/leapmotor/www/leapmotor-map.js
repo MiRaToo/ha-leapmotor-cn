@@ -29,6 +29,14 @@
  *   height: 320         # 卡片高度 px
  *   satellite: true     # 用卫星底图(默认用路网图)
  *   follow: true        # 车动了自动跟随居中(默认 true; 手动拖动后自动关闭)
+ *   track_entity: sensor.…_xing_cheng_gui_ji   # 最近一段行程的轨迹(默认自动找)
+ *
+ * 最近一段行程的轨迹
+ * ------------------
+ * `sensor.*_xing_cheng_gui_ji`(行程轨迹)的属性里放着最近一段行程抽稀后的轨迹点(WGS-84),
+ * 卡片把它画成一条蓝色折线; 相邻两点距离 > 2 km 的地方判为断档(中间丢过采样), 用虚线连。
+ * 默认自动找这个实体(匹配 `xing_cheng_gui_ji`), 也可以用 `track_entity` 显式指定;
+ * 找不到就不画, 不打扰。
  *
  * 这个文件由集成自动注册为前端模块(见 custom_components/leapmotor/__init__.py),
  * 用户不需要把它拷到 www/ 或手配资源。
@@ -98,7 +106,10 @@ const TILE_SOURCES = {
 /* 高德连不上时回落到 OSM(海外用户/高德故障时至少还能看图) */
 const TILE_FALLBACK = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 
-const CARD_VERSION = "1.4.1";
+/* 轨迹折线的断档阈值(km): 相邻两点距离超过它 → 中间丢过采样, 用虚线连 */
+const TRACK_GAP_KM = 2;
+
+const CARD_VERSION = "1.5.0";
 
 /** 经纬度 → 世界像素坐标(标准 Web 墨卡托, 与高德/OSM 一致)。 */
 function project(lat, lon, zoom) {
@@ -129,6 +140,34 @@ function pickTracker(hass) {
   return cand[0] || "";
 }
 
+/** 自动找"最近行程轨迹"实体: 集成的传感器实体 id 里带 `xing_cheng_gui_ji`(行程轨迹)。 */
+function pickTrackEntity(hass) {
+  if (!hass || !hass.states) return "";
+  const ids = Object.keys(hass.states).filter(
+    (e) => e.startsWith("sensor.") && /xing_cheng_gui_ji/.test(e)
+  );
+  if (ids.length) return ids[0];
+  // 兜底: 谁带 points/trip_id 属性就当轨迹(用户改过实体 id 的场合)
+  for (const e of Object.keys(hass.states)) {
+    if (!e.startsWith("sensor.")) continue;
+    const a = hass.states[e].attributes || {};
+    if (Array.isArray(a.points) && a.trip_id !== undefined) return e;
+  }
+  return "";
+}
+
+/** 两点球面距离(km) —— 判断轨迹是否断档用。 */
+function haversineKm(a, b) {
+  const r = 6371.0088;
+  const p1 = (a[0] * Math.PI) / 180;
+  const p2 = (b[0] * Math.PI) / 180;
+  const dp = p2 - p1;
+  const dl = ((b[1] - a[1]) * Math.PI) / 180;
+  const s = Math.sin(dp / 2) * Math.sin(dp / 2) +
+    Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) * Math.sin(dl / 2);
+  return 2 * r * Math.asin(Math.min(1, Math.sqrt(s)));
+}
+
 function clamp(v, lo, hi) {
   return Math.min(hi, Math.max(lo, v));
 }
@@ -143,6 +182,7 @@ class LeapmotorMapCard extends HTMLElement {
     this._dragging = false;
     this._tiles = new Map();  // "z/x/y" → <img>
     this._marker = null;
+    this._trackPts = null;    // 最近一段行程的轨迹(显示坐标 [lat, lon] 数组)
     this._built = false;
   }
 
@@ -197,6 +237,7 @@ class LeapmotorMapCard extends HTMLElement {
     this._lat = dlat;
     this._lon = dlon;
     this._stateObj = st;
+    this._updateTrack(hass);
 
     if (!this._center) {
       this._center = [dlat, dlon];
@@ -498,6 +539,10 @@ class LeapmotorMapCard extends HTMLElement {
         }
         .btns button.on { border-color: var(--primary-color, #03a9f4); color: var(--primary-color, #03a9f4); }
         .zones { position: absolute; left: 0; top: 0; width: 100%; height: 100%; z-index: 3; pointer-events: none; }
+        /* 最近一段行程的轨迹: 用 SVG 折线画(没有 viewBox → 坐标就是卡片内像素) */
+        .traj { position: absolute; left: 0; top: 0; width: 100%; height: 100%; z-index: 2; pointer-events: none; }
+        .traj polyline { fill: none; stroke: #1e88e5; stroke-width: 3; stroke-linejoin: round; stroke-linecap: round; }
+        .traj polyline.gap { stroke: #1e88e5; stroke-width: 2; stroke-dasharray: 6 5; opacity: .85; }
         .zone {
           position: absolute; border: 2px solid rgba(33,150,243,.85); border-radius: 50%;
           background: rgba(33,150,243,.14); box-sizing: border-box;
@@ -557,6 +602,7 @@ class LeapmotorMapCard extends HTMLElement {
       </style>
       <div class="wrap">
         <div class="layer"></div>
+        <svg class="traj" xmlns="http://www.w3.org/2000/svg"></svg>
         <div class="zones"></div>
         <div class="crosshair">
           <svg viewBox="0 0 20 20" width="20" height="20">
@@ -604,6 +650,7 @@ class LeapmotorMapCard extends HTMLElement {
     this._layer = this.shadowRoot.querySelector(".layer");
     this._overlay = this.shadowRoot.querySelector(".overlay");
     this._zonesLayer = this.shadowRoot.querySelector(".zones");
+    this._trajLayer = this.shadowRoot.querySelector(".traj");
     this._crosshair = this.shadowRoot.querySelector(".crosshair");
     this._panel = this.shadowRoot.querySelector(".panel");
     this._zpanel = this.shadowRoot.querySelector(".zpanel");
@@ -820,6 +867,69 @@ class LeapmotorMapCard extends HTMLElement {
       }
     });
     this._layer.style.transform = "translate(0,0)";
+    // 轨迹必须在每次底图重画后跟着重画(平移/缩放/容器尺寸变化的入口都汇到这里)
+    this._renderTrack();
+  }
+
+  /** 从"行程轨迹"实体里取出最近一段轨迹, 换算成显示坐标(WGS-84 → GCJ-02)。 */
+  _updateTrack(hass) {
+    const id = this._config.track_entity || pickTrackEntity(hass);
+    if (!id) {
+      this._trackPts = null;
+      return;
+    }
+    const st = hass.states[id];
+    const raw = st && st.attributes && st.attributes.points;
+    const out = [];
+    if (Array.isArray(raw)) {
+      for (const p of raw) {
+        if (!p || p.length < 2) continue;
+        const la = Number(p[0]);
+        const lo = Number(p[1]);
+        if (!Number.isFinite(la) || !Number.isFinite(lo)) continue;
+        if (la === 0 && lo === 0) continue;
+        out.push(this._toDisplay(la, lo, st));
+      }
+    }
+    this._trackPts = out.length >= 2 ? out : null;
+  }
+
+  /** 画最近一段行程的轨迹: 连续段实线, 相邻点距离 > 2 km 的断档用虚线连。 */
+  _renderTrack() {
+    if (!this._trajLayer) return;
+    const pts = this._trackPts;
+    if (!this._wrap || !this._center || !pts || pts.length < 2) {
+      if (this._trajLayer.firstChild) this._trajLayer.innerHTML = "";
+      return;
+    }
+    const z = this._zoom;
+    const [cx, cy] = project(this._center[0], this._center[1], z);
+    const [fx, fy] = this._focusPoint();
+    const at = (p) => {
+      const [x, y] = project(p[0], p[1], z);
+      return (x - cx + fx).toFixed(1) + "," + (y - cy + fy).toFixed(1);
+    };
+    const lines = [];
+    let run = [pts[0]];
+    const gaps = [];
+    for (let i = 1; i < pts.length; i++) {
+      if (haversineKm(pts[i - 1], pts[i]) > TRACK_GAP_KM) {
+        if (run.length >= 2) lines.push({ pts: run, gap: false });
+        gaps.push({ pts: [pts[i - 1], pts[i]], gap: true });
+        run = [];
+      }
+      run.push(pts[i]);
+    }
+    if (run.length >= 2) lines.push({ pts: run, gap: false });
+    lines.push.apply(lines, gaps);
+
+    this._trajLayer.innerHTML = "";
+    for (const line of lines) {
+      const el = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+      el.setAttribute("points", line.pts.map(at).join(" "));
+      if (line.gap) el.setAttribute("class", "gap");
+      this._trajLayer.appendChild(el);
+    }
   }
 
   _renderMarker() {

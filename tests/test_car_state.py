@@ -53,10 +53,38 @@ def test_soc_prefers_precise_value_and_accepts_zero():
 
 
 def test_range_fallback_chain():
-    assert state({"3260": 170, "2188": 168}).range_km == 170
-    assert state({"2188": 168}).range_km == 168
-    assert state({"3261": 512.5}).range_km == pytest.approx(512.5)
+    """续航 = 官方 App 主页那个大数字: 纯电取表显(2188); 增程取油电总续航(按工况)。"""
+    assert state({"2188": 168, "3260": 170}).range_km == 168          # 纯电优先表显
+    assert state({"3261": 512.5}).range_km == pytest.approx(512.5)     # 增程(WLTC 总续航)
+    assert state({"3262": 0, "3258": 350, "3261": 999}).range_km == pytest.approx(350)  # CLTC
+    assert state({"3260": 170}).range_km == 170                        # 只有纯电续航也认
     assert state({}).range_km is None
+
+
+# ── 增程(REEV): 信号语义与工况选择 ──
+def test_reev_ranges_picks_by_working_condition():
+    """注意: `reev_ranges` 吃的是**翻译后的字段名**(不是信号号)。"""
+    two_modes = {"range_fuel_cltc": 200, "range_ev_cltc": 150, "range_total_cltc": 350,
+                 "range_fuel_wltc": 180, "range_ev_wltc": 130, "range_total_wltc": 310}
+    r = api_client.reev_ranges({**two_modes, "range_mode_code": 1})
+    assert (r["fuel_km"], r["ev_km"], r["total_km"], r["mode"]) == (180, 130, 310, "WLTC")
+    r = api_client.reev_ranges({**two_modes, "range_mode_code": 0})
+    assert (r["fuel_km"], r["ev_km"], r["total_km"], r["mode"]) == (200, 150, 350, "CLTC")
+    # 工况缺失 → 按 WLTC(与 App 的分支默认一致); 车端只报一套时互相回退
+    only_wltc = {"range_fuel_wltc": 180, "range_total_wltc": 310}
+    r = api_client.reev_ranges(only_wltc)
+    assert r["mode"] == "WLTC" and r["fuel_km"] == 180 and r["total_km"] == 310
+    r = api_client.reev_ranges({"range_fuel_cltc": 200, "range_total_cltc": 350})
+    assert r["fuel_km"] == 200 and r["total_km"] == 350, "只报 CLTC 时也要能取到"
+    # 纯电车 → 全 None
+    assert api_client.reev_ranges({"range_live": 131})["total_km"] is None
+
+
+def test_is_reev_only_true_when_fuel_signals_present():
+    assert api_client.is_reev({"range_live": 131, "soc": 56}) is False   # C10 纯电
+    assert api_client.is_reev({"fuel_level": 55}) is True
+    assert api_client.is_reev({"range_fuel_wltc": 180}) is True
+    assert api_client.is_reev({}) is False
 
 
 # ── 胎压 ──
@@ -80,10 +108,15 @@ def test_lock_status_semantics():
 
 
 def test_charging_requires_cable_and_current():
+    """旧版按"电流绝对值"判充电 —— 2026-10-02 已按官方 App 的 1149 语义改掉(见下一条测试)。
+
+    保留这条是作为**反例**: 同样"有电流", 1149=2 现在不再算充电中, 只有 1149=1 才算。
+    """
     assert state({"1149": 0, "1178": 0.0}).charging is False        # 没插枪
     assert state({"1149": 2, "1178": 0.0}).charging is False        # 插着但没进电流
-    assert state({"1149": 2, "1178": -12.5}).charging is True       # 真在充
-    assert state({"1298": 1}).charging is None                      # 两个关键信号都缺
+    assert state({"1149": 1, "1178": -12.5}).charging is True       # 真在充(1149=1 且进电流)
+    assert state({"1149": 2, "1178": -12.5}).charging is False      # 有电流但 1149 不是 1 -> 不算
+    assert state({"1298": 1}).charging is None                      # 关键信号缺席
 
 
 def test_vehicle_state_from_gear_then_speed():
@@ -198,3 +231,57 @@ def test_sunshade_percent_and_flag():
     assert state({"1724": 100}).sunshade_open is True
     assert state({"1724": 46}).sunshade_open is True
     assert state({}).sunshade_open is None
+
+
+def test_resp_code_is_exposed_for_rate_limit_detection():
+    """解析失败时不能抛异常, 但要把业务码带出来 —— 限流/风控判定要用它。"""
+    from api_client import parse_car_state
+    ok = parse_car_state({"code": 0, "data": {"vin": "V", "collectTime": 1, "signalMap": {"1318": 5}}})
+    assert ok.resp_code == 0
+    rl = parse_car_state({"code": 1023, "message": "环境被风控", "data": None})
+    assert rl.resp_code == 1023
+    assert rl.raw == {}
+    assert api_client.is_rate_limited({"code": rl.resp_code})
+
+
+def test_seat_rows_gates_on_abilities_with_third_row_signal_fallback():
+    """后排座椅门控: **能力位**为主(信号值会假阳性), 三排用信号是否存在兜底。
+
+    实测教训: 纯电 C10 照样上报 1879/1880/3727/3728 = 0 —— 只看"信号有值"会让它平白
+    长出后排实体; 它的 abilities 里没有 22/67/85/93, 所以用能力位判定才对。
+    """
+    c10_signals = {"seat_heat_rear_left": 0, "seat_vent_rear_left": 0}   # 有值但是 0
+    r = api_client.seat_rows(c10_signals, ["1", "20", "21", "32", "42", "43"])
+    assert r == {"rear_heat": False, "rear_vent": False,
+                 "third_heat_left": False, "third_heat_right": False}, "纯电 C10 不该有后排实体"
+    # C16 这类: 能力位给 22(二排)/67(二排通风)/85·93(三排左·右)
+    r = api_client.seat_rows({}, ["22", "67", "85", "93"])
+    assert r == {"rear_heat": True, "rear_vent": True,
+                 "third_heat_left": True, "third_heat_right": True}
+    # 能力位缺失(老数据)时, 三排还能靠 12276/12277 是否存在兜底(纯电车这两个信号缺席)
+    r = api_client.seat_rows({"seat_heat_third_left": 3})
+    assert r["third_heat_left"] is True and r["third_heat_right"] is False
+    assert api_client.seat_rows({})["rear_heat"] is False
+
+
+# ── 充电判定: 按官方 App 的 1149 语义(2026-10-02 修"行驶中误报充电") ──
+def test_charging_only_when_code_is_1():
+    """只有 1149 == 1 才是充电中; 5 = 插枪未充电; 0 = 未插枪。
+
+    真机证据(历史): 车在行驶、且刚没充过电时, 1149 的值是 **5**(插枪待机态),
+    旧代码只排除 0 就把它当"插着枪", 再叠加"电流绝对值>1"(行驶时非零)→ 误报"充电中"。
+    """
+    assert state({"1149": 1}).charging is True
+    assert state({"1149": 5}).charging is False          # 关键: 插枪待机不是充电中
+    assert state({"1149": 0}).charging is False
+    assert state({"1149": 2}).charging is False          # 其它待机态一律保守处理
+    assert state({}).charging is None
+    # 行驶中: 电流非零 + 1149=5 -> 仍然不是充电
+    assert state({"1149": 5, "1178": 12.0, "1319": 40, "1010": 1}).charging is False
+
+
+def test_charge_plugged_semantics():
+    assert state({"1149": 5}).charge_plugged is True
+    assert state({"1149": 1}).charge_plugged is True
+    assert state({"1149": 0}).charge_plugged is False
+    assert state({}).charge_plugged is None

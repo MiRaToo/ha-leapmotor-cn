@@ -33,17 +33,35 @@ DEFAULT_PWD_MODE = "aes_jwt"
 CONF_POLL_SECONDS = "poll_seconds"
 CONF_DRIVING_POLL_SECONDS = "driving_poll_seconds"   # 行驶中的轮询间隔
 CONF_VIN = "vin"
+CONF_LAUNCH_BOOST = "launch_boost"        # 解锁/上电/非 P 挡时立刻按行程采样间隔轮询
+CONF_BATTERY_KWH = "battery_kwh"          # 电池可用容量, 用于把 ΔSOC 折算成 kWh
 
-DEFAULT_POLL_SECONDS = 300
+DEFAULT_LAUNCH_BOOST = True
+DEFAULT_BATTERY_KWH = 69.9                # C10 纯电版标称, 仅供折算; 用户可改
+MIN_BATTERY_KWH = 20.0
+MAX_BATTERY_KWH = 150.0
+
+# ── 重数据取数策略(见 coordinator._refresh_car_data)──
+HEAVY_REFRESH_SECONDS = 600        # 停车时里程/能耗/配置的最小刷新间隔(行驶中一律跳过)
+PHOTO_RETRY_WINDOW_SECONDS = 120   # 新泊车事件后, 为等"照片上传完"而重试的窗口
+PHOTO_RETRY_EVERY_SECONDS = 30     # 窗口内两次重试的最小间隔
+RATE_LIMIT_COOLDOWN_SECONDS = 900  # 命中限流/风控后的冷却时间(期间用慢档)
+LAUNCH_BOOST_MAX_SECONDS = 600     # 出发提速的最长持续时间, 防止"解锁后不开车"长期高频
+
+# 停车轮询: 与官方 App 的静止档一致(60 s)。注意每轮只拉**车况帧**一个请求,
+# 里程/能耗/配置/照片另有节流(见 coordinator 的重数据策略), 所以总量并不比 300 s 时代高。
+DEFAULT_POLL_SECONDS = 60
 MIN_POLL_SECONDS = 60
 
 # 行驶中把轮询调快(位置/速度这类数据只有开车时才有意义)。
 # 参考 EU 版的双档轮询思路(它按"是否安静"切档), 这里按"是否在开"切:
 #   行驶中 → DRIVING_POLL_SECONDS; 其余(停车/充电/未锁) → poll_seconds
 # 停车时**不能完全停轮询** —— 那样就发现不了"车又开始动了"。
-DRIVING_POLL_SECONDS = 60
+# 行程采样间隔(行驶中): 官方 App 前台对**同一个车况接口**就是 6 秒一次。
+# 6 s × 1 个请求 = 10 请求/分钟, 与官方同节奏; 这也是行程轨迹点的时间分辨率。
+DRIVING_POLL_SECONDS = 6
 DEFAULT_DRIVING_POLL_SECONDS = DRIVING_POLL_SECONDS
-MIN_DRIVING_POLL_SECONDS = 60      # 与全局下限一致(coordinator 里统一钳到 ≥60s)
+MIN_DRIVING_POLL_SECONDS = 6
 
 # 车端 token 剩余不足这么多秒就自动续期(用账号 token, 不需短信)
 RENEW_SKEW_SECONDS = 600

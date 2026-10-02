@@ -363,6 +363,92 @@ class StateOverrides:
 MIN_POLL_SECONDS = 60          # 全局下限: 车端上报本来也不是实时的, 再密没意义
 
 
+def choose_poll_seconds(*, parked: int, trip: int, driving: bool, launch_boost: bool,
+                        rate_limited: bool = False, floor: int = 6) -> int:
+    """四档轮询决策(纯函数, 便于单测)。
+
+    档位与依据(2026-09-28 调研):
+      * **行驶中** → `trip`(行程采样间隔, 默认 6s)。官方 App 前台对同一个车况接口就是 6 秒一次,
+        这个值同时决定行程轨迹点的时间分辨率。
+      * **出发提速**(解锁 / 上电 / 非 P 挡, 且开关打开) → 也用 `trip`:
+        停车档默认 60s, 不提速的话"出发后的头一分钟"会整段丢掉(等价 EU 版 mate 的 PARKED_ALERT)。
+      * **限流冷却中** → 退避:`max(parked, 60) * 2`。
+      * **其余**(停车 / 充电) → `parked`(默认 60s, 与官方 App 静止档一致)。
+
+    停车时**不停止轮询**: 车端休眠时本来就不上报, 停轮询只会让"车又动了"发现不了。
+    """
+    base = max(int(parked), 60)
+    if rate_limited:
+        return max(base * 2, 120)
+    if driving or launch_boost:
+        return max(int(trip), floor)
+    return base
+
+
+def reev_ranges(signals: dict) -> dict:
+    """增程车的"燃油续航 / 纯电续航 / 油电总续航" —— 按工况选定(纯函数, 可单测)。
+
+    工况来自信号 `3262`(0=CLTC, 1=WLTC; 缺失时按 WLTC —— 与官方 App 的分支默认一致)。
+    三组各有 CLTC/WLTC 两套, 车端只报一套的情况也存在, 所以缺失时**互相回退**。
+    验证过的算术关系(EU mate): 总续航 = 燃油续航 + 纯电续航。
+    纯电车没有这些信号 → 全部返回 None。
+    """
+    if not signals:
+        return {"fuel_km": None, "ev_km": None, "total_km": None, "mode": None}
+    mode = signals.get("range_mode_code")
+    wltc = mode != 0                      # 0=CLTC; 其余(含缺失)=WLTC
+
+    def pick(a: str, b: str):
+        first, second = (a, b) if wltc else (b, a)     # a=WLTC 名, b=CLTC 名
+        v = signals.get(first)
+        return v if v is not None else signals.get(second)
+
+    return {
+        "fuel_km": pick("range_fuel_wltc", "range_fuel_cltc"),
+        "ev_km": pick("range_ev_wltc", "range_ev_cltc"),
+        "total_km": pick("range_total_wltc", "range_total_cltc"),
+        "mode": "WLTC" if wltc else "CLTC",
+    }
+
+
+def seat_rows(signals: dict, abilities=()) -> dict:
+    """这辆车有没有二排/三排座椅, 以及各有什么功能(纯函数, 可单测)。
+
+    ★ 门控为什么用**能力位**而不是"信号有没有值" ★
+    实测(2026-09-30, 纯电 C10): 它**照样上报** `1879/1880/3727/3728 = 0` —— 值 0 既可能是
+    "座椅关着", 也可能是"没这套硬件", 从值上分不出来; 三排的 `12276/12277` 则干脆缺席,
+    可以用"是否存在"兜底。而能力位里 22=二排、67=二排通风、85/93=三排左/右加热(见 CN App
+    `LpCarTempActivity` 的显隐条件), 实测那辆 C10 的 abilities **不含** 22/67/85/93 → 不会误显示。
+
+    ⚠️ 能力位不是处处可靠(那辆 C10 的 abilities 里也有 "20", 而研究里它在 App 里是"增程"
+    判据) —— 所以在二排这种"信号会假阳性"的地方用能力位, 在增程/燃油这种"信号不会假阳性"
+    的地方用信号值(`is_reev`)。
+    """
+    ab = {str(x) for x in (abilities or ())}
+    sig = signals or {}
+    return {
+        "rear_heat": "22" in ab,
+        "rear_vent": "67" in ab,
+        "third_heat_left": "85" in ab or sig.get("seat_heat_third_left") is not None,
+        "third_heat_right": "93" in ab or sig.get("seat_heat_third_right") is not None,
+    }
+
+
+def is_reev(signals: dict) -> bool:
+    """是不是增程车: 只要车端报了燃油量/燃油续航相关信号就是。
+
+    依据: EU mate 用 `3235 is not None` 判定, 且"值存在才建实体"最稳(不依赖能力位,
+    各车型的能力码并不统一)。纯电车这些信号一律缺失。
+    """
+    if not signals:
+        return False
+    for k in ("fuel_level", "fuel_ml", "range_fuel_wltc", "range_fuel_cltc",
+              "range_total_wltc", "range_total_cltc"):
+        if signals.get(k) is not None:
+            return True
+    return False
+
+
 def pick_poll_seconds(poll_seconds: int, driving_seconds: int, driving: bool,
                       floor: int = MIN_POLL_SECONDS) -> int:
     """该用哪个轮询间隔: **行驶中快、停车慢**。
@@ -396,14 +482,20 @@ SIGNAL_IDS: dict[str, str] = {
     # 电量 / 续航
     "100003": "soc_precise",                 # 电量 %(带小数, 如 36.9)
     "1204": "soc",                           # 电量 %(整数)
-    "3260": "range_remaining",               # 剩余续航 km
-    "2188": "range_live",                    # 实时剩余续航 km
-    "3257": "range_cltc",                    # CLTC 满电续航 km
-    "3258": "range_combined_max",            # 满油满电综合续航 km
-    "3259": "range_fuel",                    # 燃油剩余续航 km
-    "3261": "range_combined",                # 当前综合续航 km
+    "2188": "range_live",                    # 表显剩余续航 km(纯电车主页那个数)
+    # ── 增程(REEV)的续航: CLTC / WLTC 两套, 用信号 3262 选(0=CLTC, 1=WLTC) ──
+    #    取自 CN App 的字段名(权威): cltcGasolineRemainMileage / wltcGasolineRemainMileage …
+    "3256": "range_fuel_cltc",               # CLTC 燃油续航 km
+    "3259": "range_fuel_wltc",               # WLTC 燃油续航 km
+    "3257": "range_ev_cltc",                 # CLTC 纯电续航 km
+    "3260": "range_ev_wltc",                 # WLTC 纯电续航 km
+    "3258": "range_total_cltc",              # CLTC 油电总续航 km
+    "3261": "range_total_wltc",              # WLTC 油电总续航 km
+    "3262": "range_mode_code",               # 当前工况: 0=CLTC, 1=WLTC
     "3235": "fuel_level",                    # 燃油量 %
-    "3263": "fuel_liters",                   # 燃油量 L
+    # ⚠️ 3263 的单位是**毫升**(EU 三个项目一致: mate 明确除以 1000;48 L 的油箱报 45382
+    #    → 只能是毫升)。对外要 /1000 才是升 —— 名字里带单位, 免得再踩。
+    "3263": "fuel_ml",
     # 里程 / 行驶
     "1318": "odometer",                      # 总里程 km(已与里程接口交叉验证)
     "1319": "speed",                         # 车速 km/h
@@ -423,10 +515,21 @@ SIGNAL_IDS: dict[str, str] = {
     # 门窗
     "1298": "lock_status",                   # 1=已锁, 0=未锁
     "1281": "trunk_open",
-    "3727": "window_front_left",             # 开度 %
-    "3728": "window_front_right",
-    "1879": "window_rear_left",
-    "1880": "window_rear_right",
+    # ⚠️ 这里曾经按 EU 表把 1879/1880/3727/3728 当成"车窗开度" —— 在 CN 车上它们是**后排座椅**!
+    #    证据(CN App, 权威): OooOOO0.java 里
+    #        leftbackState=get_$1879 / rightbackState=get_$1880  → 二排加热档位
+    #        twoLeftWindState=get_$3727 / twoRightWindState=get_$3728 → 二排通风档位
+    #    CN 的车窗开度是下面那四个(644/645/865/866); 每轮读到的值都是 "开度 %"。
+    "1879": "seat_heat_rear_left",           # 二排左 加热档位 0~3
+    "1880": "seat_heat_rear_right",          # 二排右 加热档位
+    "3727": "seat_vent_rear_left",           # 二排左 通风档位
+    "3728": "seat_vent_rear_right",          # 二排右 通风档位
+    "12276": "seat_heat_third_left",         # 三排左 加热档位(C16 6 座; 三排无通风)
+    "12277": "seat_heat_third_right",        # 三排右 加热档位
+    "644": "window_percent_left_front",      # CN 车窗开度 %: 左前
+    "645": "window_percent_left_rear",       # 左后
+    "865": "window_percent_right_front",     # 右前
+    "866": "window_percent_right_rear",      # 右后
     "1946": "rear_window_heat",
     # 充电
     "1149": "charge_connection",             # 充电枪连接状态
@@ -466,7 +569,7 @@ SIGNAL_IDS: dict[str, str] = {
     "6047": "speed_limit_unit",               # 限速单位
     "6048": "speed_limit_kmh",                # 限速值
     "12054": "speed_limit_enabled",           # 限速识别开关
-    "3256": "range_fuel_max",                 # 满油续航(REEV)
+    "2956": "fuel_heater_level",              # 燃油加热器油量档位 0~4
     "100011": "ext_100011",                   # 扩展信号(EU 亦未命名)
     "100012": "ext_100012",
     "100013": "ext_100013",
@@ -532,6 +635,9 @@ class CarState:
     collect_time: int = 0                    # 服务端采集时间(epoch ms)
     signals: dict[str, float] = field(default_factory=dict)   # 名称 → 值(已按表翻译)
     raw: dict[str, Any] = field(default_factory=dict)         # 原始 signalMap(保留原键)
+    # 响应里的业务码(0=成功)。解析函数**不会**因非 0 抛异常(它只回空对象),
+    # 所以调用方要拿这个码去判断"是限流/风控还是普通失败"(见 is_rate_limited)。
+    resp_code: int | None = None
 
     # ── 便捷读取 ──
     def get(self, name: str) -> float | None:
@@ -596,8 +702,17 @@ class CarState:
 
     @property
     def range_km(self) -> float | None:
-        """剩余续航 km(依次尝试 3260 / 2188 / 3261)。"""
-        for k in ("range_remaining", "range_live", "range_combined"):
+        """剩余续航 km —— **就是官方 App 主页那个大数字**。
+
+        纯电车取表显(2188);增程车取"油电总续航"(3261/3258, 按工况选) —— 两者不是同一个
+        信号, 但都是 App 认为该显示给用户的那个数。见 `reev_ranges()`。
+        """
+        if is_reev(self.signals):
+            r = reev_ranges(self.signals)          # 增程: 按工况取"油电总续航"
+            for v in (r["total_km"], r["ev_km"]):
+                if v is not None:
+                    return v
+        for k in ("range_live", "range_ev_wltc", "range_ev_cltc"):
             v = self.signals.get(k)
             if v is not None:
                 return v
@@ -636,14 +751,41 @@ class CarState:
 
     @property
     def charging(self) -> bool | None:
-        """是否正在充电: 充电枪已连 + 充电电流非零。"""
-        current = self.signals.get("charging_current")
+        """是否正在充电。
+
+        ★ 判据以官方 App 为准(2026-10-02 修): **只有 `1149 == 1` 才算充电中**。
+        App 里就是这么写的 —— `LPCarOwnerFragment` 用 `chargeState != 1` 来隐藏"充电中"提示,
+        `OooOo00` 把 **0 和 5 并列**当作"未插枪"。
+
+        之前的写法是"电流绝对值 > 1" —— **错的**: 行驶/能量回收时电池电流本来就不为零,
+        于是出现过"车在开却显示充电中"(用户实测反馈)。历史数据证实那时的 1149 是 **5**,
+        而被我们当成了"插着枪"。
+
+        已知取值(1149, 官方 App 与实测):
+          0 = 未插枪 / 未充电
+          1 = 充电中
+          5 = 已插枪但未充电(含"已充满/停止充电"这类待机态) —— 归入 plugged, 不算充电中
+          其它值(2~4 等)按"已插枪、未充电"处理(宁可显示保守, 不误报充电)
+        """
         conn = self.signals.get("charge_connection")
-        if current is None and conn is None:
+        if conn is None:
             return None
-        if conn is not None and int(conn) == 0:
-            return False
-        return current is not None and abs(current) > 1.0
+        try:
+            code = int(conn)
+        except (TypeError, ValueError):
+            return None
+        return code == 1
+
+    @property
+    def charge_plugged(self) -> bool | None:
+        """充电枪是否插着(1149 != 0 即视为插枪; None = 车端没上报)。"""
+        conn = self.signals.get("charge_connection")
+        if conn is None:
+            return None
+        try:
+            return int(conn) != 0
+        except (TypeError, ValueError):
+            return None
 
     @property
     def vehicle_state(self) -> str | None:
@@ -677,11 +819,16 @@ def parse_car_state(payload: dict) -> CarState:
             signals[name] = float(v)
     # 带符号的经纬度可能因为第三方 JSON 序列化丢掉负号 —— 这里保留原始值,
     # 由 CarState.latitude/longitude 决定回落到哪个信号。
+    try:
+        resp_code = int(payload.get("code")) if isinstance(payload, dict) else None
+    except (TypeError, ValueError):
+        resp_code = None
     st = CarState(
         vin=str(data.get("vin") or ""),
         collect_time=int(data.get("collectTime") or 0),
         signals=signals,
         raw={str(k): v for k, v in raw.items()},
+        resp_code=resp_code,
     )
     return st
 
@@ -1590,6 +1737,29 @@ class LeapmotorClient:
         """
         return self.car_call(EP_CHASSIS_QUERY, {"vin": vin or self.session.car_vin})
 
+    def chassis_info(self, vin: str = "") -> dict:
+        """驻车照片的**地址与上传时间**(给"照片更新了没有"用)。
+
+        实测(2026-09-28):
+            {"data": {"fileUrl": "http://lp-carnet.oss-.../ChassisPicture/prod/<VIN>?Expires=…",
+                      "uploadTime": 1790590434026}}
+
+        ★ 为什么需要它 ★
+        驻车照片只在**泊车那一刻**拍一次, 之后异步上传到 OSS; 请求同一个接口只会拿回同一张。
+        图片 URL 里的签名是固定的、对图片发 HEAD 会 403(取不到 ETag / Last-Modified),
+        所以**唯一可用于判断"有新照片"的字段是 `uploadTime`**(车端上传时刻, 毫秒)。
+        调用方应: 记住上次 uploadTime, 只有它变大时才认为照片更新了。
+        """
+        r = self.car_call(EP_CHASSIS_QUERY, {"vin": vin or self.session.car_vin})
+        data = (r.get("data") or {}) if isinstance(r, dict) else {}
+        if not isinstance(data, dict):
+            data = {}
+        try:
+            upload = int(data.get("uploadTime") or 0)
+        except (TypeError, ValueError):
+            upload = 0
+        return {"url": str(data.get("fileUrl") or ""), "upload_time_ms": upload, "raw": r}
+
     # ---- 车况(全量信号) ----
     def get_car_state(self, vin: str = "") -> CarState:
         """拉一帧完整车况(GPS / 电量 / 续航 / 四轮胎压 / 门窗 / 充电 / 空调...)。
@@ -1692,6 +1862,24 @@ def command_failed(resp: Any) -> str | None:
         return None
     msg = resp.get("message") or resp.get("result") or ""
     return f"code={code} {msg}".strip()
+
+
+# 限流/风控类错误: 官方提示语是 "环境被风控(1023)"。收到这类错误要**退避**,
+# 不能继续按 6 秒的行程采样节奏硬冲 —— 否则会把冷却时间拖长。
+RATE_LIMIT_CODES = {1023}
+
+
+def is_rate_limited(resp: Any) -> bool:
+    """服务端是否以"限流/风控"为由拒绝(调用方应拉长轮询间隔并冷却一段时间)。"""
+    if not isinstance(resp, dict):
+        return False
+    try:
+        if int(resp.get("code")) in RATE_LIMIT_CODES:
+            return True
+    except (TypeError, ValueError):
+        pass
+    text = str(resp.get("message") or "")
+    return "风控" in text or "频繁" in text
 
 
 def is_signature_error(resp: Any) -> bool:

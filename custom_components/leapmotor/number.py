@@ -7,6 +7,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .api import seat_rows
 from .const import DOMAIN
 from .coordinator import LeapmotorCoordinator
 from .entity import LeapmotorEntity
@@ -15,6 +16,9 @@ from .entity import LeapmotorEntity
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry,
                             add: AddEntitiesCallback) -> None:
     c = hass.data[DOMAIN][entry.entry_id]
+    st = c.car_state
+    _rows = seat_rows(st.signals if st is not None else {},
+                      getattr(c.vehicle, "abilities", None) or ())
     add([
         LeapmotorSeat(c, "seat_heat_driver", "主驾座椅加热", "driver", heat=True,
                       signal="seat_heat_driver", icon="mdi:car-seat-heater"),
@@ -25,6 +29,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry,
         LeapmotorSeat(c, "seat_vent_copilot", "副驾座椅通风", "copilot", heat=False,
                       signal="seat_vent_passenger", icon="mdi:car-seat-cooler"),
         LeapmotorChargeLimit(c),
+        # ── 后排座椅(C16 这类多排座车型; 纯电 C10 上这些信号缺失 → 不会创建) ──
+        #   CN App 的取值: 二排 left_rear/right_rear、三排 left_third/right_third;
+        #   加热复用 cmdId 301、通风复用 370, payload 与前排同形。
+        #   ⚠️ 后排**没有真车实测样本**(EU 三个项目也都没测过), 以 App 源码为准。
+        *([LeapmotorSeat(c, "seat_heat_rear_left", "二排左座椅加热", "left_rear",
+                         heat=True, signal="seat_heat_rear_left", icon="mdi:car-seat-heater"),
+           LeapmotorSeat(c, "seat_heat_rear_right", "二排右座椅加热", "right_rear",
+                         heat=True, signal="seat_heat_rear_right", icon="mdi:car-seat-heater")]
+          if _rows.get("rear_heat") else []),
+        *([LeapmotorSeat(c, "seat_vent_rear_left", "二排左座椅通风", "left_rear",
+                         heat=False, signal="seat_vent_rear_left", icon="mdi:car-seat-cooler"),
+           LeapmotorSeat(c, "seat_vent_rear_right", "二排右座椅通风", "right_rear",
+                         heat=False, signal="seat_vent_rear_right", icon="mdi:car-seat-cooler")]
+          if _rows.get("rear_vent") else []),
+        *([LeapmotorSeat(c, "seat_heat_third_left", "三排左座椅加热", "left_third",
+                         heat=True, signal="seat_heat_third_left", icon="mdi:car-seat-heater")]
+          if _rows.get("third_heat_left") else []),
+        *([LeapmotorSeat(c, "seat_heat_third_right", "三排右座椅加热", "right_third",
+                         heat=True, signal="seat_heat_third_right", icon="mdi:car-seat-heater")]
+          if _rows.get("third_heat_right") else []),
     ])
 
 

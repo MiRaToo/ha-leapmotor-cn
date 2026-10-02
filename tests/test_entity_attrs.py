@@ -90,3 +90,28 @@ def test_scan_actually_detects_a_missing_attribute(tmp_path):
     )
     assigned, read = _scan(bad)
     assert "_never_assigned" in read and "_never_assigned" not in assigned
+
+
+# ── 跨模块的字段名一致性(2026-09-30 真机踩到) ──
+# 事故: `trips.py` 给 Trip 实例动态赋了 `distance_source`, 但 dataclass **没声明**该字段
+# → 从磁盘载入的历史行程没有这个属性 → `sensor.py` 一读就 AttributeError(实体添加失败)。
+# 这类"实体读了对方类里不存在的字段"靠运行时才发现太晚, 静态扫一遍最省事。
+def test_sensor_only_reads_fields_declared_on_trip():
+    import ast as _ast
+    import pathlib as _pathlib
+
+    root = _pathlib.Path(__file__).resolve().parent.parent / "custom_components" / "leapmotor"
+    trips_src = (root / "trips.py").read_text(encoding="utf-8")
+    tree = _ast.parse(trips_src)
+    fields: set[str] = set()
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.ClassDef) and node.name == "Trip":
+            for stmt in node.body:
+                if isinstance(stmt, _ast.AnnAssign) and isinstance(stmt.target, _ast.Name):
+                    fields.add(stmt.target.id)
+    assert "distance_source" in fields, "Trip 必须声明 distance_source"
+
+    sensor_src = (root / "sensor.py").read_text(encoding="utf-8")
+    used = {m.group(1) for m in __import__("re").finditer(r"\btrip\.(\w+)", sensor_src)}
+    missing = sorted(a for a in used if a not in fields)
+    assert not missing, f"sensor.py 读了 Trip 上不存在的字段: {missing}"
