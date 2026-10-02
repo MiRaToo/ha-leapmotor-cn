@@ -46,8 +46,13 @@ MAX_BATTERY_KWH = 150.0
 
 # ── 重数据取数策略(见 coordinator._refresh_car_data)──
 HEAVY_REFRESH_SECONDS = 600        # 停车时里程/能耗/配置的最小刷新间隔(行驶中一律跳过)
-PHOTO_RETRY_WINDOW_SECONDS = 120   # 新泊车事件后, 为等"照片上传完"而重试的窗口
-PHOTO_RETRY_EVERY_SECONDS = 30     # 窗口内两次重试的最小间隔
+# 驻车照片: 新泊车事件后的"等上传"窗口。
+# 车端拍照后异步上传, 时长不定 —— 所以窗口给足(默认 15 分钟), 但**重试节奏递增退避**:
+# 前 15s 每 15 秒试一次(照片通常很快到), 之后 30s → 60s → 120s → 300s;
+# **一旦拿到新的 uploadTime 就立即停止**(见 coordinator._photo_due)。
+PHOTO_RETRY_WINDOW_SECONDS = 900   # 窗口总长(15 分钟)
+PHOTO_RETRY_STEPS = (15, 30, 60, 120, 300)   # 逐次重试的间隔(递增退避)
+PHOTO_RETRY_EVERY_SECONDS = 30     # (旧值, 兼容保留: 未配置 steps 时的兜底)
 RATE_LIMIT_COOLDOWN_SECONDS = 900  # 命中限流/风控后的冷却时间(期间用慢档)
 LAUNCH_BOOST_MAX_SECONDS = 600     # 出发提速的最长持续时间, 防止"解锁后不开车"长期高频
 

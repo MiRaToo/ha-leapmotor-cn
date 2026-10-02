@@ -120,3 +120,45 @@ def test_short_stop_defaults_and_bounds():
     m = int(_re.search(r"MAX_SHORT_STOP_SECONDS\s*=\s*(\d+)", src).group(1))
     assert 0 < d <= m, "默认短停窗口应在 (0, 上限] 之间"
     assert m >= 600, "上限至少给到 10 分钟"
+
+
+# ── 驻车照片: 递增退避窗口(2026-10-02 A+C) ──
+def test_photo_retry_backoff_is_increasing():
+    """照片"等上传"的重试节奏必须**递增**(头几次快、之后慢), 且窗口给足。
+
+    设计取舍: 车端拍照是异步上传的, 传完的时刻我们控制不了 ——
+    窗口给足(不错过) + 节奏递增(不白问) + 拿到新照片立即停(见 _refresh_photo)。
+    """
+    import pathlib as _p
+    import re as _re
+    src = (_p.Path(__file__).resolve().parent.parent / "custom_components" / "leapmotor"
+           / "const.py").read_text(encoding="utf-8")
+    steps = _re.search(r"PHOTO_RETRY_STEPS\s*=\s*\(([^)]+)\)", src)
+    assert steps, "找不到 PHOTO_RETRY_STEPS"
+    vals = [int(x.strip()) for x in steps.group(1).split(",") if x.strip()]
+    assert len(vals) >= 3, "至少三级退避"
+    assert vals == sorted(vals), "退避间隔必须单调不减: %s" % vals
+    assert vals[0] <= 20, "第一次要快(照片通常秒级到): %s" % vals[0]
+    assert vals[-1] >= 120, "最后一级要够慢(车端迟迟不传时收敛): %s" % vals[-1]
+    window = int(_re.search(r"PHOTO_RETRY_WINDOW_SECONDS\s*=\s*(\d+)", src).group(1))
+    assert window >= 600, "窗口太短会错过慢上传的照片: %ss" % window
+
+
+def test_heavy_data_is_decoupled_from_fast_polling():
+    """重数据(里程/能耗/配置)有独立节奏, 不跟着 6 秒档高频拉。
+
+    真机场景: 短停快档/出发提速会把轮询打到 6 秒 —— 但里程/能耗 10 分钟内几乎不变,
+    跟着高频拉纯属浪费(还会顺带触发写库/前端刷新)。
+    """
+    import pathlib as _p
+    import re as _re
+    src = (_p.Path(__file__).resolve().parent.parent / "custom_components" / "leapmotor"
+           / "coordinator.py").read_text(encoding="utf-8")
+    # 重数据分支必须由 _last_heavy + HEAVY_REFRESH_SECONDS 控制(与轮询档位无关)
+    m = _re.search(r"if self\._last_heavy == 0\.0 or \(not driving", src)
+    assert m, "重数据的触发条件应只看 _last_heavy(与轮询档位解耦)"
+    assert "now - self._last_heavy >= HEAVY_REFRESH_SECONDS" in src, "重数据间隔应使用常量"
+    c = (_p.Path(__file__).resolve().parent.parent / "custom_components" / "leapmotor"
+         / "const.py").read_text(encoding="utf-8")
+    heavy = int(_re.search(r"HEAVY_REFRESH_SECONDS\s*=\s*(\d+)", c).group(1))
+    assert heavy >= 300, "重数据间隔不该太短: %ss" % heavy

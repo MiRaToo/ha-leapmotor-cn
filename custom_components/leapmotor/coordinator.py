@@ -39,6 +39,7 @@ from .const import (
     HEAVY_REFRESH_SECONDS,
     LAUNCH_BOOST_MAX_SECONDS,
     PHOTO_RETRY_EVERY_SECONDS,
+    PHOTO_RETRY_STEPS,
     PHOTO_RETRY_WINDOW_SECONDS,
     RATE_LIMIT_COOLDOWN_SECONDS,
     CONF_DRIVING_POLL_SECONDS,
@@ -103,6 +104,8 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._photo_retry_until = 0.0           # 迟到重试窗口的截止时刻
         self._photo_last_try = 0.0              # 上次尝试取照片的时刻
         self._photo_pending = False             # True = 地址有了但还没换成新照片(上传中)
+        self._photo_retry_count = 0             # 本轮"等上传"窗口里已重试几次(递增退避用)
+        self._photo_upload_ms_acc = 0           # 最近一次拿到的 uploadTime(供传感器展示)
         self._photo_force = False               # 「刷新车况」按钮强制重取一次
         # ── 轮询档位 ──
         self._rate_limited_until = 0.0          # 限流/风控冷却截止时刻
@@ -296,6 +299,7 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._photo_retry_until = now + PHOTO_RETRY_WINDOW_SECONDS
             self._photo_pending = True
             # 短停快档: 行程刚结束的一段时间内继续用快档, 便于抓住"短停再出发"
+            self._photo_retry_count = 0          # 新一轮"等上传": 退避从头开始
             short = int(self.entry.options.get(CONF_SHORT_STOP_SECONDS,
                                                DEFAULT_SHORT_STOP_SECONDS) or 0)
             self._short_stop_until = (now + short) if short > 0 else 0.0
@@ -310,6 +314,9 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         driving = bool(self.state and (
             self.state.vehicle_state == "driving" or (self.state.get("speed") or 0) > 0))
         if not self.light_first_refresh:
+            # 重数据(里程/能耗/配置)有**自己的节奏**(`HEAVY_REFRESH_SECONDS`), 与轮询档位无关:
+            # 短停快档/出发提速时轮询会到 6 秒, 但这些数据在 10 分钟内几乎不变 ——
+            # 跟着高频拉纯属浪费(它们还会顺带触发 HA 的写库与前端刷新)。
             if self._last_heavy == 0.0 or (not driving
                                           and now - self._last_heavy >= HEAVY_REFRESH_SECONDS):
                 self._last_heavy = now
@@ -330,52 +337,67 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._adapt_poll_interval()
 
     async def _refresh_heavy(self) -> None:
-        """里程 / 能耗 / 配置 —— 变化慢, 只按需拉(见 `_refresh_car_data` 的说明)。"""
-        config: dict[str, Any] = {}
-        charge_plan: dict[str, Any] = {}
-        try:
-            r = await self.hass.async_add_executor_job(self.client.get_car_config, self.vin)
-            config = (r.get("data") or {}) if isinstance(r, dict) else {}
-            charge_plan = ((config.get("config") or {}) if isinstance(config, dict) else {}).get("3") or {}
-        except Exception as err:  # noqa: BLE001
-            log.debug("获取车辆配置失败: %s", err)
-        self._config = config
-        self._charge_plan = charge_plan
-        # 增程车: 顺带拉一次"电耗/油耗"(纯电车这接口没意义, 不请求)
-        if is_reev(self.state.signals if self.state is not None else {}):
+        """里程 / 能耗 / 配置 —— 变化慢, 只按需拉(见 `_refresh_car_data` 的说明)。
+
+        取数优化(2026-10-02):
+          * **三个请求并发**(原来串行 ~0.85s → 现在约等于最慢的一个 ~0.3s);
+          * **去掉一个重复请求**: `mileage/energy/detail` 带时间窗口时会同时返回
+            `totalmileage` / `deliveryDays`(与不带窗口的调用同一个端点), 所以
+            原来那次额外的 `get_mileage_detail` 是多余的 —— 直接省掉。
+        """
+        import asyncio
+
+        async def _call(fn, *args):
             try:
-                r = await self.hass.async_add_executor_job(self.client.get_plug_energy, self.vin)
-                self._plug_energy = (r.get("data") or {}) if isinstance(r, dict) else {}
+                r = await self.hass.async_add_executor_job(fn, *args)
+                return (r.get("data") or {}) if isinstance(r, dict) else {}
             except Exception as err:  # noqa: BLE001
-                log.debug("获取增程能耗(电耗/油耗)失败: %s", err)
-        mileage: dict[str, Any] = {}
-        energy: dict[str, Any] = {}
-        try:
-            r = await self.hass.async_add_executor_job(self.client.get_mileage_detail, self.vin)
-            mileage = (r.get("data") or {}) if isinstance(r, dict) else {}
-        except Exception as err:  # noqa: BLE001
-            log.debug("获取里程失败: %s", err)
-        try:
-            r = await self.hass.async_add_executor_job(self.client.get_energy_rank, self.vin)
-            energy = (r.get("data") or {}) if isinstance(r, dict) else {}
-        except Exception as err:  # noqa: BLE001
-            log.debug("获取能耗失败: %s", err)
-        try:
-            r = await self.hass.async_add_executor_job(self.client.get_mileage_range, self.vin, 7)
-            mileage = {**(r.get("data") or {}), "mileage7": (r.get("data") or {})}
-        except Exception as err:  # noqa: BLE001
-            log.debug("获取近 7 天里程失败: %s", err)
-        self._mileage = mileage
+                log.debug("%s 失败: %s", getattr(fn, "__name__", fn), err)
+                return {}
+
+        jobs = [
+            _call(self.client.get_car_config, self.vin),        # 充电计划/车辆配置
+            _call(self.client.get_energy_rank, self.vin),       # 百公里能耗 + 排名 + 周明细
+            _call(self.client.get_mileage_range, self.vin, 7),  # 近 7 天(含总里程/交付天数)
+        ]
+        if is_reev(self.state.signals if self.state is not None else {}):
+            # 增程车才有意义(纯电车这接口没数据)
+            jobs.append(_call(self.client.get_plug_energy, self.vin))
+        results = await asyncio.gather(*jobs)
+        config = results[0] or {}
+        energy = results[1] or {}
+        mileage_raw = results[2] or {}
+        if len(results) > 3:
+            self._plug_energy = results[3] or {}
+
+        self._config = config
+        self._charge_plan = ((config.get("config") or {}) if isinstance(config, dict) else {}).get("3") or {}
+        self._mileage = {**mileage_raw, "mileage7": mileage_raw}
         self._energy = energy
 
     def _photo_due(self, st, now: float) -> bool:
-        """现在该不该去取驻车照片(按需, 不是每轮)。"""
+        """现在该不该去取驻车照片(按需, 不是每轮)。
+
+        触发条件(与"不白问"的取舍):
+          * 启动后还没拿到过地址;
+          * 用户手动刷新;
+          * **新泊车事件后的窗口内** —— 车端拍照是异步上传的, 所以停车后一段时间里
+            按**递增退避**重试(15s→30s→60s→120s→300s): 头几次试得快(照片通常秒级到),
+            之后越试越慢(车端迟迟不传时快速收敛, 不再浪费请求);
+          * 总里程变了(说明车又动过, 可能拍了新照片)。
+
+        速度上限由**车端**决定: 它什么时候传完我们才知道 —— 窗口给足 15 分钟是为了"不错过",
+        退避是为了"不白问"; 拿到新的 uploadTime 会立即把窗口关掉(见 `_refresh_photo`)。
+        """
         if self._photo_force:
             return True
         if not self.parking_url:
             return True                                   # 启动后还没拿到过
-        if now < self._photo_retry_until and now - self._photo_last_try >= PHOTO_RETRY_EVERY_SECONDS:
-            return True                                   # 新照片可能还在上传 -> 窗口内重试
+        if now < self._photo_retry_until:
+            # 窗口内: 按递增退避决定这一轮要不要试
+            idx = min(self._photo_retry_count, len(PHOTO_RETRY_STEPS) - 1)
+            if now - self._photo_last_try >= PHOTO_RETRY_STEPS[idx]:
+                return True
         odo = st.get("odometer") if st is not None else None
         if odo is not None and self._photo_odo is not None and odo != self._photo_odo:
             return True                                   # 车又动过 -> 可能拍了新照片
@@ -385,6 +407,7 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """取驻车照片。以 `uploadTime` 判断是否换了新照片 —— 这是"迟到兜底"的核心。"""
         self._photo_last_try = now
         self._photo_force = False
+        self._photo_retry_count += 1
         try:
             info = await self.hass.async_add_executor_job(self.client.chassis_info, self.vin)
         except Exception as err:  # noqa: BLE001
@@ -403,6 +426,8 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._photo_upload_ms = upload
                 self._photo_pending = False
                 self._photo_retry_until = 0.0
+                self._photo_upload_ms_acc = upload
+                self._photo_retry_count = 0
             else:
                 # 地址有了, 但内容还是上一张 -> 车端可能还在上传
                 self._photo_pending = True
@@ -446,6 +471,8 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "car_state_problem": self.car_state_problem,
             # 诊断: 每轮实际耗时(请求本身约 0.2s; 常年几十秒说明在网络层等超时)
             "cycle_seconds": round(self.last_cycle_seconds, 1),
+            "photo_upload_ms": self._photo_upload_ms_acc,
+            "photo_pending": self._photo_pending,
         }
 
     def _adapt_poll_interval(self) -> None:
