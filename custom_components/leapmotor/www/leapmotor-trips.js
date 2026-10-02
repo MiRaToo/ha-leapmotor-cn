@@ -1,13 +1,27 @@
 /*
- * 零跑行程浏览 —— 行程列表 + 轨迹地图的 Lovelace 卡片。
+ * 零跑行程浏览 —— 行程卡片 + 轨迹地图的 Lovelace 卡片。
  *
  * 数据来源(集成的 WebSocket 命令, 见 custom_components/leapmotor/ws_api.py):
  *   * `leapmotor/trips/list`   —— 行程摘要列表 + 今日/近7天/近30天统计 + 正在记录的那段
  *   * `leapmotor/trips/track`  —— 单段行程的轨迹点(max_points: 0 = 全量, 坐标 WGS-84)
  *   * `leapmotor/trips/delete` —— 删除一段行程(需要管理员)
  *
- * 列表按日期分组(今天/昨天/…), 点一行就会在地图上画出那段轨迹; 勾上"叠加最近 N 段"
- * 可以把最近几段轨迹用不同颜色画在一起, 看常走路线。
+ * 版式(v1.1.0, 对齐零跑官方 App)
+ * --------------------------------
+ *   * 列表 = 主视图。按天分组(今天/昨天/9月12日…), 标题右边是当天总里程;
+ *     每段行程是**一张白色小卡**: 左边一张小地图缩略图(瓦片 + 红色轨迹),
+ *     右上大号里程 + 时间段, 底部三列小指标(耗时 / 耗电 kWh / 平均能耗)。
+ *   * 点卡片 → 进详情: 上方一张大图(完整轨迹 + 起点黑钉/终点红钉),
+ *     下方信息卡(日期时间标题、起终点两行、3×2 指标网格)。
+ *   * **不显示电量百分比, 也不显示电费** —— 我们没有可靠的电费数据;
+ *     耗电一律给 kWh。
+ *
+ * 缩略图怎么来的(别把首屏拖垮)
+ * ----------------------------
+ *   首屏只画卡片骨架(缩略图是浅灰占位), 然后异步去拉轨迹:
+ *   `leapmotor/trips/track` 每段只取 **80 个点**(降采样够画小图了),
+ *   结果缓存在实例里(按 trip_id), 第二次渲染直接命中缓存。
+ *   最多只补前 THUMB_LIMIT(30)段的图, 并发 4, 拉失败的段保持占位, 绝不阻塞列表。
  *
  * 断档怎么画
  * ----------
@@ -19,16 +33,16 @@
  * ------------
  * 与 `leapmotor-map.js` 完全同一套做法: 底图取高德瓦片(GCJ-02 火星坐标), 集成给的
  * 轨迹是 WGS-84, 画之前用 wgs84ToGcj02() 换算 —— 不换算会偏 300~500 米。
- * 计算与绘制代码也是从地图卡里搬过来的(投影/瓦片/换算), 两张卡行为一致。
+ * 缩略图与大图共用 project()/unproject() 与同一份瓦片模板。
  *
  * 用法
  * ----
  *   type: custom:leapmotor-trips
  *   # 可选
- *   height: 340          # 地图高度 px
+ *   height: 340          # 详情页大图高度 px
  *   satellite: false     # true = 卫星底图(默认路网图)
- *   overlay: 0           # 打开时默认叠加最近 N 段(0=关, 可选 5/10/20), 卡片上也能开关
- *   list_height: 460     # 左侧行程列表最大高度 px
+ *   overlay: 0           # 打开时默认叠加最近 N 段(0=关, 可选 5/10/20; 别名 overlay_count)
+ *   list_height: 520     # 行程列表最大高度 px
  *
  * 这个文件由集成自动注册为前端模块(见 custom_components/leapmotor/__init__.py),
  * 用户不需要把它拷到 www/ 或手配资源。
@@ -36,10 +50,17 @@
 
 const TILE = 256;
 
-const CARD_VERSION = "1.0.2";
+const CARD_VERSION = "1.1.0";
 
 /* 断档阈值(km): 相邻轨迹点距离超过它 → 视为中间丢过采样, 用虚线连 */
 const TRACK_GAP_KM = 2;
+
+/* 列表缩略图: 固定尺寸 + 最多补前 N 段(防止一次拉几十条轨迹/瓦片) */
+const THUMB_W = 96;
+const THUMB_H = 72;
+const THUMB_LIMIT = 30;
+const THUMB_FETCH_POINTS = 80;      // 缩略图只要这么多点, 详情大图才是全量
+const THUMB_CONCURRENCY = 4;
 
 /* 叠加模式的配色(相邻两段尽量不同色) */
 const OVERLAY_COLORS = [
@@ -163,6 +184,14 @@ function fmtDayTime(ts) {
   return (d.getMonth() + 1) + "月" + d.getDate() + "日 " + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
 }
 
+/** 详情页标题用的"9月13日 20:11"。 */
+function fmtStamp(ts) {
+  const n = Number(ts);
+  if (!n || !Number.isFinite(n)) return "—";
+  const d = new Date(n * 1000);
+  return (d.getMonth() + 1) + "月" + d.getDate() + "日 " + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+}
+
 function dayKey(ts) {
   const d = new Date(Number(ts) * 1000);
   return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
@@ -191,13 +220,52 @@ function fmtDuration(min) {
   return mm ? hh + " 小时 " + mm + " 分" : hh + " 小时";
 }
 
+/**
+ * 紧凑时长(对齐官方 App): 44'55" / 1h37' / 40"。
+ * duration_min 是分钟(带小数), 先换算成秒再拼。
+ */
+function fmtDurShort(min) {
+  const n = Number(min);
+  if (min == null || !Number.isFinite(n)) return "—";
+  const s = Math.max(0, Math.round(n * 60));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return h + "h" + pad2(m) + "'";
+  if (m > 0) return m + "'" + pad2(sec) + '"';
+  return sec + '"';
+}
+
 function fmtNum(v, digits, unit) {
   const n = Number(v);
   if (v == null || !Number.isFinite(n)) return "—";
   return n.toFixed(digits) + (unit ? " " + unit : "");
 }
 
-/** 等距抽稀(保留首尾), 给"叠加模式"减负 —— 画在一起时每段不需要全量点。 */
+/** 里程: 一位小数(官方 App 就是 19.0 km)。 */
+function fmtKm(v) {
+  const n = Number(v);
+  if (v == null || !Number.isFinite(n)) return "—";
+  return n.toFixed(1);
+}
+
+/** 耗电 kWh: 一位小数, 不到 1 kWh 的小段给两位(免得 0.40 显示成 0.4)。 */
+function fmtKwh(v) {
+  const n = Number(v);
+  if (v == null || !Number.isFinite(n)) return "—";
+  return Math.abs(n) < 1 ? n.toFixed(2) : n.toFixed(1);
+}
+
+/** 坐标文本(没有地点名, 就老实给坐标 —— 不编地名)。 */
+function fmtCoord(lat, lon) {
+  const la = Number(lat);
+  const lo = Number(lon);
+  if (lat == null || lon == null || !Number.isFinite(la) || !Number.isFinite(lo)) return null;
+  return Math.abs(la).toFixed(4) + "°" + (la >= 0 ? "N" : "S") + "  " +
+    Math.abs(lo).toFixed(4) + "°" + (lo >= 0 ? "E" : "W");
+}
+
+/** 等距抽稀(保留首尾), 给缩略图/叠加模式减负。 */
 function simplify(points, maxN) {
   if (!points || points.length <= maxN || maxN < 3) return points || [];
   const step = (points.length - 1) / (maxN - 1);
@@ -224,7 +292,11 @@ class LeapmotorTripsCard extends HTMLElement {
     this._selectedId = "";
     this._selTrip = null;
     this._sel = null;           // 选中行程的 {runs, breaks}(显示坐标)
-    this._trackCache = {};      // trip_id → 原始轨迹点(WGS-84)
+    this._trackCache = {};      // trip_id → 全量轨迹点(WGS-84), 详情大图用
+    this._thumbCache = {};      // trip_id → 降采样轨迹点(WGS-84), 缩略图用
+    this._thumbPrep = {};       // trip_id → 缩略图用的 {runs, breaks}(null = 没轨迹)
+    this._thumbSeq = 0;
+    this._view = "list";        // list | detail
     this._overlayN = 0;
     this._overlayTracks = [];
     this._overlaySeq = 0;
@@ -235,19 +307,24 @@ class LeapmotorTripsCard extends HTMLElement {
 
   /** 从卡片选择器添加时不需要填任何东西(数据走本集成的 WS 命令)。 */
   static getStubConfig() {
-    return { height: 340, satellite: false, overlay: 0 };
+    return { height: 340, satellite: false, overlay: 0, list_height: 520 };
   }
 
   setConfig(config) {
+    const raw = config || {};
     this._config = {
       height: 340,
       satellite: false,
       overlay: 0,
-      list_height: 460,
-      ...(config || {}),
+      list_height: 520,
+      ...raw,
     };
+    // overlay_count 是 overlay 的别名(两版卡片都有人这么写)
+    if (this._config.overlay == null && this._config.overlay_count != null) {
+      this._config.overlay = this._config.overlay_count;
+    }
     this._config.height = clamp(Number(this._config.height) || 340, 200, 900);
-    this._config.list_height = clamp(Number(this._config.list_height) || 460, 160, 1200);
+    this._config.list_height = clamp(Number(this._config.list_height) || 520, 160, 1600);
     const ov = Number(this._config.overlay) || 0;
     this._overlayN = ov === 5 || ov === 10 || ov === 20 ? ov : 0;
     this._overlayTracks = [];
@@ -256,6 +333,7 @@ class LeapmotorTripsCard extends HTMLElement {
     this._tiles.clear();
     this._built = false;
     this._center = null;
+    this._view = "list";
     this._needFit = true;
     this._render();
     if (this._overlayN > 0 && this._trips.length && this._hass) this._loadOverlay();
@@ -310,12 +388,15 @@ class LeapmotorTripsCard extends HTMLElement {
       this._stats = (res && res.stats) || null;
       this._active = (res && res.active) || null;
       this._trackCache = {};
+      this._thumbCache = {};
+      this._thumbPrep = {};
+      this._thumbSeq++;
       this._overlayTracks = [];
       this._overlaySeq++;
       this._loading = false;
       this._pickDefault();
       this._render();
-      if (this._selectedId) await this._select(this._selectedId);
+      if (this._view === "detail" && this._selectedId) await this._openDetail(this._selectedId, true);
       if (this._overlayN > 0) await this._loadOverlay();
     } catch (err) {
       this._loading = false;
@@ -324,7 +405,7 @@ class LeapmotorTripsCard extends HTMLElement {
     }
   }
 
-  /** 默认选中"最近一段有轨迹的行程"(没有就选最新一段)。 */
+  /** 默认选中"最近一段有轨迹的行程"(没有就选最新一段) —— 只决定高亮, 不自动进详情。 */
   _pickDefault() {
     if (this._selectedId && !this._find(this._selectedId)) this._selectedId = "";
     if (!this._selectedId) {
@@ -342,7 +423,7 @@ class LeapmotorTripsCard extends HTMLElement {
     this._needFit = true;
   }
 
-  /** 取一段行程的轨迹(带缓存), 顺手把 WGS-84 换算成显示坐标并切好断档。 */
+  /** 取一段行程的**全量**轨迹(详情大图用), 带缓存。 */
   async _ensureTrack(id) {
     if (this._trackCache[id]) return this._trackCache[id];
     let pts = [];
@@ -355,34 +436,31 @@ class LeapmotorTripsCard extends HTMLElement {
       pts = (res && res.points) || [];
     } catch (err) {
       pts = [];
-      this._err = this._errText(err);
+      if (!this._err) this._err = this._errText(err);
     }
     this._trackCache[id] = pts;
     return pts;
   }
 
-  async _select(id) {
-    const t = this._find(id);
-    this._selectedId = id;
-    this._selTrip = t;
-    this._renderList();
-    this._renderPanel();
-    if (!t) return;
-    if (t.point_count > 0) {
-      const pts = await this._ensureTrack(id);
-      if (String(this._selectedId) !== String(id)) return;   // 用户又点了别的行
-      this._sel = this._prepare(pts, 4000);
-    } else {
-      this._sel = null;
+  /** 取一段行程的**降采样**轨迹(缩略图用, 只 80 点), 带缓存; 失败返回空数组。 */
+  async _ensureThumbTrack(id) {
+    if (this._thumbCache[id]) return this._thumbCache[id];
+    let pts = [];
+    try {
+      const res = await this._hass.callWS({
+        type: "leapmotor/trips/track",
+        trip_id: id,
+        max_points: THUMB_FETCH_POINTS,
+      });
+      pts = (res && res.points) || [];
+    } catch (err) {
+      pts = [];
     }
-    this._needFit = true;
-    this._renderMap();
+    this._thumbCache[id] = pts;
+    return pts;
   }
 
-  /**
-   * 原始轨迹(WGS-84)→ 显示坐标, 并按距离切成 runs(实线)/ breaks(虚线)。
-   * 返回 {runs: [[pt,…],…], breaks: [[a,b],…]}。
-   */
+  /** 原始轨迹(WGS-84)→ 显示坐标, 并按距离切成 runs(实线)/ breaks(虚线)。 */
   _prepare(raw, maxN) {
     const src = simplify(raw || [], maxN);
     const disp = [];
@@ -409,6 +487,31 @@ class LeapmotorTripsCard extends HTMLElement {
     }
     if (cur.length) runs.push(cur);
     return { runs: runs, breaks: breaks };
+  }
+
+  async _openDetail(id, keepView) {
+    const t = this._find(id);
+    this._selectedId = id;
+    this._selTrip = t;
+    this._view = "detail";
+    this._render();
+    if (!t) return;
+    if (t.point_count > 0) {
+      const pts = await this._ensureTrack(id);
+      if (String(this._selectedId) !== String(id) || this._view !== "detail") return;
+      this._sel = this._prepare(pts, 4000);
+    } else {
+      this._sel = null;
+    }
+    if (keepView === true && this._overlayN > 0) return;   // 刷新场景, 叠加单独加载
+    this._needFit = true;
+    this._renderMap();
+    this._renderDetailInfo();
+  }
+
+  _backToList() {
+    this._view = "list";
+    this._render();          // 走一次整体渲染, 顺便把列表视图重新显示出来
   }
 
   async _loadOverlay() {
@@ -468,10 +571,17 @@ class LeapmotorTripsCard extends HTMLElement {
     this._renderHead();
     this._renderActive();
     this._renderToolbar();
-    this._renderList();
+    if (this._view === "detail") {
+      this._listView.hidden = true;
+      this._detailView.hidden = false;
+      this._renderMap();
+      this._renderDetailInfo();
+    } else {
+      this._detailView.hidden = true;
+      this._listView.hidden = false;
+      this._renderList();
+    }
     this._renderLegend();
-    this._renderPanel();
-    this._renderMap();
   }
 
   _renderHead() {
@@ -479,8 +589,8 @@ class LeapmotorTripsCard extends HTMLElement {
     const st = this._stats;
     const parts = [];
     if (st && st.today) {
-      parts.push(`今日 ${st.today.count || 0} 段 · ${fmtNum(st.today.km, 1, "km")}`);
-      if (st.days7) parts.push(`近7天 ${fmtNum(st.days7.km, 1, "km")}`);
+      parts.push(`今日 ${st.today.count || 0} 段 · ${fmtKm(st.today.km)} km`);
+      if (st.days7) parts.push(`近7天 ${fmtKm(st.days7.km)} km`);
     }
     if (st && st.gaps) parts.push(`漏采 ${st.gaps} 次`);
     this._sumEl.textContent = parts.join(" · ");
@@ -505,13 +615,16 @@ class LeapmotorTripsCard extends HTMLElement {
     this._ovlN.value = String(this._overlayN || 5);
   }
 
+  // ── 列表视图 ──
   _renderList() {
     if (!this._listEl) return;
     if (this._err) {
       this._listEl.innerHTML = "";
       this._lmsgEl.textContent = this._err;
+      this._lmsgEl.className = "lmsg err";
       return;
     }
+    this._lmsgEl.className = "lmsg";
     if (!this._loaded || (this._loading && !this._trips.length)) {
       this._listEl.innerHTML = "";
       this._lmsgEl.textContent = "读取中…";
@@ -530,8 +643,10 @@ class LeapmotorTripsCard extends HTMLElement {
       if (!group.length) return;
       let km = 0;
       for (const t of group) km += Number(t.distance_km) || 0;
-      html += '<div class="grp">' + dayLabel(group[0].started_at) +
-        " · " + group.length + " 段 · " + km.toFixed(1) + " km</div>";
+      html += '<div class="grp" data-day="' + dayKey(group[0].started_at) + '">' +
+        '<span class="dn">' + dayLabel(group[0].started_at) + "</span>" +
+        '<span class="dc">' + group.length + " 段</span>" +
+        '<span class="dk">' + km.toFixed(1) + " km</span></div>";
       for (const t of group) html += this._rowHtml(t);
       group = [];
     };
@@ -545,31 +660,281 @@ class LeapmotorTripsCard extends HTMLElement {
       group.push(t);
     }
     flush();
+    const keepTop = this._listEl.scrollTop;
     this._listEl.innerHTML = html;
+    this._listEl.scrollTop = keepTop;
+    this._paintThumbs();
   }
 
+  /** 一段行程 = 一张白卡: 缩略图 + 大号里程 + 时间段 + 三列小指标。 */
   _rowHtml(t) {
     const sel = String(t.id) === String(this._selectedId);
     const sameDay = dayKey(t.started_at) === dayKey(t.ended_at || t.started_at);
     const tm = sameDay
-      ? fmtTime(t.started_at) + " → " + fmtTime(t.ended_at)
-      : fmtDayTime(t.started_at) + " → " + fmtDayTime(t.ended_at);
+      ? fmtTime(t.started_at) + " - " + fmtTime(t.ended_at)
+      : fmtDayTime(t.started_at) + " - " + fmtDayTime(t.ended_at);
     const badges = [];
-    if (t.reconstructed) badges.push('<span class="badge r" title="漏采补记: 没有轨迹, 时间只是两次观测之间">补记</span>');
+    if (t.reconstructed) {
+      badges.push('<span class="badge r" title="漏采补记: 没有轨迹, 时间只是两次观测之间">补记</span>');
+    }
     if (t.frozen) badges.push('<span class="badge f" title="车端失联后收尾, 时长可能有偏差">失联</span>');
-    const sub = [];
-    sub.push((t.approx_time ? "≈ " : "") + fmtDuration(t.duration_min));
-    if (t.efficiency != null) sub.push(fmtNum(t.efficiency, 1, "kWh/100km"));
-    if (t.energy_kwh != null) sub.push(fmtNum(t.energy_kwh, 2, "kWh"));
+    const mets = [
+      ["耗时", (t.approx_time ? "≈ " : "") + fmtDurShort(t.duration_min), "", "时长"],
+      ["耗电", fmtKwh(t.energy_kwh), "kWh", "这段行程的耗电量"],
+      // 单位跟官方 App 的详情页一致(那儿是「百公里 20.7 kWh」), 窄屏下才塞得下;
+      // 完整口径 kWh/100km 放在 title 里, 详情页的「百公里能耗」格也写着
+      ["平均能耗", t.efficiency == null ? "—" : fmtNum(t.efficiency, 1), "kWh", "百公里能耗 (kWh/100km)"],
+    ];
+    const metHtml = mets
+      .map((m) => '<div class="met" title="' + m[3] + '"><span class="k">' + m[0] + "</span><span class=\"v\">" +
+        m[1] + (m[2] ? "<i>" + m[2] + "</i>" : "") + "</span></div>")
+      .join("");
     return (
-      '<div class="row' + (sel ? " sel" : "") + '" data-id="' + String(t.id) + '">' +
-      '<div class="r1"><span class="tm">' + tm + "</span>" +
-      '<span class="km">' + fmtNum(t.distance_km, 2, "km") + "</span></div>" +
-      '<div class="r2">' + sub.map((s) => "<span>" + s + "</span>").join("") +
-      badges.join("") + "</div>" +
-      '<button class="del" title="删除这段行程">删</button>' +
-      "</div>"
+      '<div class="row trip' + (sel ? " sel" : "") + '" data-id="' + String(t.id) + '">' +
+      '<div class="thumb" title="行程缩略图">' +
+      (badges.length ? '<span class="rbadges">' + badges.join("") + "</span>" : "") +
+      "</div>" +
+      '<div class="rbody">' +
+      '<div class="rtop">' +
+      '<span class="rkm">' + fmtKm(t.distance_km) + "<i>km</i></span>" +
+      '<span class="rtm">' + tm + "</span>" +
+      '<button class="del" data-act="del" title="删除这段行程">' +
+      '<ha-icon icon="mdi:trash-can-outline"></ha-icon></button>' +
+      "</div>" +
+      '<div class="mets">' + metHtml + "</div>" +
+      "</div></div>"
     );
+  }
+
+  // ── 缩略图 ──
+  _paintThumbs() {
+    if (!this._listEl) return;
+    const rows = this._listEl.querySelectorAll(".row[data-id]");
+    let i = 0;
+    for (const row of rows) {
+      if (i >= THUMB_LIMIT) break;      // 只补前 N 段, 后面的保持占位(省瓦片请求)
+      i++;
+      if (this._thumbPrep[row.dataset.id]) this._paintThumb(row, row.dataset.id);
+    }
+    this._queueThumbs();
+  }
+
+  /** 排队拉缩略图轨迹: 并发 4, 拿到就只补那一张缩略图(不整表重画)。 */
+  _queueThumbs() {
+    if (!this._listEl || !this._hass || !this._hass.callWS) return;
+    const rows = [];
+    let i = 0;
+    for (const row of this._listEl.querySelectorAll(".row[data-id]")) {
+      if (i++ >= THUMB_LIMIT) break;
+      rows.push(row);
+    }
+    if (!rows.length) return;
+    const seq = ++this._thumbSeq;
+    let idx = 0;
+    const worker = async () => {
+      while (idx < rows.length) {
+        const row = rows[idx++];
+        const id = row && row.dataset ? row.dataset.id : "";
+        if (!id || !row.isConnected) continue;
+        if (!this._thumbPrep[id]) {
+          const raw = await this._ensureThumbTrack(id);
+          if (seq !== this._thumbSeq) return;
+          this._thumbPrep[id] = raw && raw.length ? this._prepare(raw, 160) : null;
+        }
+        if (seq !== this._thumbSeq || !row.isConnected) return;
+        this._paintThumb(row, id);
+      }
+    };
+    for (let k = 0; k < THUMB_CONCURRENCY; k++) worker();
+  }
+
+  /** 把一段行程画进某个 .thumb 容器(瓦片 + 红色折线; 没轨迹就退回虚线/占位)。 */
+  _paintThumb(row, id) {
+    const el = row.querySelector(".thumb");
+    if (!el) return;
+    const t = this._find(id);
+    const prep = this._thumbPrep[id];
+    const pts = prep ? this._flatPrep(prep) : [];
+    // 瓦片/轨迹节点只建一次(里面可能压着徽标, 不能整块 innerHTML 覆盖)
+    let box = el.querySelector(".tiles");
+    let svg = el.querySelector("svg");
+    if (!box) {
+      box = document.createElement("div");
+      box.className = "tiles";
+      svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("class", "ttraj");
+      svg.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+      svg.setAttribute("width", String(THUMB_W));
+      svg.setAttribute("height", String(THUMB_H));
+      svg.setAttribute("viewBox", "0 0 " + THUMB_W + " " + THUMB_H);
+      el.appendChild(box);
+      el.appendChild(svg);
+    }
+    box.innerHTML = "";
+    svg.innerHTML = "";
+    if (pts.length < 2) {
+      // 补记/没轨迹: 浅灰底 + 起终点一条虚线; 连坐标都没有就写一个"无轨迹"
+      el.classList.add("empty");
+      const a = t ? this._point(t.start_lat, t.start_lon) : null;
+      const b = t ? this._point(t.end_lat, t.end_lon) : null;
+      if (a && b) {
+        const geom = this._geom([a, b], THUMB_W, THUMB_H);
+        if (geom) {
+          this._thumbTiles(el, geom, THUMB_W, THUMB_H);
+          const mapPt = this._mapper(geom, THUMB_W, THUMB_H);
+          svg.appendChild(this._poly([a, b], mapPt, "#e53935", 1.5, true));
+        }
+      }
+      if (!a || !b) {
+        const ph = document.createElement("span");
+        ph.className = "ph";
+        ph.textContent = t && t.reconstructed ? "补记·无轨迹" : "无轨迹";
+        el.appendChild(ph);
+      }
+      return;
+    }
+    el.classList.remove("empty");
+    const geom = this._geom(pts, THUMB_W, THUMB_H);
+    if (!geom) return;
+    this._thumbTiles(el, geom, THUMB_W, THUMB_H);
+    const mapPt = this._mapper(geom, THUMB_W, THUMB_H);
+    for (const run of prep.runs) {
+      if (run.length < 2) continue;
+      svg.appendChild(this._poly(run, mapPt, "#e53935", 2, false));
+    }
+    for (const br of prep.breaks) svg.appendChild(this._poly(br, mapPt, "#e53935", 1.5, true));
+  }
+
+  _flatPrep(prep) {
+    const out = [];
+    if (!prep) return out;
+    for (const run of prep.runs) for (const p of run) out.push(p);
+    for (const br of prep.breaks) { out.push(br[0]); out.push(br[1]); }
+    return out;
+  }
+
+  /**
+   * 取景: 让这些点在 w×h 的框里尽量撑满。
+   * 返回 {z, k, cx, cy}(cx/cy 已经是该 zoom 下的世界像素中心), 点 < 2 个返回 null。
+   */
+  _geom(pts, w, h) {
+    if (!pts || pts.length < 2 || !w || !h) return null;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const p of pts) {
+      const xy = project(p[0], p[1], 0);
+      if (xy[0] < minX) minX = xy[0];
+      if (xy[0] > maxX) maxX = xy[0];
+      if (xy[1] < minY) minY = xy[1];
+      if (xy[1] > maxY) maxY = xy[1];
+    }
+    const spanX = Math.max(maxX - minX, 1e-9);
+    const spanY = Math.max(maxY - minY, 1e-9);
+    // fit = 1 个 zoom0 世界像素该缩成多少 CSS px; 0.86 是四周留的边距
+    const fit = Math.min((w * 0.86) / spanX, (h * 0.86) / spanY);
+    const z = clamp(Math.floor(Math.log2(fit)), 3, 18);
+    const s = Math.pow(2, z);
+    // 注意 k 要除以 s: 直接拿 w/(spanX*s) 会把边距吃掉, 轨迹会贴到框边上
+    const k = fit / s;
+    return { z: z, k: k, cx: ((minX + maxX) / 2) * s, cy: ((minY + maxY) / 2) * s };
+  }
+
+  _mapper(geom, w, h) {
+    const z = geom.z;
+    return (p) => {
+      const xy = project(p[0], p[1], z);
+      // 注意: x/y 必须各自先算完再拼字符串, 直接写成 `x + "," + y + h / 2`
+      // 会被 JS 的 + 优先级变成字符串拼接(数字后面接 "36"), 点全飞到框外去。
+      const sx = ((xy[0] - geom.cx) * geom.k + w / 2).toFixed(1);
+      const sy = ((xy[1] - geom.cy) * geom.k + h / 2).toFixed(1);
+      return sx + "," + sy;
+    };
+  }
+
+  /** 缩略图底图: 一般 1~2 张瓦片就够, 全挂了就退回纯色底(轨迹线照画)。 */
+  _thumbTiles(el, geom, w, h) {
+    const box = el.querySelector(".tiles");
+    if (!box) return;
+    const left = geom.cx - w / (2 * geom.k);
+    const top = geom.cy - h / (2 * geom.k);
+    const vw = w / geom.k;
+    const vh = h / geom.k;
+    const z = geom.z;
+    const x0 = Math.floor(left / TILE);
+    const y0 = Math.floor(top / TILE);
+    const x1 = Math.floor((left + vw) / TILE);
+    const y1 = Math.floor((top + vh) / TILE);
+    const max = Math.pow(2, z);
+    for (let x = x0; x <= x1; x++) {
+      for (let y = y0; y <= y1; y++) {
+        if (y < 0 || y >= max) continue;
+        const wx = ((x % max) + max) % max;
+        const img = document.createElement("img");
+        img.decoding = "async";
+        img.style.left = (x * TILE - left) + "px";
+        img.style.top = (y * TILE - top) + "px";
+        img.src = this._tileUrl(z, wx, y, false);
+        img.addEventListener("error", () => {
+          if (!img.dataset.retried) {
+            // 高德连不上(海外网络)时回落 OSM
+            img.dataset.retried = "1";
+            img.src = this._tileUrl(z, wx, y, true);
+          } else {
+            img.remove();       // 两边都不行 → 留浅灰底, 轨迹线还在
+          }
+        });
+        box.appendChild(img);
+      }
+    }
+  }
+
+  // ── 详情视图 ──
+  _renderDetailInfo() {
+    if (!this._dinfoEl) return;
+    const t = this._selTrip;
+    if (!t) {
+      this._dinfoEl.innerHTML = '<div class="pempty">没有选中行程</div>';
+      return;
+    }
+    const sameDay = dayKey(t.started_at) === dayKey(t.ended_at || t.started_at);
+    const when = sameDay
+      ? fmtStamp(t.started_at) + " - " + fmtTime(t.ended_at)
+      : fmtStamp(t.started_at) + " - " + fmtStamp(t.ended_at);
+    const sc = fmtCoord(t.start_lat, t.start_lon);
+    const ec = fmtCoord(t.end_lat, t.end_lon);
+    const bad = [];
+    if (t.reconstructed) bad.push("补记");
+    if (t.approx_time) bad.push("≈ 时间");
+    if (t.frozen) bad.push("失联");
+    const cells = [
+      ["里程", fmtKm(t.distance_km), "km"],
+      ["耗时", (t.approx_time ? "≈ " : "") + fmtDurShort(t.duration_min), ""],
+      ["耗电", fmtKwh(t.energy_kwh), "kWh"],
+      ["百公里能耗", t.efficiency == null ? "—" : fmtNum(t.efficiency, 1), "kWh/100km"],
+      ["平均速度", fmtNum(t.avg_speed_kmh, 1), "km/h"],
+      ["轨迹点", t.point_count ? String(t.point_count) : "—", t.point_count ? "个" : ""],
+    ];
+    const legHtml = (kind, coord, when2, label) =>
+      '<div class="leg ' + kind + '"><span class="dot"></span><span class="lwrap">' +
+      '<span class="lt">' + label + "</span>" +
+      '<span class="lc">' + (coord || "坐标未知") + "</span>" +
+      '<span class="lc">' + when2 + "</span></span></div>";
+    this._dinfoEl.innerHTML =
+      '<div class="dwhen">' + when +
+      (bad.length ? '<span class="dbad">' + bad.join(" · ") + "</span>" : "") + "</div>" +
+      '<div class="legs">' +
+      legHtml("start", sc, "出发 · " + fmtTime(t.started_at), "起点") +
+      legHtml("end", ec, "到达 · " + fmtTime(t.ended_at), "终点") +
+      "</div>" +
+      '<div class="ddiv"></div>' +
+      '<div class="dgrid">' +
+      cells.map((c) => '<div class="dcell"><span class="k">' + c[0] + "</span><span class=\"v\">" +
+        c[1] + (c[2] ? "<i>" + c[2] + "</i>" : "") + "</span></div>").join("") +
+      "</div>" +
+      (t.reconstructed ? '<div class="dnote">补记: 这段没有轨迹, 里程/耗电来自总里程与电量跳变。</div>' : "");
+    this._ddelEl.dataset.id = String(t.id);
   }
 
   _renderLegend() {
@@ -587,47 +952,10 @@ class LeapmotorTripsCard extends HTMLElement {
       .join("");
   }
 
-  _renderPanel() {
-    if (!this._panelEl) return;
-    const t = this._selTrip;
-    if (!t) {
-      this._panelEl.innerHTML = '<div class="pempty">点左边的行程查看详情</div>';
-      return;
-    }
-    const sameDay = dayKey(t.started_at) === dayKey(t.ended_at || t.started_at);
-    const when = sameDay
-      ? fmtTime(t.started_at) + " → " + fmtTime(t.ended_at)
-      : fmtDayTime(t.started_at) + " → " + fmtDayTime(t.ended_at);
-    const soc = (t.start_soc != null && t.end_soc != null)
-      ? fmtNum(t.start_soc, 0, "%") + " → " + fmtNum(t.end_soc, 0, "%")
-      : "—";
-    const rows = [
-      ["时间", when],
-      ["时长", (t.approx_time ? "≈ " : "") + fmtDuration(t.duration_min)],
-      ["里程", fmtNum(t.distance_km, 2, "km") +
-        (t.distance_source === "odo" ? "（总里程）" : t.distance_source === "gps" ? "（GPS）" : "")],
-      ["耗电", fmtNum(t.energy_kwh, 2, "kWh")],
-      ["能耗", fmtNum(t.efficiency, 1, "kWh/100km")],
-      ["平均速度", fmtNum(t.avg_speed_kmh, 1, "km/h")],
-      ["电量", soc],
-      ["轨迹点", t.point_count ? String(t.point_count) : "—"],
-    ];
-    let html = rows
-      .map((r) => '<div class="prow"><span class="pk" title="' + r[0] + '">' + r[0] +
-        '</span><span class="pv">' + r[1] + "</span></div>")
-      .join("");
-    const notes = [];
-    if (t.reconstructed) notes.push("补记(无轨迹; 里程/耗电来自总里程与 SOC 跳变)");
-    if (t.approx_time) notes.push("时间只是两次观测之间, 不是精确行程时刻");
-    if (t.frozen) notes.push("失联收尾");
-    if (notes.length) html += '<div class="prow"><span class="pk">备注</span><span class="pv">' +
-      notes.join(" · ") + "</span></div>";
-    this._panelEl.innerHTML = html;
-  }
-
-  // ── 地图 ──
+  // ── 地图(详情大图) ──
   _renderMap() {
     if (!this._mapEl) return;
+    if (this._view !== "detail" || this._detailView.hidden) return;
     if (this._needFit && this._fit(this._allPts())) this._needFit = false;
     this._renderTiles();
     this._renderLines();
@@ -845,10 +1173,12 @@ class LeapmotorTripsCard extends HTMLElement {
     } else if (!this._trips.length) {
       text = this._loading || !this._loaded ? "读取中…" : "还没有行程记录";
     } else if (!this._selectedId) {
-      text = "点左边的行程看轨迹";
+      text = "回列表选一段行程";
     } else if (this._selTrip && !this._selTrip.point_count) {
       text = this._selTrip.reconstructed ? "这段没有轨迹(靠里程跳变补记)" : "这段没有轨迹";
-    } else if (this._selTrip && this._sel && !this._sel.runs.length) {
+    } else if (this._selTrip && !this._sel) {
+      text = "轨迹点太少, 画不出路线";
+    } else if (this._selTrip && !this._sel.runs.length) {
       text = "轨迹点太少, 画不出路线";
     }
     this._mhintEl.textContent = text;
@@ -856,16 +1186,27 @@ class LeapmotorTripsCard extends HTMLElement {
   }
 
   // ── 交互 ──
+  /** 删除按钮的两态: 平时垃圾桶, 确认态打勾。 */
+  _delIcon(btn, armed) {
+    if (armed) {
+      btn.innerHTML = '<ha-icon icon="mdi:check"></ha-icon>';
+      btn.title = "再点一次确认删除";
+    } else {
+      btn.innerHTML = '<ha-icon icon="mdi:trash-can-outline"></ha-icon>';
+      btn.title = "删除这段行程";
+    }
+  }
+
   async _deleteTrip(id, btn) {
     if (!btn.dataset.armed) {
       btn.dataset.armed = "1";
       btn.classList.add("armed");
-      btn.textContent = "确认";
+      this._delIcon(btn, true);
       setTimeout(() => {                        // 3 秒内没确认就复位, 防止误触
         if (btn.dataset.armed && btn.isConnected) {
           delete btn.dataset.armed;
           btn.classList.remove("armed");
-          btn.textContent = "删";
+          this._delIcon(btn, false);
         }
       }, 3000);
       return;
@@ -873,23 +1214,30 @@ class LeapmotorTripsCard extends HTMLElement {
     if (!this._hass || !this._hass.callWS) return;
     if (this._hass.user && !this._hass.user.is_admin) {
       this._err = "需要管理员权限才能删除行程";
-      this._renderList();
+      this._render();
       return;
     }
     btn.disabled = true;
-    btn.textContent = "…";
+    btn.innerHTML = "";
     try {
       await this._hass.callWS({ type: "leapmotor/trips/delete", trip_id: id });
+      delete this._trackCache[id];
+      delete this._thumbCache[id];
+      delete this._thumbPrep[id];
       if (String(this._selectedId) === String(id)) {
         this._selectedId = "";
         this._selTrip = null;
         this._sel = null;
+        this._view = "list";
       }
-      delete this._trackCache[id];
       await this._load();
     } catch (err) {
+      btn.disabled = false;
+      delete btn.dataset.armed;
+      btn.classList.remove("armed");
+      this._delIcon(btn, false);
       this._err = "删除失败: " + this._errText(err);
-      this._renderList();
+      this._render();
     }
   }
 
@@ -935,68 +1283,152 @@ class LeapmotorTripsCard extends HTMLElement {
         :host { display: block; }
         .card {
           background: var(--ha-card-background, var(--card-background-color, #fff));
-          color: var(--primary-text-color, #222);
+          color: var(--primary-text-color, #212121);
           border-radius: var(--ha-card-border-radius, 12px);
-          padding: 8px 10px 10px; box-sizing: border-box;
+          padding: 10px 12px 12px; box-sizing: border-box;
           font-size: 13px;
         }
+        /* 行程卡/信息卡的底色 —— HA 深浅色主题下都靠这几个变量自适应 */
+        .sheet {
+          background: var(--ha-card-background, var(--card-background-color, #fff));
+          border: 1px solid var(--divider-color, rgba(0, 0, 0, .09));
+          box-shadow: 0 1px 3px rgba(0, 0, 0, .13);
+        }
+        .sub { color: var(--secondary-text-color, #6b7280); }
+
         .head { display: flex; align-items: center; gap: 8px; }
-        .head .title { font-weight: 600; font-size: 14px; }
-        .head .sum { font-size: 12px; opacity: .7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .head .title { font-weight: 600; font-size: 14px; white-space: nowrap; flex: 0 0 auto; }
+        .head .sum {
+          flex: 0 1 auto; min-width: 0; font-size: 12px;
+          overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
         .head .spacer { flex: 1; }
         button {
           font: inherit; font-size: 12px; color: inherit; cursor: pointer;
-          border-radius: 8px; border: 1px solid var(--divider-color, #ccc);
+          border-radius: 8px; border: 1px solid var(--divider-color, #d8dde2);
           background: var(--card-background-color, #fff);
         }
         .head button.refresh { width: 30px; height: 26px; font-size: 15px; line-height: 1; }
         .head button.refresh.spin { opacity: .45; }
+        ha-icon { display: inline-flex; width: 16px; height: 16px; --mdc-icon-size: 16px; }
+
         .active {
-          display: none; align-items: center; gap: 6px; margin-top: 6px; padding: 5px 8px;
+          display: none; align-items: center; gap: 6px; margin-top: 6px; padding: 4px 8px;
           font-size: 12px; border-radius: 8px;
           background: rgba(3,169,244,.12); border: 1px solid rgba(3,169,244,.35);
         }
         .active.on { display: flex; }
         .active .dot { width: 8px; height: 8px; border-radius: 50%; background: #03a9f4; animation: lpulse 1.4s infinite; }
         @keyframes lpulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
-        .body { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; align-items: flex-start; }
-        .listwrap { flex: 1 1 260px; min-width: 230px; max-width: 360px; }
-        .list { max-height: ${listH}px; overflow: auto; font-size: 12px; }
+
+        .view[hidden] { display: none !important; }
+
+        /* ── 列表视图 ── */
+        .list { max-height: ${listH}px; overflow: auto; margin: 0 -4px; padding: 0 4px; }
         .grp {
-          position: sticky; top: 0; z-index: 1; padding: 4px 2px; font-size: 11px; opacity: .7;
+          position: sticky; top: 0; z-index: 2; display: flex; align-items: baseline; gap: 6px;
+          padding: 9px 2px 5px;
           background: var(--ha-card-background, var(--card-background-color, #fff));
         }
-        .row { position: relative; padding: 6px 42px 6px 8px; border-radius: 8px; cursor: pointer; }
-        .row:hover { background: rgba(127,127,127,.09); }
-        .row.sel { background: rgba(3,169,244,.14); box-shadow: inset 0 0 0 1px rgba(3,169,244,.4); }
-        .row.act { cursor: default; }
-        .row .r1 { display: flex; justify-content: space-between; gap: 6px; }
-        .row .tm { font-weight: 600; }
-        .row .km { opacity: .85; }
-        .row .r2 { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 2px; font-size: 11px; opacity: .7; }
-        .badge { padding: 0 5px; border-radius: 999px; font-size: 10px; border: 1px solid currentColor; opacity: 1; }
-        .badge.r { color: #f9a825; }
-        .badge.f { color: #e53935; }
-        .row .del {
-          position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
-          padding: 2px 7px; font-size: 11px;
+        .grp .dn { font-weight: 600; font-size: 14px; }
+        .grp .dc { font-size: 11px; }
+        .grp .dk { margin-left: auto; font-weight: 600; font-size: 14px; }
+        .row {
+          position: relative;                     /* 徽标要压在缩略图上, 得有个定位父级 */
+          display: flex; gap: 10px; padding: 9px; margin: 0 0 8px;
+          border-radius: 14px; cursor: pointer;
+          background: var(--ha-card-background, var(--card-background-color, #fff));
+          border: 1px solid var(--divider-color, rgba(0, 0, 0, .09));
+          box-shadow: 0 1px 3px rgba(0, 0, 0, .13);
         }
-        .row .del.armed { background: var(--error-color, #db4437); color: #fff; border-color: var(--error-color, #db4437); }
-        .lmsg { padding: 6px 4px; font-size: 12px; opacity: .75; }
-        .main { flex: 1 1 380px; min-width: 300px; }
-        .tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; margin-bottom: 6px; }
+        .row:hover { box-shadow: 0 2px 8px rgba(0, 0, 0, .2); }
+        .row.sel { border-color: var(--primary-color, #03a9f4); box-shadow: 0 0 0 1px var(--primary-color, #03a9f4); }
+
+        /* 缩略图: 固定尺寸的小地图 + 红色轨迹 */
+        .thumb {
+          position: relative; flex: 0 0 auto; width: ${THUMB_W}px; height: ${THUMB_H}px;
+          border-radius: 10px; overflow: hidden;
+          background: var(--secondary-background-color, #e7eaed);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0, 0, 0, .08));
+        }
+        .thumb .tiles { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+        .thumb .tiles img { position: absolute; width: ${TILE}px; height: ${TILE}px; -webkit-user-drag: none; }
+        .thumb svg { position: absolute; left: 0; top: 0; }
+        .thumb .ph {
+          position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%);
+          text-align: center; font-size: 9px; line-height: 1.3;
+        }
+
+        .rbody { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+        .rtop { display: flex; align-items: center; gap: 6px; }
+        .rkm { font-size: 26px; font-weight: 600; line-height: 1.05; letter-spacing: -.5px; white-space: nowrap; }
+        .rkm i, .met .v i, .dcell .v i {
+          font-style: normal; font-size: 11px; font-weight: 500; margin-left: 2px;
+          color: var(--secondary-text-color, #6b7280);
+        }
+        .rtm {
+          margin-left: auto; font-size: 12px; white-space: nowrap; overflow: hidden;
+          text-overflow: ellipsis; color: var(--secondary-text-color, #6b7280);
+        }
+        /* 补记/失联徽标: 压在缩略图左上角 —— 放行内会把时间段/指标挤没 */
+        .thumb .rbadges { position: absolute; left: 4px; top: 4px; z-index: 3; display: flex; gap: 4px; }
+        .badge {
+          padding: 0 5px; border-radius: 999px; font-size: 9px; line-height: 14px;
+          white-space: nowrap; color: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .3);
+        }
+        .badge.r { background: rgba(245, 158, 11, .95); }
+        .badge.f { background: rgba(229, 57, 53, .95); }
+
+        .mets { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-top: auto; }
+        .met { min-width: 0; }
+        .met .k {
+          display: block; font-size: 10px; line-height: 1.2;
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+          color: var(--secondary-text-color, #6b7280);
+        }
+        .met .v {
+          display: block; font-size: 14px; font-weight: 600; line-height: 1.3;
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .met .v i { font-size: 9px; }
+
+        .del {
+          flex: 0 0 auto; width: 24px; height: 24px; padding: 0;
+          display: flex; align-items: center; justify-content: center;
+          border-color: transparent; background: transparent; opacity: .45;
+        }
+        .del:hover { opacity: 1; background: rgba(127,127,127,.16); }
+        .del.armed {
+          opacity: 1; color: #fff; border-color: var(--error-color, #db4437);
+          background: var(--error-color, #db4437);
+        }
+        .del[disabled] { opacity: .3; }
+        .lmsg { padding: 10px 2px; font-size: 12px; }
+        .lmsg.err { color: var(--error-color, #db4437); }
+
+        /* ── 详情视图 ── */
+        .dhead { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+        .dhead .dtitle { font-weight: 600; font-size: 14px; }
+        .dhead .spacer { flex: 1; }
+        .back {
+          width: 28px; height: 28px; padding: 0;
+          display: flex; align-items: center; justify-content: center;
+        }
+        .back ha-icon { width: 18px; height: 18px; --mdc-icon-size: 18px; }
+        .tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; margin-top: 8px; }
         .tools label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
         .tools select {
           padding: 2px 4px; font: inherit; font-size: 12px; color: inherit;
-          border: 1px solid var(--divider-color, #ccc); border-radius: 6px;
+          border: 1px solid var(--divider-color, #d8dde2); border-radius: 6px;
           background: var(--card-background-color, #fff);
         }
         .tools .spacer { flex: 1; }
         .tools button { width: 30px; height: 26px; }
+
         .map {
           position: relative; height: ${h}px;
           /* 必须用 clip 而不是 hidden: hidden 仍是可滚动容器, 会让绝对定位的瓦片整体偏移 */
-          overflow: clip; border-radius: 10px; background: #dfe6ea;
+          overflow: clip; border-radius: 12px; background: #dfe6ea;
           cursor: grab; touch-action: none; user-select: none;
         }
         .map.dragging { cursor: grabbing; }
@@ -1009,21 +1441,40 @@ class LeapmotorTripsCard extends HTMLElement {
           border-radius: 50%; color: #fff; font-size: 11px; font-weight: 600; line-height: 18px;
           text-align: center; border: 2px solid #fff; box-shadow: 0 1px 3px rgba(0,0,0,.4);
         }
-        .mk.start { background: #2e7d32; }
+        .mk.start { background: #111; }
         .mk.end { background: #e53935; }
         .mhint {
           position: absolute; left: 50%; bottom: 8px; transform: translateX(-50%); z-index: 6;
           display: none; padding: 3px 9px; border-radius: 999px; font-size: 11px; white-space: nowrap;
           background: rgba(0,0,0,.62); color: #fff;
         }
-        .panel {
-          margin-top: 6px; font-size: 12px;
-          display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 2px 12px;
+
+        .dinfo { margin-top: 10px; padding: 12px 14px; border-radius: 14px; }
+        .dwhen { font-size: 17px; font-weight: 600; letter-spacing: .2px; }
+        .dwhen .dbad { margin-left: 8px; font-size: 11px; font-weight: 500; color: var(--secondary-text-color, #6b7280); }
+        .legs { margin-top: 10px; display: flex; flex-direction: column; gap: 9px; }
+        .leg { position: relative; display: flex; align-items: flex-start; gap: 9px; }
+        .leg .dot { margin-top: 5px; width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; }
+        .leg.start .dot { background: #111; }
+        .leg.end .dot { background: #e53935; }
+        .leg.start::after {
+          content: ""; position: absolute; left: 4px; top: 18px; bottom: -11px;
+          border-left: 2px dotted var(--divider-color, #b9c0c6);
         }
-        .prow { display: flex; gap: 5px; min-width: 0; }
-        .prow .pk { opacity: .6; white-space: nowrap; }
-        .prow .pv { font-weight: 600; min-width: 0; word-break: break-word; }
-        .pempty { opacity: .6; }
+        .leg .lwrap { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+        .leg .lt { font-weight: 600; font-size: 13px; }
+        .leg .lc { font-size: 12px; color: var(--secondary-text-color, #6b7280); }
+        .ddiv { height: 1px; margin: 12px 0; background: var(--divider-color, #e0e0e0); }
+        .dgrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 8px; }
+        .dcell { min-width: 0; }
+        .dcell .k { display: block; font-size: 11px; color: var(--secondary-text-color, #6b7280); }
+        .dcell .v {
+          display: block; font-size: 19px; font-weight: 600; margin-top: 1px;
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .dnote { margin-top: 10px; font-size: 11px; color: var(--secondary-text-color, #6b7280); }
+        .pempty { opacity: .6; font-size: 12px; padding: 6px 2px; }
+
         .legend { display: none; flex-wrap: wrap; gap: 4px 10px; margin-top: 6px; font-size: 11px; }
         .legend.on { display: flex; }
         .lg { display: flex; align-items: center; gap: 4px; cursor: pointer; opacity: .85; }
@@ -1033,38 +1484,46 @@ class LeapmotorTripsCard extends HTMLElement {
       <div class="card">
         <div class="head">
           <span class="title">行程</span>
-          <span class="sum"></span>
+          <span class="sum sub"></span>
           <span class="spacer"></span>
           <button class="refresh" title="刷新行程列表">↻</button>
         </div>
         <div class="active"><span class="dot"></span><span class="atext"></span></div>
-        <div class="body">
-          <div class="listwrap">
-            <div class="list"></div>
-            <div class="lmsg"></div>
+
+        <div class="view listview">
+          <div class="list"></div>
+          <div class="lmsg"></div>
+        </div>
+
+        <div class="view detailview" hidden>
+          <div class="dhead">
+            <button class="back" title="返回行程列表"><ha-icon icon="mdi:arrow-left"></ha-icon></button>
+            <span class="dtitle">行程详情</span>
+            <span class="spacer"></span>
+            <button class="del ddel" data-act="del" title="删除这段行程">
+              <ha-icon icon="mdi:trash-can-outline"></ha-icon>
+            </button>
           </div>
-          <div class="main">
-            <div class="tools">
-              <label><input type="checkbox" class="ovlbox">叠加最近</label>
-              <select class="ovln">
-                <option value="5">5 段</option>
-                <option value="10">10 段</option>
-                <option value="20">20 段</option>
-              </select>
-              <span class="spacer"></span>
-              <button data-m="fit" title="缩放至轨迹">⤢</button>
-              <button data-m="in" title="放大">＋</button>
-              <button data-m="out" title="缩小">－</button>
-            </div>
-            <div class="map">
-              <div class="tiles"></div>
-              <svg class="traj" xmlns="http://www.w3.org/2000/svg"></svg>
-              <div class="marks"></div>
-              <div class="mhint"></div>
-            </div>
-            <div class="panel"></div>
-            <div class="legend"></div>
+          <div class="map">
+            <div class="tiles"></div>
+            <svg class="traj" xmlns="http://www.w3.org/2000/svg"></svg>
+            <div class="marks"></div>
+            <div class="mhint"></div>
           </div>
+          <div class="tools">
+            <label><input type="checkbox" class="ovlbox">叠加最近</label>
+            <select class="ovln">
+              <option value="5">5 段</option>
+              <option value="10">10 段</option>
+              <option value="20">20 段</option>
+            </select>
+            <span class="spacer"></span>
+            <button data-m="fit" title="缩放至轨迹">⤢</button>
+            <button data-m="in" title="放大">＋</button>
+            <button data-m="out" title="缩小">－</button>
+          </div>
+          <div class="dinfo sheet"></div>
+          <div class="legend"></div>
         </div>
       </div>`;
 
@@ -1073,6 +1532,8 @@ class LeapmotorTripsCard extends HTMLElement {
     this._refreshBtn = this.shadowRoot.querySelector(".head .refresh");
     this._activeEl = this.shadowRoot.querySelector(".active");
     this._activeText = this.shadowRoot.querySelector(".active .atext");
+    this._listView = this.shadowRoot.querySelector(".listview");
+    this._detailView = this.shadowRoot.querySelector(".detailview");
     this._listEl = this.shadowRoot.querySelector(".list");
     this._lmsgEl = this.shadowRoot.querySelector(".lmsg");
     this._mapEl = this.shadowRoot.querySelector(".map");
@@ -1080,7 +1541,8 @@ class LeapmotorTripsCard extends HTMLElement {
     this._trajEl = this.shadowRoot.querySelector(".traj");
     this._marksEl = this.shadowRoot.querySelector(".marks");
     this._mhintEl = this.shadowRoot.querySelector(".mhint");
-    this._panelEl = this.shadowRoot.querySelector(".panel");
+    this._dinfoEl = this.shadowRoot.querySelector(".dinfo");
+    this._ddelEl = this.shadowRoot.querySelector(".ddel");
     this._legendEl = this.shadowRoot.querySelector(".legend");
     this._ovlBox = this.shadowRoot.querySelector(".ovlbox");
     this._ovlN = this.shadowRoot.querySelector(".ovln");
@@ -1088,6 +1550,10 @@ class LeapmotorTripsCard extends HTMLElement {
     this._refreshBtn.addEventListener("click", (ev) => {
       ev.stopPropagation();
       this._load();
+    });
+    this.shadowRoot.querySelector(".back").addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      this._backToList();
     });
     this._ovlBox.addEventListener("change", () => this._toggleOverlay(this._ovlBox.checked));
     this._ovlN.addEventListener("change", () => {
@@ -1108,18 +1574,22 @@ class LeapmotorTripsCard extends HTMLElement {
         return;
       }
       const row = ev.target.closest(".row");
-      if (row && row.dataset.id) this._select(row.dataset.id);
+      if (row && row.dataset.id) this._openDetail(row.dataset.id);
+    });
+    this._ddelEl.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      if (this._ddelEl.dataset.id) this._deleteTrip(this._ddelEl.dataset.id, this._ddelEl);
     });
     this._legendEl.addEventListener("click", (ev) => {
       const lg = ev.target.closest(".lg");
-      if (lg && lg.dataset.id) this._select(lg.dataset.id);
+      if (lg && lg.dataset.id) this._openDetail(lg.dataset.id);
     });
     this._bindMap();
 
     // 卡片尺寸变化(切视图/改列宽)时要重算可视瓦片与轨迹位置
     if (typeof ResizeObserver !== "undefined") {
       this._ro = new ResizeObserver(() => {
-        if (this._center) this._renderMap();
+        if (this._view === "detail" && this._center) this._renderMap();
       });
       this._ro.observe(this._mapEl);
     }
@@ -1178,7 +1648,7 @@ if (!window.customCards.some((c) => c.type === "leapmotor-trips")) {
   window.customCards.push({
     type: "leapmotor-trips",
     name: "零跑·行程浏览",
-    description: "行程列表 + 轨迹地图(列表分组/起终点/断档虚线/最近多段叠加)",
+    description: "行程卡片(缩略图/按天分组/起终点/断档虚线/最近多段叠加)",
     preview: false,
     documentationURL: "https://github.com/MiRaToo/ha-leapmotor-cn/blob/main/docs/dashboard.md",
   });
