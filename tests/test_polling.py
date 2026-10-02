@@ -35,8 +35,8 @@ def test_choose_poll_seconds_tiers():
     # 限流退避: 取"停车档 × 2"与 120 的较大者
     assert c(parked=60, trip=6, driving=True, launch_boost=False, rate_limited=True) == 120
     assert c(parked=120, trip=6, driving=True, launch_boost=False, rate_limited=True) == 240
-    # 下限与钳制: 停车档不会低于 60, 行程档不会低于 floor(默认 6)
-    assert c(parked=10, trip=6, driving=False, launch_boost=False) == 60
+    # 下限与钳制: 停车档的下限放宽到 20(2026-10-02 起可调), 行程档不会低于 floor(默认 6)
+    assert c(parked=10, trip=6, driving=False, launch_boost=False) == api_client.MIN_PARKED_POLL_SECONDS
     assert c(parked=60, trip=1, driving=True, launch_boost=False) == 6
 
 
@@ -79,3 +79,44 @@ def test_coordinator_allows_a_six_second_poll_interval():
         % floor)
     # 再验证: 6 秒这一档确实不会被抬升
     assert max(floor, 6) == 6
+
+
+# ── 短停快档 & 可调停车下限(2026-10-02 加) ──
+def test_short_stop_uses_fast_interval():
+    """行程刚结束后的一段时间内也用快档 —— 抓"短停再出发"(下车买东西/接人)。
+
+    否则停车档(默认 60s)会把这类短停 + 再出发整段漏掉(只能事后"补记", 没有轨迹)。
+    """
+    c = api_client.choose_poll_seconds
+    # 短停窗口内: 用行程采样间隔
+    assert c(parked=60, trip=6, driving=False, launch_boost=False, short_stop=True) == 6
+    # 窗口外/关闭: 回到停车档
+    assert c(parked=60, trip=6, driving=False, launch_boost=False, short_stop=False) == 60
+    # 与其它档位的优先级: 行驶/提速仍然生效(不冲突)
+    assert c(parked=60, trip=6, driving=True, launch_boost=False, short_stop=False) == 6
+    # 限流退避优先于短停快档(被风控时不该继续高频)
+    assert c(parked=60, trip=6, driving=False, launch_boost=False,
+             short_stop=True, rate_limited=True) == 120
+
+
+def test_parked_floor_can_go_below_60_but_not_below_20():
+    """停车档下限放宽到 20 秒(用户可调) —— 但不会低于 20(再密对停车没意义)。"""
+    c = api_client.choose_poll_seconds
+    assert c(parked=20, trip=6, driving=False, launch_boost=False) == 20
+    assert c(parked=30, trip=6, driving=False, launch_boost=False) == 30
+    assert c(parked=10, trip=6, driving=False, launch_boost=False) == api_client.MIN_PARKED_POLL_SECONDS
+    assert api_client.MIN_PARKED_POLL_SECONDS == 20
+    # 默认仍是 60
+    assert api_client.choose_poll_seconds(parked=60, trip=6, driving=False, launch_boost=False) == 60
+
+
+def test_short_stop_defaults_and_bounds():
+    """默认值要在合理范围(默认开启 5 分钟, 允许 0=关闭)。"""
+    import pathlib as _p
+    import re as _re
+    src = (_p.Path(__file__).resolve().parent.parent / "custom_components" / "leapmotor"
+           / "const.py").read_text(encoding="utf-8")
+    d = int(_re.search(r"DEFAULT_SHORT_STOP_SECONDS\s*=\s*(\d+)", src).group(1))
+    m = int(_re.search(r"MAX_SHORT_STOP_SECONDS\s*=\s*(\d+)", src).group(1))
+    assert 0 < d <= m, "默认短停窗口应在 (0, 上限] 之间"
+    assert m >= 600, "上限至少给到 10 分钟"

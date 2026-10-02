@@ -397,7 +397,10 @@ class StateOverrides:
 
 
 # ── 轮询策略 ────────────────────────────────────────────────────────
-MIN_POLL_SECONDS = 60          # 全局下限: 车端上报本来也不是实时的, 再密没意义
+MIN_POLL_SECONDS = 60          # (旧的两档函数用)全局下限
+# 停车档的下限(可调): 官方 App 静止档是 60s, 但用户可按自己需要调低到 20s;
+# 再低没有意义 —— 车端在停车时本来就很少上报新帧。
+MIN_PARKED_POLL_SECONDS = 20
 
 
 def order_addresses_by_family(infos: list, prefer_ipv4: bool = True) -> list:
@@ -425,23 +428,28 @@ def order_addresses_by_family(infos: list, prefer_ipv4: bool = True) -> list:
 
 
 def choose_poll_seconds(*, parked: int, trip: int, driving: bool, launch_boost: bool,
-                        rate_limited: bool = False, floor: int = 6) -> int:
-    """四档轮询决策(纯函数, 便于单测)。
+                        short_stop: bool = False, rate_limited: bool = False,
+                        floor: int = 6) -> int:
+    """轮询档位决策(纯函数, 便于单测)。
 
-    档位与依据(2026-09-28 调研):
+    档位与依据:
       * **行驶中** → `trip`(行程采样间隔, 默认 6s)。官方 App 前台对同一个车况接口就是 6 秒一次,
         这个值同时决定行程轨迹点的时间分辨率。
       * **出发提速**(解锁 / 上电 / 非 P 挡, 且开关打开) → 也用 `trip`:
         停车档默认 60s, 不提速的话"出发后的头一分钟"会整段丢掉(等价 EU 版 mate 的 PARKED_ALERT)。
-      * **限流冷却中** → 退避:`max(parked, 60) * 2`。
-      * **其余**(停车 / 充电) → `parked`(默认 60s, 与官方 App 静止档一致)。
+      * **短停快档**(`short_stop`: 一趟行程刚结束的一段时间内) → 也用 `trip`:
+        抓住"下车买个东西 / 接人, 很快又出发"这种短停再出发 —— 停车档 60s 时,
+        这类短停+再出发很容易整段漏掉; 窗口长度可配(0 = 关闭)。
+        注意: 提速的**判断本身**也要等下一帧才能看到(有 ≤parked 秒的固有延迟), 这是无法消除的。
+      * **限流冷却中** → 退避:`max(parked, 下限) * 2`。
+      * **其余**(停车 / 充电) → `parked`(默认 60s, 与官方 App 静止档一致; 下限 20s 可调)。
 
     停车时**不停止轮询**: 车端休眠时本来就不上报, 停轮询只会让"车又动了"发现不了。
     """
-    base = max(int(parked), 60)
+    base = max(int(parked), MIN_PARKED_POLL_SECONDS)
     if rate_limited:
         return max(base * 2, 120)
-    if driving or launch_boost:
+    if driving or launch_boost or short_stop:
         return max(int(trip), floor)
     return base
 

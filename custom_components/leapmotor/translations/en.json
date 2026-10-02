@@ -41,7 +41,8 @@
           "poll_seconds": "Poll interval (parked)",
           "driving_poll_seconds": "Trip sampling interval (driving)",
           "launch_boost": "Speed up polling when about to depart (unlock / power on)",
-          "battery_kwh": "Usable battery capacity"
+          "battery_kwh": "Usable battery capacity",
+          "short_stop_seconds": "Short-stop fast polling (seconds)"
         },
         "description": "Polling: 60 s parked, 6 s driving (same as the official app), and only the vehicle-state frame is fetched each round; mileage/energy/photo are fetched on demand.\n\nBattery capacity is only used to turn SoC delta into kWh for trips."
       }

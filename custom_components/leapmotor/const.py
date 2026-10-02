@@ -34,9 +34,12 @@ CONF_POLL_SECONDS = "poll_seconds"
 CONF_DRIVING_POLL_SECONDS = "driving_poll_seconds"   # 行驶中的轮询间隔
 CONF_VIN = "vin"
 CONF_LAUNCH_BOOST = "launch_boost"        # 解锁/上电/非 P 挡时立刻按行程采样间隔轮询
+CONF_SHORT_STOP_SECONDS = "short_stop_seconds"   # 短停快档: 行程结束后这段时间内仍用快档(0=关)
 CONF_BATTERY_KWH = "battery_kwh"          # 电池可用容量, 用于把 ΔSOC 折算成 kWh
 
 DEFAULT_LAUNCH_BOOST = True
+DEFAULT_SHORT_STOP_SECONDS = 300          # 默认 5 分钟; 设 0 关闭
+MAX_SHORT_STOP_SECONDS = 1800
 DEFAULT_BATTERY_KWH = 69.9                # C10 纯电版标称, 仅供折算; 用户可改
 MIN_BATTERY_KWH = 20.0
 MAX_BATTERY_KWH = 150.0
@@ -48,10 +51,11 @@ PHOTO_RETRY_EVERY_SECONDS = 30     # 窗口内两次重试的最小间隔
 RATE_LIMIT_COOLDOWN_SECONDS = 900  # 命中限流/风控后的冷却时间(期间用慢档)
 LAUNCH_BOOST_MAX_SECONDS = 600     # 出发提速的最长持续时间, 防止"解锁后不开车"长期高频
 
-# 停车轮询: 与官方 App 的静止档一致(60 s)。注意每轮只拉**车况帧**一个请求,
-# 里程/能耗/配置/照片另有节流(见 coordinator 的重数据策略), 所以总量并不比 300 s 时代高。
+# 停车轮询: 默认与官方 App 的静止档一致(60 s), 但**下限放宽到 20 s 可调** ——
+# 调低可以让"起步头一分钟"的缺口更小(代价是停车时的请求量成比例增加)。
+# 注意每轮只拉**车况帧**一个请求, 里程/能耗/配置/照片另有节流(见 coordinator 的重数据策略)。
 DEFAULT_POLL_SECONDS = 60
-MIN_POLL_SECONDS = 60
+MIN_POLL_SECONDS = 20
 
 # 行驶中把轮询调快(位置/速度这类数据只有开车时才有意义)。
 # 参考 EU 版的双档轮询思路(它按"是否安静"切档), 这里按"是否在开"切:

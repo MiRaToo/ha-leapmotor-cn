@@ -35,28 +35,32 @@ _FRONTEND_KEY = "_frontend_registered"
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """配置条目迁移。
+    """配置条目迁移(累积式: 老条目会一路补到最新版本)。
 
     v1 → v2(行程记录): 轮询默认值改了语义 —— 停车 300→60 秒、行驶 60→6 秒,
     并新增「出发提速」与「电池可用容量」。老条目里存的是旧默认值, 这里显式换成新默认,
     免得升级后仍停在"停车 300 秒"(那样行程起点会晚最多 5 分钟才被发现)。
+    v2 → v3(短停快档): 新增「短停快档」时长(行程结束后仍用快档的窗口, 0=关)。
     """
-    if entry.version >= 2:
+    if entry.version >= 3:
         return True
     new = dict(entry.options)
     from .const import (CONF_BATTERY_KWH, CONF_DRIVING_POLL_SECONDS, CONF_LAUNCH_BOOST,
-                        CONF_POLL_SECONDS, DEFAULT_BATTERY_KWH, DEFAULT_DRIVING_POLL_SECONDS,
-                        DEFAULT_LAUNCH_BOOST, DEFAULT_POLL_SECONDS)
-    if int(new.get(CONF_POLL_SECONDS) or 0) in (0, 300):
-        new[CONF_POLL_SECONDS] = DEFAULT_POLL_SECONDS
-    if int(new.get(CONF_DRIVING_POLL_SECONDS) or 0) in (0, 60):
-        new[CONF_DRIVING_POLL_SECONDS] = DEFAULT_DRIVING_POLL_SECONDS
-    new.setdefault(CONF_LAUNCH_BOOST, DEFAULT_LAUNCH_BOOST)
-    new.setdefault(CONF_BATTERY_KWH, DEFAULT_BATTERY_KWH)
-    hass.config_entries.async_update_entry(entry, options=new, version=2)
-    log.info("配置条目已迁移到 v2: 停车 %ss / 行程采样 %ss / 出发提速 %s",
+                        CONF_POLL_SECONDS, CONF_SHORT_STOP_SECONDS, DEFAULT_BATTERY_KWH,
+                        DEFAULT_DRIVING_POLL_SECONDS, DEFAULT_LAUNCH_BOOST,
+                        DEFAULT_POLL_SECONDS, DEFAULT_SHORT_STOP_SECONDS)
+    if entry.version < 2:
+        if int(new.get(CONF_POLL_SECONDS) or 0) in (0, 300):
+            new[CONF_POLL_SECONDS] = DEFAULT_POLL_SECONDS
+        if int(new.get(CONF_DRIVING_POLL_SECONDS) or 0) in (0, 60):
+            new[CONF_DRIVING_POLL_SECONDS] = DEFAULT_DRIVING_POLL_SECONDS
+        new.setdefault(CONF_LAUNCH_BOOST, DEFAULT_LAUNCH_BOOST)
+        new.setdefault(CONF_BATTERY_KWH, DEFAULT_BATTERY_KWH)
+    new.setdefault(CONF_SHORT_STOP_SECONDS, DEFAULT_SHORT_STOP_SECONDS)
+    hass.config_entries.async_update_entry(entry, options=new, version=3)
+    log.info("配置条目已迁移到 v3: 停车 %ss / 行程采样 %ss / 出发提速 %s / 短停快档 %ss",
              new.get(CONF_POLL_SECONDS), new.get(CONF_DRIVING_POLL_SECONDS),
-             new.get(CONF_LAUNCH_BOOST))
+             new.get(CONF_LAUNCH_BOOST), new.get(CONF_SHORT_STOP_SECONDS))
     return True
 
 

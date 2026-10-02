@@ -25,7 +25,6 @@ from .api import (
     is_rate_limited,
     is_signature_error,
     LeapmotorClient,
-    pick_poll_seconds,
     Session,
     StateOverrides,
     Vehicle,
@@ -33,8 +32,10 @@ from .api import (
 from .const import (
     CONF_BATTERY_KWH,
     CONF_LAUNCH_BOOST,
+    CONF_SHORT_STOP_SECONDS,
     DEFAULT_BATTERY_KWH,
     DEFAULT_LAUNCH_BOOST,
+    DEFAULT_SHORT_STOP_SECONDS,
     HEAVY_REFRESH_SECONDS,
     LAUNCH_BOOST_MAX_SECONDS,
     PHOTO_RETRY_EVERY_SECONDS,
@@ -106,6 +107,7 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # ── 轮询档位 ──
         self._rate_limited_until = 0.0          # 限流/风控冷却截止时刻
         self._launch_boost_until = 0.0          # 出发提速(解锁/上电/非P)的截止时刻
+        self._short_stop_until = 0.0            # 短停快档的截止时刻(行程刚结束后的一段时间)
         self._launch_hint_prev = False
         self._prev_vehicle_state = None
         # 首轮刷新只拉车况帧(见 __init__.py 的 async_setup_entry):
@@ -293,7 +295,13 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._prev_vehicle_state == "driving" and cur_state == "parked":
             self._photo_retry_until = now + PHOTO_RETRY_WINDOW_SECONDS
             self._photo_pending = True
-            log.debug("检测到新泊车事件 -> 打开驻车照片重试窗口(%ds)", PHOTO_RETRY_WINDOW_SECONDS)
+            # 短停快档: 行程刚结束的一段时间内继续用快档, 便于抓住"短停再出发"
+            short = int(self.entry.options.get(CONF_SHORT_STOP_SECONDS,
+                                               DEFAULT_SHORT_STOP_SECONDS) or 0)
+            self._short_stop_until = (now + short) if short > 0 else 0.0
+            log.debug("检测到新泊车事件 -> 照片重试窗口 %ds; 短停快档 %s",
+                      PHOTO_RETRY_WINDOW_SECONDS,
+                      ("%ds" % short) if short else "已关闭")
         if cur_state:
             self._prev_vehicle_state = cur_state
 
@@ -441,7 +449,7 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
 
     def _adapt_poll_interval(self) -> None:
-        """四档轮询: 行驶 6s / 出发提速 6s / 限流退避 / 停车 60s。
+        """轮询档位: 行驶 6s / 出发提速 6s / 短停快档 6s / 限流退避 / 停车(可调, 默认 60s)。
 
         决策逻辑在 `api.choose_poll_seconds`(纯函数, 有单测)。这里只负责算两个输入:
           * `driving`: 车辆状态=driving 或车速>0
@@ -473,15 +481,20 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._launch_boost_until = 0.0
         self._launch_hint_prev = launch_hint
         boost_active = launch_hint and now < self._launch_boost_until
+        # 短停快档: 行程刚结束的一段时间内也用快档(充电时不启用 —— 充电是长时间驻留)
+        short_stop = bool(not driving and self._short_stop_until and now < self._short_stop_until
+                          and not (st is not None and st.charging))
         rate_limited = now < self._rate_limited_until
 
         target = choose_poll_seconds(parked=parked, trip=trip, driving=driving,
-                                     launch_boost=boost_active, rate_limited=rate_limited)
+                                     launch_boost=boost_active, short_stop=short_stop,
+                                     rate_limited=rate_limited)
         want = timedelta_seconds(target)
         if self.update_interval != want:
             self.update_interval = want
             why = ("限流退避" if rate_limited else "行驶中" if driving
-                   else "出发提速" if boost_active else "停车/充电")
+                   else "出发提速" if boost_active else "短停快档" if short_stop
+                   else "停车/充电")
             log.debug("轮询间隔 -> %s 秒(%s)", target, why)
 
     def remember(self, key: str, value: Any) -> None:
