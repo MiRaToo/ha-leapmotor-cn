@@ -50,7 +50,7 @@
 
 const TILE = 256;
 
-const CARD_VERSION = "1.1.0";
+const CARD_VERSION = "1.1.1";
 
 /* 断档阈值(km): 相邻轨迹点距离超过它 → 视为中间丢过采样, 用虚线连 */
 const TRACK_GAP_KM = 2;
@@ -862,6 +862,7 @@ class LeapmotorTripsCard extends HTMLElement {
     const vw = w / geom.k;
     const vh = h / geom.k;
     const z = geom.z;
+    const k = geom.k;                   // 轨迹的缩放: 1 个 zoom-z 世界像素 = k 个 CSS 像素
     const x0 = Math.floor(left / TILE);
     const y0 = Math.floor(top / TILE);
     const x1 = Math.floor((left + vw) / TILE);
@@ -873,8 +874,14 @@ class LeapmotorTripsCard extends HTMLElement {
         const wx = ((x % max) + max) % max;
         const img = document.createElement("img");
         img.decoding = "async";
-        img.style.left = (x * TILE - left) + "px";
-        img.style.top = (y * TILE - top) + "px";
+        // ★ 瓦片必须按 k 缩放: 轨迹折线是按 k = fit/2^z 缩放的(为撑满画布), 而整数 zoom
+        //   的瓦片天然是"1 世界像素 = 1 CSS 像素" —— 不乘 k, 两者就不同尺度, 表现为
+        //   "缩略图的轨迹和大图不一样、不贴路"(实测 k 可达 1.6, 即偏 60%)。
+        const size = TILE * k;
+        img.style.width = size + "px";
+        img.style.height = size + "px";
+        img.style.left = ((x * TILE - left) * k) + "px";
+        img.style.top = ((y * TILE - top) * k) + "px";
         img.src = this._tileUrl(z, wx, y, false);
         img.addEventListener("error", () => {
           if (!img.dataset.retried) {
@@ -1367,8 +1374,11 @@ class LeapmotorTripsCard extends HTMLElement {
           color: var(--secondary-text-color, #6b7280);
         }
         .rtm {
-          margin-left: auto; font-size: 12px; white-space: nowrap; overflow: hidden;
-          text-overflow: ellipsis; color: var(--secondary-text-color, #6b7280);
+          margin-left: auto; font-size: 12px;
+          /* 跨天的时间串("10月1日 23:30 - 10月2日 00:11")很长; 窄屏放不下时**换行**,
+             而不要用省略号截断(截断后时间就没法看了) */
+          white-space: normal; text-align: right; line-height: 1.15;
+          color: var(--secondary-text-color, #6b7280);
         }
         /* 补记/失联徽标: 压在缩略图左上角 —— 放行内会把时间段/指标挤没 */
         .thumb .rbadges { position: absolute; left: 4px; top: 4px; z-index: 3; display: flex; gap: 4px; }

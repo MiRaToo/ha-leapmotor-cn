@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 # 前端模块: 把 www/ 下的三张卡片注册成全局卡片(用户无需手动放 www/ 或配资源)。
 # CARD_VERSION 与各自 JS 文件头里的同名常量保持一致(改 JS 记得一起升, 好让浏览器拿到新文件)。
 CARD_VERSION = "1.5.0"            # leapmotor-map.js
-TRIPS_CARD_VERSION = "1.1.0"      # leapmotor-trips.js
+TRIPS_CARD_VERSION = "1.1.1"      # leapmotor-trips.js
 CONTROL_CARD_VERSION = "1.3.0"    # leapmotor-control.js
 _CARDS = (
     ("leapmotor-map.js", "/leapmotor-card/leapmotor-map.js", CARD_VERSION),
