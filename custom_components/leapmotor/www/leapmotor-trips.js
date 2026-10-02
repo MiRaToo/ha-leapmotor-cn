@@ -50,7 +50,7 @@
 
 const TILE = 256;
 
-const CARD_VERSION = "1.1.1";
+const CARD_VERSION = "1.1.2";
 
 /* 断档阈值(km): 相邻轨迹点距离超过它 → 视为中间丢过采样, 用虚线连 */
 const TRACK_GAP_KM = 2;
@@ -1315,8 +1315,20 @@ class LeapmotorTripsCard extends HTMLElement {
           border-radius: 8px; border: 1px solid var(--divider-color, #d8dde2);
           background: var(--card-background-color, #fff);
         }
-        .head button.refresh { width: 30px; height: 26px; font-size: 15px; line-height: 1; }
+        /* 刷新按钮: 圆形浅灰底 —— 与「零跑·车辆控制」卡片顶部的刷新按钮同一套写法 */
+        .head button.refresh {
+          width: 30px; height: 30px; padding: 0; border: none; border-radius: 50%;
+          display: inline-flex; align-items: center; justify-content: center;
+          color: var(--secondary-text-color, #6b7280);
+          background: var(--secondary-background-color, #e7eaed);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0, 0, 0, .08));
+          transition: background .15s ease, box-shadow .15s ease;
+        }
+        .head button.refresh:hover {
+          background: var(--card-background-color, #fff); box-shadow: 0 1px 3px rgba(0, 0, 0, .13);
+        }
         .head button.refresh.spin { opacity: .45; }
+        .head button.refresh ha-icon { width: 18px; height: 18px; --mdc-icon-size: 18px; }
         ha-icon { display: inline-flex; width: 16px; height: 16px; --mdc-icon-size: 16px; }
 
         .active {
@@ -1496,7 +1508,7 @@ class LeapmotorTripsCard extends HTMLElement {
           <span class="title">行程</span>
           <span class="sum sub"></span>
           <span class="spacer"></span>
-          <button class="refresh" title="刷新行程列表">↻</button>
+          <button class="refresh" title="刷新行程列表"><ha-icon icon="mdi:refresh"></ha-icon></button>
         </div>
         <div class="active"><span class="dot"></span><span class="atext"></span></div>
 

@@ -78,12 +78,12 @@
  * 用户不需要把它拷到 www/ 或手配资源。
  */
 
-const CARD_VERSION = "1.3.0";
+const CARD_VERSION = "1.4.0";
 
 /* 区块顺序(show 配置按这个顺序渲染; 缺键的区块自动隐藏)
  * 注意: 这里没有 tires —— 胎压在 v3 并进了车模区, 但 show 里写 "tires" 仍然被接受(忽略即可)。
  * seats 也一样: v4 起后排并进 comfort 的座舱模型, show 里写 "seats" 仍然被接受。 */
-const PANELS = ["hero", "actions", "climate", "location", "charging", "comfort", "seats", "fuel", "trip"];
+const PANELS = ["hero", "actions", "climate", "location", "charging", "comfort", "csdetail", "seats", "fuel", "trip"];
 
 /* show 的向后兼容: 老配置里的 climate 意思是"空调 + 前排座椅", 新版拆成了
  * climate(空调卡) 和 comfort(座椅与加热), 所以填 climate 时把 comfort 一起带上。 */
@@ -836,6 +836,7 @@ this._index = {};            // translation_key → entity_id
     this._renderCharging();
     this._renderComfort();
     this._renderSeats();
+    this._renderCsDetail();
     this._renderFuel();
     this._renderTrip();
     this._renderPhoto();
@@ -1326,77 +1327,104 @@ this._index = {};            // translation_key → entity_id
   }
 
   // ── 充电(可折叠) ──
+  /**
+   * 充电: 标题行留在并排的卡片里, 正文由 _renderCsDetail() 铺在两卡下面(跨整行)。
+   * 收起态只有标题 + 摘要("79% · 未插枪"), 点开才出下面那一整块设置。
+   */
   _renderCharging() {
     if (!this._vis("charging")) return this._setPanel("charging", "");
     const has = ["battery", "charging_state", "charge_limit", "charge_book", "charge_start",
       "charge_end", "healthy_charge", "preheat_on", "preheat_off"].some((k) => this._entId(k));
     if (!has) return this._setPanel("charging", "");
-    const open = this._secOpen("charging");
-    let h = '<section class="sec">' + this._foldHead("charging", "充电", this._sumCharging());
-    if (open) {
-      h += '<div class="secB">';
-      const soc = this._num("battery");
-      const chg = this._chgInfo();
-      const chips = [];
-      if (soc != null) chips.push('<span class="kvchip">电量 ' + fmtNum(soc, 0, "%") + "</span>");
-      if (chg) chips.push('<span class="kvchip' + (chg.on ? " on" : "") + '">' + esc(chg.text) + "</span>");
-      const liveKw = this._attr("battery", "charging_voltage");
-      const liveA = this._attr("battery", "charging_current");
-      if (chg && chg.on && liveKw != null && liveA != null) {
-        const kw = Number(liveKw) * Number(liveA) / 1000;
-        if (Number.isFinite(kw) && kw > 0) chips.push('<span class="kvchip">' + fmtNum(kw, 1, "kW") + "</span>");
-      }
-      if (chips.length) h += '<div class="chips">' + chips.join("") + "</div>";
-
-      // 充电上限(number, 50~100)
-      const clId = this._entId("charge_limit");
-      if (clId) {
-        const st = this._ent("charge_limit");
-        const a = (st && st.attributes) || {};
-        const v = Number(st && st.state);
-        const lo = Number.isFinite(Number(a.min)) ? Number(a.min) : 50;
-        const hi = Number.isFinite(Number(a.max)) ? Number(a.max) : 100;
-        const sAttr = Number(a.step);
-        const step = Number.isFinite(sAttr) && sAttr > 0 ? sAttr : 5;
-        const val = Number.isFinite(v) ? clampNum(v, lo, hi) : lo;
-        const busy = !!this._busy["cl:" + clId];
-        h += '<div class="row"><span class="rowL">充电上限</span>' +
-          '<input class="rng" type="range" data-act="charge_limit" data-entity="' + esc(clId) +
-          '" min="' + lo + '" max="' + hi + '" step="' + step + '" value="' + val + '"' +
-          this._dis(busy) + ">" +
-          '<span class="rowV">' + fmtNum(val, 0, "%") + "</span></div>";
-      }
-      // 预约充电开关 + 起止时间
-      if (this._entId("charge_book")) {
-        h += '<div class="row"><span class="rowL">预约充电</span>' + this._togChip("charge_book", "预约充电") + "</div>";
-      }
-      if (this._entId("charge_start") || this._entId("charge_end")) {
-        h += '<div class="row"><span class="rowL">起止时间</span>';
-        h += this._timeRow("charge_start", "开始");
-        h += this._timeRow("charge_end", "结束");
-        h += "</div>";
-      }
-      if (this._entId("healthy_charge")) {
-        h += '<div class="row"><span class="rowL">健康充电</span>' + this._togChip("healthy_charge", "健康充电") + "</div>";
-      }
-      // 电池预热(旧版在动作行里, 挪进充电设置一起管)
-      const pre = [["preheat_on", "开"], ["preheat_off", "关"]].filter((p) => this._entId(p[0]));
-      if (pre.length) {
-        const driving = this._driving();
-        h += '<div class="row"><span class="rowL">电池预热</span><div class="chips">';
-        for (const p of pre) {
-          const id = this._entId(p[0]);
-          const busy = !!this._busy["btn:" + id];
-          h += '<button class="chip" data-act="press" data-entity="' + esc(id) + '"' +
-            this._dis(driving || busy) + ' title="' + esc(driving ? "行驶中已禁用" : "电池预热" + p[1]) + '">' +
-            (busy ? "…" : p[1]) + "</button>";
-        }
-        h += "</div></div>";
-      }
-      h += "</div>";
-    }
-    h += "</section>";
+    const h = '<section class="sec">' + this._foldHead("charging", "充电", this._sumCharging()) + "</section>";
     this._setPanel("charging", h);
+  }
+
+  /**
+   * 「充电 / 座椅与加热」共用一个跨整行的详情容器: 谁展开就把谁的正文放进来。
+   * 两张卡互斥 —— 点开一个会把另一个收起来, 不会同时撑开两块(见 _onClick 的 fold 分支)。
+   */
+  _renderCsDetail() {
+    const chg = this._secOpen("charging") && this._vis("charging") &&
+      ["battery", "charging_state", "charge_limit", "charge_book", "charge_start",
+        "charge_end", "healthy_charge", "preheat_on", "preheat_off"].some((k) => this._entId(k));
+    if (chg) return this._setPanel("csdetail", '<section class="sec">' + this._chargeBody() + "</section>");
+    if (this._secOpen("comfort") && this._vis("comfort") && this._cabinAny()) {
+      return this._setPanel("csdetail", '<section class="sec"><div class="secB">' + this._cabin() + "</div></section>");
+    }
+    return this._setPanel("csdetail", "");
+  }
+
+  /** 充电详情正文(顺序照官方 App: 健康充电 → 充电上限 → 预约 → 起止时间 → 电池预热) */
+  _chargeBody() {
+    let h = '<div class="secB">';
+    const soc = this._num("battery");
+    const chg = this._chgInfo();
+    const chips = [];
+    if (soc != null) chips.push('<span class="kvchip">电量 ' + fmtNum(soc, 0, "%") + "</span>");
+    if (chg) chips.push('<span class="kvchip' + (chg.on ? " on" : "") + '">' + esc(chg.text) + "</span>");
+    const liveKw = this._attr("battery", "charging_voltage");
+    const liveA = this._attr("battery", "charging_current");
+    if (chg && chg.on && liveKw != null && liveA != null) {
+      const kw = Number(liveKw) * Number(liveA) / 1000;
+      if (Number.isFinite(kw) && kw > 0) chips.push('<span class="kvchip">' + fmtNum(kw, 1, "kW") + "</span>");
+    }
+    if (chips.length) h += '<div class="chips">' + chips.join("") + "</div>";
+
+    // ── 设置项: 一行一个, 标签左 / 控件右(官方 App 那种清爽版式) ──
+    h += '<div class="cList">';
+
+    // ① 健康充电(只留开关本身, 不写任何"延长寿命/有利于电池"之类的说明文字)
+    if (this._entId("healthy_charge")) {
+      h += '<div class="cRow"><span class="cL">健康充电</span><span class="cC">' +
+        this._togChip("healthy_charge", "健康充电") + "</span></div>";
+    }
+    // ② 充电上限(number, 50~100)
+    const clId = this._entId("charge_limit");
+    if (clId) {
+      const st = this._ent("charge_limit");
+      const a = (st && st.attributes) || {};
+      const v = Number(st && st.state);
+      const lo = Number.isFinite(Number(a.min)) ? Number(a.min) : 50;
+      const hi = Number.isFinite(Number(a.max)) ? Number(a.max) : 100;
+      const sAttr = Number(a.step);
+      const step = Number.isFinite(sAttr) && sAttr > 0 ? sAttr : 5;
+      const val = Number.isFinite(v) ? clampNum(v, lo, hi) : lo;
+      const busy = !!this._busy["cl:" + clId];
+      h += '<div class="cRow"><span class="cL">充电上限</span><span class="cC">' +
+        '<input class="rng" type="range" data-act="charge_limit" data-entity="' + esc(clId) +
+        '" min="' + lo + '" max="' + hi + '" step="' + step + '" value="' + val + '"' +
+        this._dis(busy) + ">" +
+        '<span class="cV">' + fmtNum(val, 0, "%") + "</span></span></div>";
+    }
+    // ③ 预约充电开关
+    if (this._entId("charge_book")) {
+      h += '<div class="cRow"><span class="cL">预约充电</span><span class="cC">' +
+        this._togChip("charge_book", "预约充电") + "</span></div>";
+    }
+    // ④ 起始 / 结束时间
+    if (this._entId("charge_start") || this._entId("charge_end")) {
+      h += '<div class="cRow"><span class="cL">起止时间</span><span class="cC">';
+      h += this._timeRow("charge_start", "开始");
+      h += this._timeRow("charge_end", "结束");
+      h += "</span></div>";
+    }
+    // ⑤ 电池预热(旧版在动作行里, 挪进充电设置一起管)
+    const pre = [["preheat_on", "开"], ["preheat_off", "关"]].filter((p) => this._entId(p[0]));
+    if (pre.length) {
+      const driving = this._driving();
+      h += '<div class="cRow"><span class="cL">电池预热</span><span class="cC">';
+      for (const p of pre) {
+        const id = this._entId(p[0]);
+        const busy = !!this._busy["btn:" + id];
+        h += '<button class="chip" data-act="press" data-entity="' + esc(id) + '"' +
+          this._dis(driving || busy) + ' title="' + esc(driving ? "行驶中已禁用" : "电池预热" + p[1]) + '">' +
+          (busy ? "…" : p[1]) + "</button>";
+      }
+      h += "</span></div>";
+    }
+    h += "</div></div>";
+    return h;
   }
 
   _sumCharging() {
@@ -1424,14 +1452,11 @@ this._index = {};            // translation_key → entity_id
       '" value="' + esc(hm) + '"></span>';
   }
 
-  // ── 座椅与加热(可折叠): 座舱俯视"模型", 档位用图标状态表示 ──
+  // ── 座椅与加热: 和「充电」并排成一张卡, 正文同样走跨整行的详情容器 ──
   _renderComfort() {
     if (!this._vis("comfort")) return this._setPanel("comfort", "");
     if (!this._cabinAny()) return this._setPanel("comfort", "");
-    const open = this._secOpen("comfort");
-    let h = '<section class="sec">' + this._foldHead("comfort", "座椅与加热", this._sumSeats());
-    if (open) h += '<div class="secB">' + this._cabin() + "</div>";
-    h += "</section>";
+    const h = '<section class="sec">' + this._foldHead("comfort", "座椅与加热", this._sumSeats()) + "</section>";
     this._setPanel("comfort", h);
   }
 
@@ -1652,42 +1677,72 @@ this._index = {};            // translation_key → entity_id
     let h = '<section class="sec">' + this._foldHead("trip", "行程", this._sumTrip(stats));
     if (open) {
       h += '<div class="secB">';
-      const kv = [];
-      if (trip) {
-        const a = trip.attributes || {};
-        const km = this._num("last_trip");
-        const t0 = fmtClock(a["开始"]);
-        const t1 = fmtClock(a["结束"]);
-        kv.push(["最近行程", fmtNum(km, 1, "km")]);
-        if (t0 || t1) kv.push(["时间", (t0 || "—") + " → " + (t1 || "—")]);
-        if (a["时长_分钟"] != null) {
-          const m = Number(a["时长_分钟"]);
-          kv.push(["时长", m >= 60 ? Math.floor(m / 60) + " 小时 " + Math.round(m % 60) + " 分" : fmtNum(m, 0, "分钟")]);
-        }
-        if (a["耗电_kwh"] != null) kv.push(["耗电", fmtNum(a["耗电_kwh"], 2, "kWh")]);
-        if (a["百公里能耗_kwh"] != null) kv.push(["能耗", fmtNum(a["百公里能耗_kwh"], 1, "kWh/100km")]);
-        if (a["平均速度_kmh"] != null) kv.push(["平均速度", fmtNum(a["平均速度_kmh"], 0, "km/h")]);
-      }
-      if (stats) {
-        const a = stats.attributes || {};
-        const today = a["今日"];
-        const d7 = a["近7天"];
-        if (today && typeof today === "object") {
-          kv.push(["今日", (today.count || 0) + " 段 · " + fmtNum(today.km, 1, "km") +
-            (today.kwh_per_100km != null ? " · " + fmtNum(today.kwh_per_100km, 1, "kWh/100km") : "")]);
-        }
-        if (d7 && typeof d7 === "object") {
-          kv.push(["近7天", (d7.count || 0) + " 段 · " + fmtNum(d7.km, 1, "km") +
-            (d7.kwh_per_100km != null ? " · " + fmtNum(d7.kwh_per_100km, 1, "kWh/100km") : "")]);
-        }
-      }
-      if (kv.length) h += this._kvs(kv);
+      h += this._tripCells(trip, stats);
       // 整句提示收进 ⓘ
       h += '<div class="tripTip">' + this._info("完整行程列表 / 轨迹回放用「零跑·行程浏览」卡片") + "</div>";
       h += "</div>";
     }
     h += "</section>";
     this._setPanel("trip", h);
+  }
+
+  /**
+   * 最近行程的指标网格(2 列 × 3 行): 抄行程卡详情页 .dcell 的排版 —— 小字标签 + 大号数值 + 小字单位。
+   * 主数据来自 sensor.*_zui_jin_xing_cheng 的中文属性(里程_km / 时长_分钟 / 耗电_kwh / 百公里能耗_kwh);
+   * 这条传感器缺属性时回落到 trip_stats 里的「最近行程」—— 后端把它放在顶层(一个数组, 最近的一段在
+   * [0], 键名是英文), 老版本也可能塞在「今日/近7天」里面(中文键), 两种都认。
+   * 任何一项取不到就显示 —。这里只放行程本身的指标: 不放电量百分比, 也不放电费。
+   */
+  _tripCells(trip, stats) {
+    const a = (trip && trip.attributes) || {};
+    let src = a;
+    if (!src["时长_分钟"] && !src["里程_km"] && stats && stats.attributes) {
+      const sa = stats.attributes;
+      // ① 顶层「最近行程」: 数组(最近一段在 [0])或单个对象
+      const top = sa["最近行程"];
+      const first = Array.isArray(top) ? top[0] : top;
+      // ② 老版本: 塞在「今日」/「近7天」里面
+      let nested = null;
+      for (const g of ["今日", "近7天"]) {
+        const box = sa[g];
+        if (box && typeof box === "object" && box["最近行程"]) { nested = box["最近行程"]; break; }
+      }
+      if (first && typeof first === "object") src = first;
+      else if (nested && typeof nested === "object") src = nested;
+    }
+    const pick = (cn, en) => {
+      const v = src[cn] != null ? src[cn] : src[en];
+      if (v == null) return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    // 里程: 属性里程_km 优先; 属性没有就用传感器状态(后端里状态本身就是 distance_km)
+    let km = pick("里程_km", "distance_km");
+    if (km == null && trip) km = this._num("last_trip");
+    const durMin = pick("时长_分钟", "duration_min");
+    const kwh = pick("耗电_kwh", "energy_kwh");
+    const k100 = pick("百公里能耗_kwh", "efficiency");
+    const avg = pick("平均速度_kmh", "avg_speed_kmh");
+    const t0 = fmtClock(src["开始"] != null ? src["开始"] : src["started_at"]);
+    const t1 = fmtClock(src["结束"] != null ? src["结束"] : src["ended_at"]);
+
+    const cells = [
+      ["里程", km == null ? null : fmtNum(km, 1, "km")],
+      ["耗时", durMin == null ? null : (fmtDur(durMin) || null)],
+      ["耗电", kwh == null ? null : fmtNum(kwh, 2, "kWh")],
+      ["百公里能耗", k100 == null ? null : fmtNum(k100, 1, "kWh/100km")],
+      ["平均速度", avg == null ? null : fmtNum(avg, 0, "km/h")],
+      ["时间", (t0 || t1) ? ((t0 || "—") + " → " + (t1 || "—")) : null],
+    ];
+    let h = '<div class="tgrid">';
+    for (const c of cells) {
+      const na = c[1] == null;
+      // 时间那一格是两个钟点连在一起, 字号收小一号才放得下
+      h += '<div class="tcell"><span class="k">' + esc(c[0]) + "</span>" +
+        '<span class="v' + (na ? " na" : "") + (c[0] === "时间" ? " sm" : "") + '">' +
+        (na ? "—" : esc(c[1])) + "</span></div>";
+    }
+    return h + "</div>";
   }
 
   _sumTrip(stats) {
@@ -1754,6 +1809,10 @@ this._index = {};            // translation_key → entity_id
       if (!sec) return;
       if (this._collapsed[sec]) delete this._collapsed[sec];
       else this._collapsed[sec] = true;
+      // 「充电」和「座椅与加热」并排成两张卡, 展开一个就把另一个收起来 —— 正文共用跨整行的
+      // 详情容器, 两块同时撑开会把版面拉得很长(旧的上下两个块没这个约束)。
+      const peer = sec === "charging" ? "comfort" : sec === "comfort" ? "charging" : "";
+      if (peer && !this._collapsed[sec]) this._collapsed[peer] = true;
       this._saveFold();
       this._render();
       return;
@@ -1843,7 +1902,7 @@ this._index = {};            // translation_key → entity_id
   _onInput(ev) {
     const el = ev.target;
     if (!el || !el.dataset || el.dataset.act !== "charge_limit") return;
-    const box = el.parentNode ? el.parentNode.querySelector(".rowV") : null;
+    const box = el.parentNode ? el.parentNode.querySelector(".cV") : null;
     if (box) box.textContent = fmtNum(Number(el.value), 0, "%");
   }
 
@@ -1952,15 +2011,17 @@ this._index = {};            // translation_key → entity_id
   _build() {
     this.shadowRoot.innerHTML = `
       <style>
-        /* v4 配色: 灰-白-灰三层 —— 外层大卡灰, 里面子块白, 白块里的按钮/胶囊再压一层浅灰。
-           全部走 HA 主题变量, 深浅两种主题都成立; 只有语义色(通风蓝/加热红/告警)写死,
-           且都挑了在白底和深灰底上都能看清的值。 */
+        /* v5 配色: 与「零跑·行程浏览」卡片同一套视觉语言 —— 外层大卡白底(同行程卡),
+           里面的子块(充电/座椅/燃油/行程/空调/位置)压一层浅灰, 灰块里的按钮再翻回白底,
+           于是"白 → 灰 → 白"三层, 深浅两种主题都靠 HA 变量自适应。
+           圆角体系也跟行程卡对齐: 大卡 12(同行程卡) / 子块 14 / 胶囊 999 / 圆钮 50%。
+           只有语义色(通风蓝/加热红/告警)写死, 且都挑了在白底和灰底上都能看清的值。 */
         :host { display: block; }
         .card {
-          background: var(--secondary-background-color, rgba(127,127,127,.1));
-          color: var(--primary-text-color, #222);
-          border-radius: 18px;
-          padding: 16px; box-sizing: border-box;
+          background: var(--ha-card-background, var(--card-background-color, #fff));
+          color: var(--primary-text-color, #212121);
+          border-radius: var(--ha-card-border-radius, 12px);
+          padding: 14px; box-sizing: border-box;
           font-size: 13px; line-height: 1.4;
           display: flex; flex-direction: column; gap: 12px;
         }
@@ -1975,15 +2036,15 @@ this._index = {};            // translation_key → entity_id
         .hint {
           padding: 8px 12px; border-radius: 14px; font-size: 12px;
           align-items: flex-start; gap: 6px;
-          background: var(--card-background-color, #fff);
-          border: 1px solid var(--divider-color, #ccc);
+          background: var(--secondary-background-color, #e7eaed);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
         }
         .hint .info { flex: none; margin-top: 1px; }
-        /* ── 内层卡片(白底, 圆角 14, 一层很浅的阴影) ── */
+        /* ── 内层卡片(浅灰底, 圆角 14, 一圈很细的内嵌描边 —— 行程卡 .thumb 同一个写法) ── */
         .sec {
-          background: var(--card-background-color, #fff);
-          border-radius: 14px; padding: 12px 16px;
-          box-shadow: 0 1px 3px rgba(0,0,0,.13);
+          background: var(--secondary-background-color, #e7eaed);
+          border-radius: 14px; padding: 12px 14px;
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
         }
         .secB { display: flex; flex-direction: column; gap: 8px; padding-top: 4px; }
         .subline { font-size: 12px; opacity: .62; }
@@ -2005,12 +2066,16 @@ this._index = {};            // translation_key → entity_id
           margin-left: auto; display: flex; align-items: center; gap: 8px;
           flex-wrap: wrap; justify-content: flex-end; flex: none;
         }
-        /* 灰底上的小圆钮/胶囊: 白底浮在灰卡上(第三层靠子块的白拉开层次) */
-        .toolBtn {
-          width: 36px; height: 36px; border-radius: 50%; display: inline-flex;
+/* 白卡上的小圆钮/胶囊: 压一层浅灰 + 一圈很细的内嵌描边(行程卡 .thumb 同款写法) */
+.toolBtn {
+          width: 30px; height: 30px; border-radius: 50%; display: inline-flex;
           align-items: center; justify-content: center; padding: 0; flex: none;
-          border: none; background: var(--card-background-color, #fff);
+          border: none; color: var(--secondary-text-color, #6b7280);
+          background: var(--secondary-background-color, #e7eaed);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
+          transition: background .15s ease, box-shadow .15s ease;
         }
+        .toolBtn:hover { background: var(--card-background-color, #fff); box-shadow: 0 1px 3px rgba(0,0,0,.13); }
         .toolBtn:active { transform: scale(.94); }
         .heroMain { display: flex; align-items: flex-end; gap: 12px; margin-top: 12px; }
         .rangeBig { flex: 1; min-width: 0; }
@@ -2031,12 +2096,15 @@ this._index = {};            // translation_key → entity_id
         .lockBox {
           display: inline-flex; align-items: center; gap: 6px; padding: 8px 12px;
           border-radius: 999px; font-size: 15px; white-space: nowrap;
-          border: none; background: var(--card-background-color, #fff);
+          border: none;
+          background: var(--secondary-background-color, #e7eaed);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
         }
-        .lockBox.armed { background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff); }
+        .lockBox.armed { background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff); box-shadow: none; }
         .pill {
           padding: 6px 12px; border-radius: 999px; font-size: 12px;
-          background: var(--card-background-color, #fff);
+          background: var(--secondary-background-color, #e7eaed);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
           color: var(--secondary-text-color, #666); white-space: nowrap;
         }
         .pill.warn { background: var(--warning-color, #ffa600); color: #fff; }
@@ -2047,7 +2115,8 @@ this._index = {};            // translation_key → entity_id
         .rchip {
           display: inline-flex; align-items: center; gap: 4px; padding: 6px 12px;
           border-radius: 999px; font-size: 13px; white-space: nowrap;
-          background: var(--card-background-color, #fff);
+          background: var(--secondary-background-color, #e7eaed);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
           color: var(--secondary-text-color, #666);
         }
         .rchip b { font-size: 15px; font-weight: 600; color: var(--primary-text-color, #222); }
@@ -2056,8 +2125,8 @@ this._index = {};            // translation_key → entity_id
         /* ── 车模区(车辆区的主图; 整块可点, 预留车模视图) ── */
         .carModel {
           position: relative; margin-top: 12px; border-radius: 14px; overflow: hidden;
-          background: var(--card-background-color, #fff);
-          box-shadow: 0 1px 3px rgba(0,0,0,.13);
+          background: var(--secondary-background-color, #e7eaed);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
           height: 200px; padding: 10px 0; box-sizing: border-box;
           display: flex; align-items: center; justify-content: center;
           cursor: pointer;
@@ -2067,19 +2136,21 @@ this._index = {};            // translation_key → entity_id
         .card.narrow .carModel { height: 160px; padding: 4px 0; }
         .card.narrow .carModel.hasTire { padding: 4px 0 30px; }
         .carSvg { width: 100%; height: 100%; }
-        .carShadow { fill: var(--secondary-text-color, #777); opacity: .12; }
-        .carBody { fill: var(--secondary-text-color, #777); opacity: .24; }
-        .carWin { fill: var(--secondary-text-color, #777); opacity: .42; }
-        .carMirror { fill: var(--secondary-text-color, #777); opacity: .3; }
+        /* 车模改成灰底之后, 描边的整体不透明度要往上抬一档, 否则车太淡看不清轮廓 */
+        .carShadow { fill: var(--secondary-text-color, #777); opacity: .16; }
+        .carBody { fill: var(--secondary-text-color, #777); opacity: .34; }
+        .carWin { fill: var(--secondary-text-color, #777); opacity: .5; }
+        .carMirror { fill: var(--secondary-text-color, #777); opacity: .38; }
         .carLine { fill: none; stroke: var(--card-background-color, #fff); stroke-width: 2; opacity: .5; }
-        .carTyre { fill: var(--secondary-text-color, #777); opacity: .45; }
+        .carTyre { fill: var(--secondary-text-color, #777); opacity: .5; }
         .carHub { fill: var(--card-background-color, #fff); opacity: .85; }
         /* 车模右下角的小胶囊: 胎压开关 */
         .tireTgl {
           position: absolute; left: 50%; bottom: 8px; transform: translateX(-50%);
           display: inline-flex; align-items: center; gap: 4px; padding: 4px 12px;
           border-radius: 999px; font-size: 12px; border: none; white-space: nowrap;
-          background: var(--secondary-background-color, rgba(127,127,127,.14));
+          background: var(--card-background-color, #fff);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
         }
         .tireTgl.on { background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff); }
         /* 车模四角上的四个轮压数据点(俯视方位: 左前/右前/左后/右后) */
@@ -2087,7 +2158,6 @@ this._index = {};            // translation_key → entity_id
           position: absolute; display: inline-flex; flex-direction: column; align-items: center;
           padding: 3px 8px; border-radius: 10px; font-size: 11px; line-height: 1.2;
           min-width: 54px; background: var(--card-background-color, #fff);
-          border: 1px solid var(--divider-color, #ccc);
           box-shadow: 0 1px 4px rgba(0,0,0,.2);
         }
         .tP i { font-style: normal; opacity: .6; }
@@ -2096,9 +2166,9 @@ this._index = {};            // translation_key → entity_id
         .tP.b { right: 8px; top: 8px; }
         .tP.c { left: 8px; bottom: 8px; }
         .tP.d { right: 8px; bottom: 8px; }
-        .tP.warn { border-color: var(--warning-color, #ffa600); }
+        .tP.warn { box-shadow: inset 0 0 0 2px var(--warning-color, #ffa600), 0 1px 4px rgba(0,0,0,.2); }
         .tP.warn b { color: var(--warning-color, #ffa600); }
-        .tP.bad { border-color: var(--error-color, #db4437); }
+        .tP.bad { box-shadow: inset 0 0 0 2px var(--error-color, #db4437), 0 1px 4px rgba(0,0,0,.2); }
         .tP.bad b { color: var(--error-color, #db4437); }
         /* ── 四个圆形动作按钮(浮在灰卡上的白圆钮) ── */
         .acts { display: flex; gap: 8px; max-width: 560px; }
@@ -2106,7 +2176,8 @@ this._index = {};            // translation_key → entity_id
         .circ {
           width: 56px; height: 56px; border-radius: 50%; border: none; padding: 0;
           display: inline-flex; align-items: center; justify-content: center;
-          background: var(--card-background-color, #fff);
+          background: var(--secondary-background-color, #e7eaed);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
           transition: transform .12s ease;
         }
         .card.narrow .circ { width: 48px; height: 48px; }
@@ -2122,28 +2193,29 @@ this._index = {};            // translation_key → entity_id
           position: absolute; top: calc(100% + 8px); left: 50%; transform: translateX(-50%);
           box-sizing: border-box; z-index: 6; display: flex; gap: 6px; padding: 8px;
           border-radius: 999px;
-          background: var(--card-background-color, #fff);
-          border: 1px solid var(--divider-color, #ccc);
-          box-shadow: 0 4px 14px rgba(0,0,0,.22); white-space: nowrap;
+          background: var(--secondary-background-color, #e7eaed);
+          box-shadow: 0 4px 14px rgba(0,0,0,.22), inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
+          white-space: nowrap;
         }
         /* 小箭头指回上面的圆钮(夹取后气泡不再正对它, 位置由 --winArrow 带过去) */
         .winPop::before {
           content: ""; position: absolute; top: -6px; left: var(--winArrow, calc(50% - 6px));
           width: 12px; height: 12px; transform: rotate(45deg);
-          background: var(--card-background-color, #fff);
-          border-left: 1px solid var(--divider-color, #ccc);
-          border-top: 1px solid var(--divider-color, #ccc);
+          background: var(--secondary-background-color, #e7eaed);
+          border-left: 1px solid var(--divider-color, rgba(0,0,0,.08));
+          border-top: 1px solid var(--divider-color, rgba(0,0,0,.08));
         }
         .winOpt {
           position: relative; padding: 6px 12px; border-radius: 999px; font-size: 13px;
           display: inline-flex; align-items: center; gap: 4px;
-          border: none; background: var(--secondary-background-color, rgba(127,127,127,.14));
+          border: none; background: var(--card-background-color, #fff);
         }
         .winOpt:active { transform: scale(.96); }
-        /* 白块里的按钮/胶囊: 再压一层浅灰(灰-白-灰的最内层) */
+        /* 灰块里的按钮/胶囊: 翻回白底, 再压一圈很细的内嵌描边 —— 「白卡 → 灰块 → 白钮」第三层 */
         .chip {
           padding: 8px 14px; border-radius: 999px; font-size: 13px; border: none;
-          background: var(--secondary-background-color, rgba(127,127,127,.14));
+          background: var(--card-background-color, #fff);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
         }
         .chip.on { background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff); }
         /* 空调模式按钮: 一排三个图标, 当前模式高亮(宽卡片里别拉得太宽) */
@@ -2154,15 +2226,15 @@ this._index = {};            // translation_key → entity_id
         .mi { padding: 9px 0; flex: 1; display: inline-flex; align-items: center; justify-content: center; }
         .mi:not(.on) { color: var(--secondary-text-color, #6b7280); }
         /* ── 两张并排的小卡 ── */
-        .cardsRow { display: flex; gap: 12px; align-items: stretch; }
+        .cardsRow { display: flex; gap: 10px; align-items: stretch; }
         .card.narrow .cardsRow { flex-direction: column; }
         .p-climate, .p-location { flex: 1; min-width: 0; display: flex; }
         .p-climate > .sec, .p-location > .sec { flex: 1; }
         .half {
           display: flex; flex-direction: column; gap: 12px;
-          background: var(--card-background-color, #fff);
-          border-radius: 14px; padding: 12px 16px;
-          box-shadow: 0 1px 3px rgba(0,0,0,.13);
+          background: var(--secondary-background-color, #e7eaed);
+          border-radius: 14px; padding: 12px 14px;
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
         }
         .halfH { display: flex; align-items: flex-end; gap: 8px; cursor: pointer; }
         .halfId { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
@@ -2172,14 +2244,17 @@ this._index = {};            // translation_key → entity_id
         .fanBtn {
           margin-left: auto; width: 36px; height: 36px; border-radius: 50%; padding: 0; border: none;
           display: inline-flex; align-items: center; justify-content: center; flex: none;
-          background: var(--secondary-background-color, rgba(127,127,127,.14)); color: var(--secondary-text-color, #6b7280);
+          background: var(--card-background-color, #fff);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
+          color: var(--secondary-text-color, #6b7280);
         }
-        .fanBtn.on { background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff); }
+        .fanBtn.on { background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff); box-shadow: none; }
         .floatRow { display: flex; gap: 8px; margin-top: auto; flex-wrap: wrap; align-items: center; }
         .floatPill {
           display: inline-flex; align-items: center; gap: 4px; padding: 8px 12px;
           border-radius: 999px; font-size: 13px; border: none;
-          background: var(--secondary-background-color, rgba(127,127,127,.14));
+          background: var(--card-background-color, #fff);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
         }
         /* ⓘ 靠右贴在胶囊行末尾 */
         .locInfo { margin-left: auto; }
@@ -2203,11 +2278,62 @@ this._index = {};            // translation_key → entity_id
         .tempBox { display: flex; align-items: center; gap: 8px; justify-content: center; }
         .step {
           width: 40px; height: 40px; border-radius: 14px; font-size: 18px; line-height: 1; flex: none;
-          border: none; background: var(--secondary-background-color, rgba(127,127,127,.14));
+          border: none; background: var(--card-background-color, #fff);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
         }
         .step:active { transform: scale(.94); }
         .tval { font-size: 20px; font-weight: 600; width: 64px; flex: none; text-align: center; }
         .tval i { font-style: normal; font-size: 12px; opacity: .6; }
+        /* ── 充电 / 座椅与加热: 左右并排两张卡, 展开的详情跨整行铺在下面 ──
+           两张卡互斥(点谁展开谁, 另一张自动收起), 窄屏(<420px)退回上下堆叠。 */
+        .csRow { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-items: stretch; }
+        .card.narrow .csRow { grid-template-columns: 1fr; }
+        .csRow > * { min-width: 0; }
+        .csRow > .sec { height: 100%; box-sizing: border-box; }
+        .csDetail { grid-column: 1 / -1; }
+        /* 并排的两张卡只有半幅宽, 标题和摘要挤一行放不下 —— 摘要换到标题下面一行,
+           箭头仍在右上角竖着居中(和折叠块"标题+摘要"的读法一致)。 */
+        .csRow .foldH {
+          display: grid; grid-template-columns: minmax(0, 1fr) auto;
+          grid-template-areas: "t c" "s c"; align-items: center; column-gap: 6px;
+        }
+        .csRow .foldT { grid-area: t; }
+        .csRow .foldS {
+          grid-area: s; margin-left: 0; text-align: left; padding-left: 0;
+          /* 半幅宽放不下一整行摘要(座椅那种"主驾加热3 · 副驾加热1 · …"), 允许折到第二行,
+             最多两行 —— grid 拉伸会让两张卡保持等高 */
+          white-space: normal; overflow: hidden;
+          display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+        }
+        .csRow .foldC { grid-area: c; align-self: center; }
+        /* 窄屏退回上下堆叠后宽度又够了 —— 标题和摘要回到原来的一行式排版 */
+        .card.narrow .csRow .foldH { display: flex; align-items: center; gap: 8px; }
+        .card.narrow .csRow .foldS {
+          display: block; margin-left: auto; text-align: right; padding-left: 8px;
+          white-space: nowrap;
+        }
+        /* 充电设置: 一行一个设置项 —— 标签在左, 控件在右, 行与行之间一条细分隔线 */
+        .cList { display: flex; flex-direction: column; }
+        .cRow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 9px 0; box-sizing: border-box; }
+        .cRow + .cRow { border-top: 1px solid var(--divider-color, rgba(0,0,0,.08)); }
+        .cL { font-size: 13px; flex: none; min-width: 68px; }
+        .cC { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+        .cC .rng { flex: 1 1 120px; min-width: 110px; }
+        .cV { font-size: 13px; font-weight: 600; min-width: 42px; text-align: right; }
+        /* ── 行程指标网格: 抄行程卡详情页 .dcell 的排版(小字标签 + 大号数值 + 小字单位) ── */
+        .tgrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 8px; }
+        .tcell { min-width: 0; }
+        .tcell .k { display: block; font-size: 11px; color: var(--secondary-text-color, #6b7280); }
+        .tcell .v {
+          display: block; font-size: 19px; font-weight: 600; margin-top: 1px;
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .tcell .v i {
+          font-style: normal; font-size: 11px; font-weight: 500; margin-left: 2px;
+          color: var(--secondary-text-color, #6b7280);
+        }
+        .tcell .v.sm { font-size: 15px; }
+        .tcell .v.na { color: var(--secondary-text-color, #6b7280); font-weight: 500; }
         /* ── 可折叠的常用块 ── */
         .foldH {
           display: flex; align-items: center; gap: 8px; width: 100%; padding: 0;
@@ -2234,7 +2360,8 @@ this._index = {};            // translation_key → entity_id
         .cabRow.front > .cabCell { flex: 1; max-width: 152px; }
         .cabConsole {
           width: 34px; flex: none; align-self: stretch; min-height: 44px; border-radius: 10px;
-          background: var(--secondary-background-color, rgba(127,127,127,.12));
+          background: var(--card-background-color, #fff);
+          opacity: .55;
         }
         /* 二排 / 三排: 左右各一个 */
         .cabRow.rear > .cabCell, .cabRow.third > .cabCell { flex: 1; max-width: 152px; }
@@ -2244,7 +2371,8 @@ this._index = {};            // translation_key → entity_id
         .cabBtn {
           width: 38px; height: 38px; border-radius: 14px; padding: 0; border: none; flex: none;
           display: inline-flex; align-items: center; justify-content: center;
-          background: var(--secondary-background-color, rgba(127,127,127,.14));
+          background: var(--card-background-color, #fff);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
           color: var(--secondary-text-color, #6b7280);
           transition: transform .12s ease;
         }
@@ -2265,7 +2393,8 @@ this._index = {};            // translation_key → entity_id
         .tripTip { display: flex; justify-content: flex-end; }
         .togchip {
           padding: 8px 12px; border-radius: 999px; font-size: 13px; text-align: left;
-          border: none; background: var(--secondary-background-color, rgba(127,127,127,.14));
+          border: none; background: var(--card-background-color, #fff);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
         }
         .togchip i { font-style: normal; opacity: .55; margin-left: 6px; font-size: 12px; }
         .togchip.on { box-shadow: inset 0 0 0 2px var(--primary-color, #03a9f4); color: var(--primary-color, #03a9f4); }
@@ -2274,12 +2403,15 @@ this._index = {};            // translation_key → entity_id
         .tinput {
           font: inherit; font-size: 13px; color: inherit; padding: 6px 8px;
           border: none; border-radius: 14px;
-          background: var(--secondary-background-color, rgba(127,127,127,.14));
+          background: var(--card-background-color, #fff);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
         }
         .timeBox { display: inline-flex; align-items: center; gap: 6px; }
         .kvchip {
           padding: 4px 10px; border-radius: 999px; font-size: 12px;
-          background: var(--secondary-background-color, rgba(127,127,127,.14)); white-space: nowrap;
+          background: var(--card-background-color, #fff);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
+          white-space: nowrap;
         }
         .kvchip.on { background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff); }
         .fuelHead { display: flex; align-items: baseline; gap: 8px; }
@@ -2287,29 +2419,30 @@ this._index = {};            // translation_key → entity_id
         /* ── 多车候选 / 提示 / toast ── */
         .pick {
           padding: 16px; border-radius: 14px;
-          background: var(--card-background-color, #fff);
-          box-shadow: 0 1px 3px rgba(0,0,0,.13);
+          background: var(--secondary-background-color, #e7eaed);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
         }
         .pickT { font-size: 15px; font-weight: 600; }
         .pickS { font-size: 12px; opacity: .7; margin-top: 4px; }
-        .pickS code { font-size: 11px; background: var(--secondary-background-color, rgba(127,127,127,.14)); padding: 0 4px; border-radius: 5px; }
+        .pickS code { font-size: 11px; background: var(--card-background-color, #fff); padding: 0 4px; border-radius: 5px; }
         .pickRow {
           display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
           width: 100%; margin-top: 8px; padding: 10px 12px; border-radius: 14px; text-align: left;
-          border: none; background: var(--secondary-background-color, rgba(127,127,127,.14));
+          border: none; background: var(--card-background-color, #fff);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
         }
         .pickRow b { font-size: 13px; }
         .pickRow span { font-size: 11px; opacity: .6; word-break: break-all; }
         .toast {
           display: none; padding: 8px 12px; border-radius: 14px; font-size: 12px;
-          background: var(--card-background-color, #fff);
-          box-shadow: 0 1px 3px rgba(0,0,0,.13);
+          background: var(--secondary-background-color, #e7eaed);
+          box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0,0,0,.08));
         }
         .toast.on { display: block; }
         .toast.err { color: var(--error-color, #db4437); }
         /* ── 照片覆盖层 ── */
         .ovl {
-          position: absolute; inset: 0; z-index: 5; border-radius: 18px;
+          position: absolute; inset: 0; z-index: 5; border-radius: var(--ha-card-border-radius, 12px);
           background: rgba(0,0,0,.72); display: flex; align-items: center; justify-content: center;
           padding: 16px; box-sizing: border-box;
         }
@@ -2330,8 +2463,11 @@ this._index = {};            // translation_key → entity_id
           <div class="p-climate"></div>
           <div class="p-location"></div>
         </div>
-        <div class="p-charging"></div>
-        <div class="p-comfort"></div>
+        <div class="csRow">
+          <div class="p-charging"></div>
+          <div class="p-comfort"></div>
+          <div class="p-csdetail"></div>
+        </div>
         <div class="p-seats"></div>
         <div class="p-fuel"></div>
         <div class="p-trip"></div>
@@ -2347,6 +2483,8 @@ this._index = {};            // translation_key → entity_id
     this._panels.seats.className = "p-seats cont";
     this._panels.climate.className = "p-climate";
     this._panels.location.className = "p-location";
+    // 充电/座椅的展开正文不是嵌在各自的卡里, 而是放在这两张卡下面那个跨整行的容器里
+    this._panels.csdetail.className = "p-csdetail csDetail";
     this._cardEl = this.shadowRoot.querySelector(".card");
     this._cardEl.style.position = "relative";
     this._bindNarrow();
