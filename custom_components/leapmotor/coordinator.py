@@ -716,7 +716,15 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.async_set_updated_data({**(self.data or {}), "last_result": self.last_result})
 
 
+# ⚠️ 轮询间隔的最小值: **6 秒**(与 `MIN_DRIVING_POLL_SECONDS` 对齐), 不是 60 秒。
+# 这里曾经写死 `max(60, seconds)` —— 那是"两档轮询"(行驶 60/停车 300)时代留下的下限;
+# 后来加了"行驶 6 秒"档, 决策函数算出了 6, 却在这个最后一步被悄悄钳成 60,
+# 结果**"行驶中提速"从未真正生效**(实测: 用户在开车时轮询仍是 60 秒一次,
+# 行程点间隔 60~136 秒、短途行程被整段漏掉而变成"补记")。
+MIN_UPDATE_INTERVAL = 6
+
+
 def timedelta_seconds(seconds: int):
     from datetime import timedelta
 
-    return timedelta(seconds=max(60, seconds))
+    return timedelta(seconds=max(MIN_UPDATE_INTERVAL, seconds))

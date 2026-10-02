@@ -46,3 +46,36 @@ def test_is_rate_limited_detection():
     assert api_client.is_rate_limited({"code": 0, "message": "操作过于频繁, 请稍后再试"})
     assert not api_client.is_rate_limited({"code": 0, "message": "请求成功"})
     assert not api_client.is_rate_limited(None)
+
+
+
+# ── 回归: 轮询间隔的最小值必须容许"行驶 6 秒"这一档(2026-10-02 真机踩到) ──
+def test_coordinator_allows_a_six_second_poll_interval():
+    """`coordinator.timedelta_seconds` 曾经写死 `max(60, seconds)`, 让 6 秒档从未生效。
+
+    真机证据(修前): 用户行驶中(车辆状态 = driving)轮询仍是 60 秒/次
+    (「状态更新时间」历史 306 次间隔都是 60 秒); 行程点间隔中位 86 秒;
+    24 段里 8 段因采样太稀被整段漏掉、只能"补记"。
+
+    这条测试**直接检查源码里那个下限常量**(不依赖 HA 运行时)。
+    """
+    import pathlib as _p
+    import re as _re
+
+    src = (_p.Path(__file__).resolve().parent.parent / "custom_components" / "leapmotor"
+           / "coordinator.py").read_text(encoding="utf-8")
+    # 找出 timedelta_seconds 里用的下限(可以是字面量, 也可以是常量名)
+    m = _re.search(r"def timedelta_seconds[\s\S]{0,400}?max\(([^,]+), seconds\)", src)
+    assert m, "找不到 timedelta_seconds 的下限写法(改了实现就要同步这条测试)"
+    token = m.group(1).strip()
+    if token.isdigit():
+        floor = int(token)
+    else:
+        cm = _re.search(_re.escape(token) + r"\s*=\s*(\d+)", src)
+        assert cm, "下限常量 %s 找不到定义" % token
+        floor = int(cm.group(1))
+    assert floor <= 10, (
+        "轮询间隔下限被钳到 %s 秒 —— 这会吃掉『行驶 6 秒』档(实测会导致行程点稀疏 + 大量补记)"
+        % floor)
+    # 再验证: 6 秒这一档确实不会被抬升
+    assert max(floor, 6) == 6
