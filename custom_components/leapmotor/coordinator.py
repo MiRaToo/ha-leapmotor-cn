@@ -113,7 +113,7 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # 20 秒超时，实测把 HA 启动拖了 4 分钟(bootstrap 连续 4 条 "Waiting for integrations")。
         self.light_first_refresh = False
         # 上一轮轮询实际花了多久(诊断用: 请求本身只要 0.2 秒, 若这里显示几十秒,
-        # 说明时间耗在 HA 的线程池排队上, 不是云端慢 —— 见「会话状态」传感器)。
+        # 说明这一轮在**网络层/重试**上花了时间(实测：某个地址族被黑洞时, 标准库会逐个地址串行等超时)。
         self.last_cycle_seconds = 0.0
         # 命令后的临时状态: 车端上报新 collectTime 前, 实体以本地值为准
         self.overrides = StateOverrides()
@@ -162,10 +162,10 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     return {**self.data, "session_problem": self.session_problem}
                 raise UpdateFailed(str(err)) from err
         finally:
-            # 诊断用: 请求本身约 0.2 秒; 这里常年几十秒说明慢在 HA 线程池排队
+            # 诊断用: 请求本身约 0.2 秒; 这里常年几十秒说明网络层在等超时/重试(不是 HA 线程池)
             self.last_cycle_seconds = time.monotonic() - t0
             if self.last_cycle_seconds > 60:
-                log.warning("本轮轮询耗时 %.0f 秒(请求本身约 0.2 秒; 多半是 HA 线程池排队)",
+                log.warning("本轮轮询耗时 %.0f 秒(请求本身约 0.2 秒; 多半在等网络超时/重试)",
                             self.last_cycle_seconds)
         return result
 
@@ -436,7 +436,7 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "last_result": self.last_result,
             "session_problem": self.session_problem,
             "car_state_problem": self.car_state_problem,
-            # 诊断: 每轮实际耗时(请求本身约 0.2s; 常年几十秒说明慢在 HA 线程池排队)
+            # 诊断: 每轮实际耗时(请求本身约 0.2s; 常年几十秒说明在网络层等超时)
             "cycle_seconds": round(self.last_cycle_seconds, 1),
         }
 

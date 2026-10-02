@@ -285,3 +285,93 @@ def test_charge_plugged_semantics():
     assert state({"1149": 1}).charge_plugged is True
     assert state({"1149": 0}).charge_plugged is False
     assert state({}).charge_plugged is None
+
+
+# ── 拨号策略: IPv4 优先(2026-10-02 修"每轮被 IPv6 黑洞拖 40 秒") ──
+def test_order_addresses_prefers_ipv4():
+    """DNS 把 AAAA 排在前面时, 我们要把 IPv4 提到前面 —— 但不是禁用 v6。
+
+    背景: 本机 IPv6 出口变成黑洞时, 标准库会顺着地址表逐个串行等超时;
+    2 条 AAAA × 20 秒 = 每轮白等 40 秒(HA 里 351 个慢样本全是 40.2 的整数倍)。
+    """
+    v6a = (10, 1, 6, "", ("240e::1", 443, 0, 0))
+    v6b = (10, 1, 6, "", ("240e::2", 443, 0, 0))
+    v4 = (2, 1, 6, "", ("1.2.3.4", 443))
+    out = api_client.order_addresses_by_family([v6a, v6b, v4])
+    assert out[0] == v4, "IPv4 必须排第一"
+    assert out[1:] == [v6a, v6b], "v6 仍保留且保持原顺序(不是禁用)"
+    # 只有 v6 时不该丢
+    assert api_client.order_addresses_by_family([v6a]) == [v6a]
+    # 空/异常输入
+    assert api_client.order_addresses_by_family([]) == []
+    assert api_client.order_addresses_by_family([(99, 0, 0, "", "x")]) == [(99, 0, 0, "", "x")]
+
+
+def test_build_opener_uses_ipv4_first_connections():
+    """构造出来的 opener 必须用我们自己的连接类(而不是标准 HTTPConnection)。"""
+    import ssl as _ssl
+    hc = api_client._build_opener(_ssl.create_default_context())
+    handlers = [h for h in getattr(hc, "handlers", [])]
+    names = " ".join(type(h).__name__ for h in handlers)
+    assert "_HTTPSHandler" in names or "HTTPSHandler" in names
+    # 连接类存在且是 http.client 的子类
+    import http.client as _hc
+    assert issubclass(api_client._IPv4FirstHTTPSConnection, _hc.HTTPSConnection)
+    assert issubclass(api_client._IPv4FirstHTTPConnection, _hc.HTTPConnection)
+
+
+def test_connect_timeout_is_short_but_read_timeout_kept():
+    """连接超时要短(对付黑洞地址), 但读响应的超时不能被改短。"""
+    assert api_client.CONNECT_TIMEOUT <= 8, "连接超时太长就失去意义"
+    cli = api_client.LeapmotorClient(api_client.Session(car_vin="VIN"))
+    assert cli.timeout >= 15, "读响应的大超时(默认 20s)要保持"
+
+
+def test_connection_dials_ipv4_first_and_uses_short_connect_timeout(monkeypatch):
+    """用伪造 socket 验证拨号行为(不依赖网络环境):
+
+    * 先试 IPv4(即使 DNS 把 AAAA 放在前面) —— 这是"IPv6 黑洞拖 40 秒"的根治点;
+    * 建连阶段用短超时(CONNECT_TIMEOUT=5), 避免坏地址等满 20 秒;
+    * 建连成功后把超时换回调用方的值(读响应可能慢);
+    * 第一个地址失败时继续试下一个(不是直接放弃)。
+    """
+    import socket as _socket
+
+    v6 = (10, 1, 6, "", ("2001:db8::1", 80, 0, 0))
+    v4 = (2, 1, 6, "", ("192.0.2.5", 80))
+    v4b = (2, 1, 6, "", ("192.0.2.6", 80))
+    calls = []
+
+    class FakeSock:
+        def __init__(self, fam, typ, proto):
+            self.fam = fam
+            self.timeouts = []
+
+        def settimeout(self, v):
+            self.timeouts.append(v)
+
+        def connect(self, addr):
+            calls.append((self.fam, addr))
+            if addr[0] == "192.0.2.5":
+                raise OSError("第一个 v4 不通(模拟)")   # 验证会继续试下一个
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(_socket, "socket", lambda f, t, p: FakeSock(f, t, p))
+    monkeypatch.setattr(_socket, "getaddrinfo",
+                        lambda *a, **k: [v6, v6, v4, v4b])     # AAAA 在最前
+    conn = api_client._IPv4FirstHTTPConnection("example.com", 80, timeout=20)
+    conn.connect()
+
+    assert [c[0] for c in calls] == [2, 2], "应当先试 IPv4(且失败后继续试下一个)"
+    assert calls[0][1][0] == "192.0.2.5" and calls[1][1][0] == "192.0.2.6"
+    assert conn.sock.timeouts[0] == api_client.CONNECT_TIMEOUT, "建连用短超时"
+    assert conn.sock.timeouts[-1] == 20, "建连后换回调用方的超时(读响应)"
+
+    # 两个 v6 排在前面时, 也不该被跳过(只是排后面)
+    monkeypatch.setattr(_socket, "getaddrinfo", lambda *a, **k: [v6])
+    calls.clear()
+    conn2 = api_client._IPv4FirstHTTPConnection("example.com", 80, timeout=20)
+    conn2.connect()
+    assert calls and calls[0][0] == 10, "只有 v6 时仍然要用它"

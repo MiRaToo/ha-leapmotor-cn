@@ -391,7 +391,7 @@ class LeapmotorSession(_Base):
             # 车况这一路是否取到: 空值说明"车端信号没拉回来", 与账号会话无关
             "车况": (self.coordinator.data or {}).get("car_state_problem")
                     or self.coordinator.car_state_problem or "正常",
-            # 诊断: 请求本身约 0.2 秒; 这里若常年几十秒, 说明慢在 HA 线程池排队
+            # 诊断: 请求本身约 0.2 秒; 这里若常年几十秒, 说明在网络层等超时(见 PROTOCOL §3)
             "上一轮轮询耗时_秒": round(getattr(self.coordinator, "last_cycle_seconds", 0.0), 1),
             # 诊断: 这辆车的能力位/授权清单 —— 后排座椅(22/67/85/93)与增程的实体是否出现,
             # 就取决于它; 让别人远程排查时, 把这两个值报回来即可(见 docs/test-c16-reev.md)

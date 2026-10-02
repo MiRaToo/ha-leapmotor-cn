@@ -400,6 +400,30 @@ class StateOverrides:
 MIN_POLL_SECONDS = 60          # 全局下限: 车端上报本来也不是实时的, 再密没意义
 
 
+def order_addresses_by_family(infos: list, prefer_ipv4: bool = True) -> list:
+    """把 `socket.getaddrinfo` 的结果重排: **优先 IPv4**, 同族内保持原顺序。
+
+    为什么需要(2026-10-02 定位): 云端域名的 DNS 会返回 **两条 AAAA(IPv6) 且排在 IPv4 之前**;
+    当本机/路由的 IPv6 出口变成"黑洞"(SYN 无响应)时, 标准库会顺着地址表**逐个串行**尝试,
+    每个都等满客户端超时 —— 2 条 AAAA × 20 秒 = **每轮白等 40 秒**。
+    证据: HA 里 351 个慢样本全部落在 40.2 秒的整数倍(×1/×2/×3/×5/×6), 2~40 秒之间一个都没有;
+    同一时刻从外部发起同一个请求只要 0.2 秒。
+
+    这里**不是禁用 IPv6**, 只是把它排到 IPv4 之后: v6 正常时依然会被用上(第一组就是 v6),
+    真遇到黑洞也最多多等一次"连接超时"。
+    """
+    four, six, other = [], [], []
+    for info in infos or []:
+        fam = info[0] if isinstance(info, (tuple, list)) and info else None
+        if fam == 2:          # AF_INET
+            four.append(info)
+        elif fam == 10:       # AF_INET6
+            six.append(info)
+        else:
+            other.append(info)
+    return (four + six + other) if prefer_ipv4 else (six + four + other)
+
+
 def choose_poll_seconds(*, parked: int, trip: int, driving: bool, launch_boost: bool,
                         rate_limited: bool = False, floor: int = 6) -> int:
     """四档轮询决策(纯函数, 便于单测)。
@@ -930,6 +954,92 @@ class Session:
 
 
 # ── 客户端 ──────────────────────────────────────────────────────────
+# ── HTTP 拨号策略: IPv4 优先 + 短连接超时(只重写 connect, 其余交给 http.client) ──
+import http.client   # noqa: E402  (放在这里是为了 keep 文件上方"纯协议/纯函数"的整洁)
+import socket        # noqa: E402
+
+CONNECT_TIMEOUT = 5          # 仅"建连"用; 读响应仍用调用方给的 timeout(默认 20s)
+
+
+class _IPv4FirstMixin:
+    """共用的拨号逻辑: 按"IPv4 优先"的顺序逐个建连, 建连超时用 CONNECT_TIMEOUT。
+
+    为什么不用 `socket.create_connection`: 它按 getaddrinfo **原顺序**逐个试, 且每个都用同一个
+    （较长的)超时 —— 遇到黑洞地址族就是成倍的等待(见 order_addresses_by_family 的说明)。
+    """
+
+    def _open_socket(self):
+        import socket
+
+        infos = []
+        try:
+            infos = socket.getaddrinfo(self.host, self.port, type=socket.SOCK_STREAM)
+        except OSError as err:
+            raise OSError(f"DNS 解析失败: {err}") from err
+        last_err = None
+        for fam, stype, proto, _canon, sockaddr in order_addresses_by_family(infos):
+            sock = None
+            try:
+                sock = socket.socket(fam, stype, proto)
+                sock.settimeout(CONNECT_TIMEOUT)      # 只约束"建连"这一步
+                sock.connect(sockaddr)
+                return sock
+            except OSError as err:
+                last_err = err
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+        raise last_err or OSError("没有可用地址")
+
+    def connect(self):
+        """建连成功后, 把 socket 超时换回调用方的值(读响应可能比建连慢)。"""
+        import socket
+
+        sock = self._open_socket()
+        self.sock = sock
+        if getattr(self, "_tunnel_host", None):
+            self._tunnel()                                  # type: ignore[attr-defined]
+        if self.timeout is not None and self.timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+            sock.settimeout(self.timeout)
+
+
+class _IPv4FirstHTTPSConnection(_IPv4FirstMixin, http.client.HTTPSConnection):
+    """HTTPS 版: 建连(TCP)走上面的策略, TLS 包装仍用 http.client 自己的实现。"""
+
+    def connect(self):
+        import socket
+
+        sock = self._open_socket()
+        if getattr(self, "_tunnel_host", None):
+            self.sock = sock
+            self._tunnel()
+            sock = self.sock
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        if self.timeout is not None and self.timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+            self.sock.settimeout(self.timeout)
+
+
+class _IPv4FirstHTTPConnection(_IPv4FirstMixin, http.client.HTTPConnection):
+    """HTTP 版(仅用于排查/兼容: 我们访问的都是 https)。"""
+
+
+def _build_opener(ctx):
+    """构造一个"IPv4 优先"的 urllib opener(每次调用重建, 无全局状态)。"""
+    import urllib.request
+
+    class _HTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(_IPv4FirstHTTPConnection, req)
+
+    class _HTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(_IPv4FirstHTTPSConnection, req, context=ctx)
+
+    return urllib.request.build_opener(_HTTPHandler(), _HTTPSHandler())
+
+
 class LeapmotorClient:
     """零跑汽车客户端(仅标准库 + cryptography 做 RSA)。"""
 
@@ -960,8 +1070,9 @@ class LeapmotorClient:
 
         req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
         ctx = ssl.create_default_context()
+        opener = _build_opener(ctx)          # IPv4 优先(见文件上方的拨号策略说明)
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout, context=ctx) as resp:
+            with opener.open(req, timeout=self.timeout) as resp:
                 raw = resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             raw = e.read().decode("utf-8", "replace")
