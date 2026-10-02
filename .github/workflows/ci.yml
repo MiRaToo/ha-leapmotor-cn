@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 安装依赖
+        # 测试只依赖 pytest 与 cryptography(协议客户端其余部分都是标准库)
+        run: pip install pytest cryptography
+      - name: 跑测试
+        run: pytest -q
+      - name: 校验集成里的 api.py 与 poller/api_client.py 保持同步
+        run: python tools/sync_api.py --check

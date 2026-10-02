@@ -1,0 +1,13 @@
+{
+  "domain": "leapmotor",
+  "name": "零跑汽车",
+  "codeowners": ["@MiRaToo"],
+  "config_flow": true,
+  "documentation": "https://github.com/MiRaToo/ha-leapmotor-cn",
+  "issue_tracker": "https://github.com/MiRaToo/ha-leapmotor-cn/issues",
+  "iot_class": "cloud_polling",
+  "integration_type": "hub",
+  "loggers": ["custom_components.leapmotor"],
+  "requirements": ["cryptography>=42"],
+  "version": "0.1.0"
+}

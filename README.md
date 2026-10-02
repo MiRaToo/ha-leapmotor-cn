@@ -1,0 +1,184 @@
+<p align="center">
+  <img src="docs/images/logo.png" alt="ha-leapmotor-cn" width="128">
+</p>
+
+# ha-leapmotor-cn
+
+**零跑汽车 Home Assistant 集成**
+
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+![Python](https://img.shields.io/badge/python-3.12+-blue?logo=python&logoColor=white)
+![Home Assistant](https://img.shields.io/badge/Home%20Assistant-%E8%87%AA%E5%AE%9A%E4%B9%89%E9%9B%86%E6%88%90-41BDF5?logo=homeassistant&logoColor=white)
+![HACS](https://img.shields.io/badge/HACS-%E8%87%AA%E5%AE%9A%E4%B9%89%E4%BB%93%E5%BA%93-41BDF5)
+
+**在 Home Assistant 里使用你的零跑汽车** —— 远程车控、实时车况与自动化联动，全部以
+**HA 原生实体**呈现。
+
+接入走**零跑云端的 HTTP 接口**（与官方 App 使用同一套服务）：接入时**不需要模拟器、不需要 root**，在 HA 里输入手机号 + 短信验证码即可完成登录，
+也不需要 MQTT 或任何附加组件。
+
+## 功能
+
+| 分类 | 内容 |
+|---|---|
+| **车辆控制** | 车门锁 · 后备箱 · 遮阳帘 · 车窗（全开 / 微开 / 半开 / 关四档）· 寻车鸣笛 · 空调（含温度设定）· 座椅加热与通风（0~3 档）· 方向盘加热 · 后视镜加热 · 电池预热 · 健康充电 · 预约充电（含充电上限与起止时间） |
+| **车辆状态** | 位置 · 电量 · 续航 · 充电状态 · 车辆状态 · 状态更新时间 · 车内温度 · 四个轮胎胎压 |
+| **里程能耗** | 总里程 · 近 7 天里程与能耗 · 百公里能耗 · 能耗排名 · 交付天数 |
+| **照片与诊断** | 驻车照片 · 最近指令回执 · 原始指令（cmdId）· 会话状态 · 刷新车况 |
+| **界面** | 自带一张高德底图的地图卡（`custom:leapmotor-map`）—— 国内网络加载不出 OpenStreetMap 底图，这张卡直接取高德瓦片，装上集成即可用；可在卡片上拖圆创建地理围栏、管理区域 |
+
+配套特性：
+
+- **自适应轮询**：行驶中 60 秒一次，停车 300 秒一次（可在集成「配置」中调整）
+- **会话自动续期**：账号 token 与车端 token 都会自动续期，正常情况下不需要重复收短信
+- **坐标自动换算**：对外发布 WGS-84 坐标，可直接用于 HA 地图、区域与手机定位口径
+- **失败可见**：云端未受理的指令会直接报错提示，不会出现"界面显示成功、车没动"
+- **按权限门控**：读取车辆授权清单（`rightList`），没有授权的功能不显示
+
+## ⚠️ 请用一个单独的子账号接入
+
+零跑云同一账号只允许一个活跃登录。本项目需要持续轮询，**用主账号会导致你的手机
+App 被顶下线**。正确做法：
+
+1. 注册一个**子账号**（备用号、家人号均可）
+2. 主账号在官方 App 里打开 `我的 → 我的车辆 → 车辆共享`，邀请该子账号
+3. 子账号在官方 App 里接受邀请
+4. 用**子账号**接入本集成
+
+这样主账号完全不受影响，日常手机控车照常；子账号的权限由主账号掌握，随时可以收回。
+
+> **不要用主账号登录本项目。**
+
+## 安装与使用
+
+1. 把 `custom_components/leapmotor/` 复制到 HA 的 `config/custom_components/`
+   （HACS 用户可把本仓库添加为自定义仓库后直接安装）
+2. **重启 Home Assistant**
+3. **设置 → 设备与服务 → 添加集成 → 搜「零跑」** → 选「零跑汽车」
+4. 填**子账号**手机号 → 收到短信 → 填验证码 → 完成
+
+装好后会得到一个车辆设备与一组实体，设备页里按「车身 → 充电 → 舒适 → 按钮 → 车况 →
+里程能耗 → 诊断」排列：
+
+| 段 | 实体 |
+|---|---|
+| 车身 | 车门锁 / 后备箱 / 遮阳帘 / 方向盘加热 / 后视镜加热 |
+| 充电 | 健康充电 / 预约充电 / 充电上限 / 预约充电-开始 / 预约充电-结束 |
+| 舒适 | 空调 / 主驾·副驾座椅加热 / 主驾·副驾座椅通风 / 车内温度 |
+| 按钮 | 寻车鸣笛 / 车窗-全开 / 微开 / 半开 / 关 / 电池预热-开 / 关 / 刷新车况 |
+| 车况 | 电量 / 续航 / 充电状态 / 车辆状态 / 状态更新时间 / 四轮胎压 / 位置 |
+| 里程能耗 | 总里程 / 近 7 天里程 / 近 7 天能耗 / 百公里能耗 / 能耗排名 / 交付天数 / 驻车照片 |
+| 诊断 | 驻车照片地址 / 充电配置 / 最近指令回执 / 会话状态 / 原始指令 |
+
+操作密码与轮询间隔在该集成条目的 **配置** 里修改。部署方式见
+[docs/DEPLOY.md](docs/DEPLOY.md)，使用说明与常见问题见 [docs/SETUP.md](docs/SETUP.md)。
+
+<details>
+<summary>命令行验证协议</summary>
+
+
+```bash
+pip install cryptography
+python scripts/login.py --phone 138xxxxxxxx -o session.json     # 或 python scripts/login_web.py
+python -c "import sys; sys.path.insert(0,'poller'); from api_client import LeapmotorClient, Session; print(LeapmotorClient(Session.load('session.json')).get_car_state().signals)"
+```
+
+</details>
+
+## 项目结构
+
+```
+ha-leapmotor-cn/
+├── custom_components/leapmotor/   ★ HA 自定义集成(用户实际安装的部分)
+│   ├── config_flow.py             手机号 + 短信验证码登录 / 重新认证
+│   ├── coordinator.py             轮询、token 自动续期、会话失效判定、指令下发
+│   ├── api.py                     协议客户端(由 poller/api_client.py 同步生成, 勿手改)
+│   ├── lock / climate / switch / number / time / button / sensor / device_tracker / image / text
+│   ├── brand/                     集成页显示的项目图标
+│   └── www/leapmotor-map.js       自带的高德底图地图卡
+├── poller/
+│   └── api_client.py              ★ 协议客户端: 登录 / 交换 / 密钥派生 / 签名 / 车况 / 车控
+├── scripts/
+│   ├── login.py                   一键登录
+│   └── login_web.py               网页版登录(仅标准库)
+├── tools/
+│   ├── sync_api.py                同步 api_client.py → 集成里的 api.py
+│   ├── deploy_ha.py               通过 SSH 把集成部署到自己的 HA
+│   └── make_homekit_yaml.py       生成"只暴露车实体"的 HomeKit 桥 YAML
+├── tests/                         pytest(协议 / 车况信号 / 会话续期 / 指令形状)
+├── docs/                          文档(见下表)
+├── hacs.json                      HACS 元数据
+└── LICENSE
+```
+
+
+### 文档
+
+| 文档 | 内容 |
+|---|---|
+| [docs/SETUP.md](docs/SETUP.md) | 安装与使用(子账号原则、首次登录、会话寿命、常见问题) |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md) | 协议: 服务拓扑、两种签名、密钥派生、车况信号表、指令码与实测结论 |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | 代码结构、如何新增实体/指令、调试与部署 |
+| [docs/dashboard.md](docs/dashboard.md) | 仪表盘与图表(自带地图卡、ApexCharts 复合卡) |
+| [docs/geofence.md](docs/geofence.md) | 地理围栏与自动化(HA 原生 zone / proximity, 示例自动化) |
+| [docs/homekit.md](docs/homekit.md) | 接到 HomeKit / Google / Alexa(含只暴露车实体的 YAML 桥) |
+| [docs/DEPLOY.md](docs/DEPLOY.md) | 部署方式(HACS / 手动 / 命令行验证) |
+
+## 开发状态
+
+### 已实现
+
+- **认证**：手机号 + 短信验证码 → 账号 token → 车端 JWT；两类 token 均自动续期
+- **协议**：请求签名与密钥派生均以纯 Python 实现（不依赖官方 App、不需要安装证书）
+- **车控**：门锁 / 后备箱 / 遮阳帘 / 车窗四档 / 寻车 / 空调（开与关）/ 座椅加热通风 /
+  方向盘加热 / 后视镜加热 / 电池预热 / 健康充电 / 预约充电
+- **车况**：位置 / 电量 / 续航 / 胎压 / 门窗 / 充电 / 空调等 90 余项车端信号
+- **集成**：config flow 登录与重新认证、授权清单门控、指令失败提示、
+  乐观状态与真实状态的对账
+- **界面**：自带高德地图卡（创建与管理地理围栏）、HomeKit 桥 YAML 生成器
+
+### 尚未支持 / 已知限制
+
+- **多车型信号映射**：信号表目前以 C10 为准，其它车型需要实测补全
+- **预约空调 / 预约电池预热**（cmdId 171 / 161）：请求体结构未知
+- **天窗、后排座椅**：本车无此配置，需要具备该配置的车型验证
+- **哨兵模式**：指令码 `400` 已查明，但它的权限码同为 `400`，而主账号**无法**把哨兵
+  权限授予子账号（云端恒回 `code=40 无此权限`），因此本集成不提供该实体。
+  用主账号运行脚本的用户仍可调用 `LeapmotorClient.sentry()`
+- **空调快捷模式**（极速降温 / 升温 / 除味 / 除霜）
+
+## 致谢
+
+本项目的协议实现与车型差异结论，参考并借鉴了以下开源项目：
+
+- [ProtossBlaster/leapmotor-mate](https://github.com/ProtossBlaster/leapmotor-mate)
+- [kerniger/leapmotor-ha](https://github.com/kerniger/leapmotor-ha)
+- [markoceri/leapmotor-api](https://github.com/markoceri/leapmotor-api)
+
+## 免责声明
+
+**请在使用前完整阅读本节。继续安装或使用本项目，即视为你已知悉并接受以下全部内容。**
+
+- **个人项目**：本项目由个人开发者出于自用与学习目的编写，**不是零跑汽车官方产品**，
+  与零跑汽车及其关联公司无任何隶属、合作或背书关系，也未获得其授权或认可。
+- **风险自负**：本项目需要你在 Home Assistant 中保存账号会话与**车辆操作密码**，
+  并向零跑云下发真实的车辆控制指令。**使用本项目所产生的一切后果，由使用者自行承担** ——
+  包括但不限于车辆状态异常、账号被限制或封禁、数据丢失、违反平台服务条款等。
+  请先确认你清楚每条指令会对车辆做什么，**不要在行驶中或不确定的场景下远程操作**。
+- **接口可能失效**：本项目依赖零跑云端接口（与官方 App 同一套）。零跑随时可能调整接口、
+  签名方式、权限策略或风控规则，届时集成的**部分或全部功能可能失效**，
+  作者无法保证持续可用，也没有义务为此提供支持或更新。
+- **使用限制**：请仅在你**本人所有或获得车主明确授权**的车辆上使用本项目。
+  **禁止**用于商业用途、批量或自动化滥用、规避平台风控，以及任何违反法律法规的用途。
+- **无担保**：本项目按"现状（as is）"提供，不附带任何明示或暗示的担保，
+  包括但不限于适销性与特定用途适用性；作者不承担任何直接或间接损失的赔偿责任。
+- **第三方权利**：本项目涉及的第三方品牌、商标、服务名称与图标 ——
+  包括零跑 / Leapmotor 的名称与商标、高德地图瓦片服务、Home Assistant 等 ——
+  **均归各自权利人所有**。本项目仅在"标识与说明"的范围内引用，不主张任何相关权利；
+  若权利人认为使用不当，请联系作者删除。
+- **合规提醒**：请遵守你所在地区的法律法规以及零跑汽车的用户协议与隐私政策。
+  因使用本项目而与第三方产生的纠纷，由使用者自行解决与承担。
+
+## 许可证
+
+[GNU AGPL-3.0](./LICENSE)

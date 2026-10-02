@@ -1,0 +1,63 @@
+{
+ "config": {
+  "step": {
+   "user": {
+    "title": "零跑汽车登录",
+    "description": "请使用【子账号】手机号 —— 零跑云单账号单会话, 用主账号会把手机上的官方 App 顶下线。\n\n之后会收到一条短信验证码。",
+    "data": {
+     "phone": "子账号手机号"
+    }
+   },
+   "code": {
+    "title": "输入短信验证码",
+    "description": "验证码已发送到 {phone}, **5 分钟内有效**。\n\n如果已经超时/收不到, 勾选下面的「重新发送验证码」再提交 —— 会立刻再发一条, 不用退出重来。",
+    "data": {
+     "sms_code": "验证码",
+     "resend": "重新发送验证码"
+    }
+   }
+  },
+  "error": {
+   "cannot_connect": "网络错误, 请稍后重试",
+   "invalid_auth": "验证码不正确或已过期(超过 5 分钟)。勾选「重新发送验证码」再提交一次即可",
+   "risk_cooldown": "账号环境被风控(1023)。请静默等待 30 分钟以上, 期间不要重试 —— 继续请求会延长冷却",
+   "sms_too_often": "验证码发送过于频繁(36), 等几分钟再试",
+   "sms_failed": "发送验证码失败, 请查看日志",
+   "car_login_failed": "车端 token 交换失败, 请查看日志",
+   "no_vehicle": "该账号名下没有可用车辆 —— 请确认子账号已被共享车辆",
+   "unknown": "未知错误",
+   "reauth_failed": "重新登录失败, 请重新发起"
+  },
+  "abort": {
+   "already_configured": "该车辆已配置过",
+   "reauth_successful": "重新登录成功, 已恢复"
+  }
+ },
+ "options": {
+  "step": {
+   "init": {
+    "title": "零跑汽车设置",
+    "data": {
+     "operate_pwd": "车辆操作密码(4 位数字)",
+     "poll_seconds": "轮询间隔(停车)",
+     "operate_pwd_mode": "操作密码编码方式",
+     "driving_poll_seconds": "轮询间隔(行驶中)"
+    },
+    "description": "操作密码是你在车机上/App 里设置的 4 位数字; 解锁等敏感指令需要它。\n\n轮询间隔: 停车时默认 5 分钟, 行驶中默认 60 秒(开车时位置/速度才有意义, 会更快); 行驶中还会跳过里程/能耗这类不常变的数据, 避免请求过多。"
+   }
+  }
+ },
+ "selector": {
+  "operate_pwd_mode": {
+   "options": {
+    "aes_jwt": "AES(车端 token 派生) —— 实测可用, 默认",
+    "aes": "AES(账号 token 派生/内置默认)",
+    "plain": "明文",
+    "md5mid16": "MD5 中段",
+    "md5": "MD5 完整",
+    "rsa": "RSA"
+   }
+  }
+ },
+ "selectors": {}
+}

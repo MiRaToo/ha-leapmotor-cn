@@ -1,0 +1,48 @@
+{
+ "config": {
+  "step": {
+   "user": {
+    "title": "Leapmotor (China) login",
+    "description": "Use a SECONDARY account — Leapmotor allows only one active session per account, so using your main account will sign out the official app on your phone.",
+    "data": {
+     "phone": "Phone number"
+    }
+   },
+   "code": {
+    "title": "Enter SMS code",
+    "description": "A code was sent to {phone} and is **valid for 5 minutes**.\n\nExpired or never arrived? Tick “Resend code” below and submit again.",
+    "data": {
+     "sms_code": "Code",
+     "resend": "Resend code"
+    }
+   }
+  },
+  "error": {
+   "cannot_connect": "Network error, please retry",
+   "invalid_auth": "Wrong or expired code (valid 5 minutes). Tick “Resend code” and submit again.",
+   "risk_cooldown": "Account flagged by risk control (1023). Wait 30+ minutes silently; retrying extends the cooldown",
+   "sms_too_often": "SMS requested too often (36), retry in a few minutes",
+   "sms_failed": "Failed to request SMS code, see logs",
+   "car_login_failed": "Vehicle token exchange failed, see logs",
+   "no_vehicle": "No vehicle on this account — make sure the car is shared with the secondary account",
+   "unknown": "Unknown error"
+  },
+  "abort": {
+   "already_configured": "This vehicle is already configured",
+   "reauth_successful": "Re-authenticated successfully"
+  }
+ },
+ "options": {
+  "step": {
+   "init": {
+    "title": "Leapmotor (China) options",
+    "data": {
+     "operate_pwd": "Vehicle operation PIN (4 digits, needed by sensitive commands)",
+     "poll_seconds": "Poll interval (parked)",
+     "driving_poll_seconds": "Poll interval (driving)"
+    },
+    "description": "Poll interval: 5 min while parked, 60 s while driving (position/speed only matter when moving). Slow-changing data (mileage/energy) is skipped while driving to keep request volume low."
+   }
+  }
+ }
+}
