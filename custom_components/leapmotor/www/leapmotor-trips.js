@@ -50,7 +50,7 @@
 
 const TILE = 256;
 
-const CARD_VERSION = "1.1.2";
+const CARD_VERSION = "1.1.3";
 
 /* 断档阈值(km): 相邻轨迹点距离超过它 → 视为中间丢过采样, 用虚线连 */
 const TRACK_GAP_KM = 2;
@@ -679,7 +679,7 @@ class LeapmotorTripsCard extends HTMLElement {
     }
     if (t.frozen) badges.push('<span class="badge f" title="车端失联后收尾, 时长可能有偏差">失联</span>');
     const mets = [
-      ["耗时", (t.approx_time ? "≈ " : "") + fmtDurShort(t.duration_min), "", "时长"],
+      ["耗时", (t.approx_time && t.duration_min != null ? "≈ " : "") + fmtDurShort(t.duration_min), "", "时长"],
       ["耗电", fmtKwh(t.energy_kwh), "kWh", "这段行程的耗电量"],
       // 单位跟官方 App 的详情页一致(那儿是「百公里 20.7 kWh」), 窄屏下才塞得下;
       // 完整口径 kWh/100km 放在 title 里, 详情页的「百公里能耗」格也写着
@@ -917,7 +917,7 @@ class LeapmotorTripsCard extends HTMLElement {
     if (t.frozen) bad.push("失联");
     const cells = [
       ["里程", fmtKm(t.distance_km), "km"],
-      ["耗时", (t.approx_time ? "≈ " : "") + fmtDurShort(t.duration_min), ""],
+      ["耗时", (t.approx_time && t.duration_min != null ? "≈ " : "") + fmtDurShort(t.duration_min), ""],
       ["耗电", fmtKwh(t.energy_kwh), "kWh"],
       ["百公里能耗", t.efficiency == null ? "—" : fmtNum(t.efficiency, 1), "kWh/100km"],
       ["平均速度", fmtNum(t.avg_speed_kmh, 1), "km/h"],

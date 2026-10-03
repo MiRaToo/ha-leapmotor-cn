@@ -17,6 +17,9 @@
 * **短行程(<0.2 km)丢弃** —— mate 在真车上踩出来的阈值(0.5 km 曾把"去便利店"的车丢掉)。
 * **漏采兜底**: 停车期间总里程跳变 >=1 km 且没有进行中的行程 → 记一条"重建行程"
   (只有里程/耗电, **没有轨迹**, 标 `reconstructed`); 若是充电造成的跳变, 记进 `offline_gaps`。
+* **补记护栏**(2026-10-02, 对照 mate 的 `_RECONSTRUCT_MAX_TRIP_KM`): 单帧总里程跳变超过
+  ±1500 km 判为毛刺(本帧里程按缺失处理, 也不立成下一帧的基线); 补记出的时长若隐含均速
+  不在 8~160 km/h 区间(观测区间里混着停车/失联), 时长留空 —— 里程照记, 不写不可信的数字。
 * 轨迹: 行驶中每帧 1 点(WGS-84), 跳过 (0,0) 与重复坐标; 单段上限 `MAX_TRACK_POINTS`。
 
 存储: HA 的 `Store`(`.storage/leapmotor_<vin>_trips.json`), 防抖落盘; 重启能接续未完成行程。
@@ -43,8 +46,17 @@ MIN_EFFICIENCY_KM = 0.5          # 里程太短时不给"百公里能耗"(除出
 PARKED_CONFIRM_SECONDS = 60      # 停车确认窗口(至少这么久没动才算行程结束)
 FROZEN_LIMIT_SECONDS = 1800      # 30 分钟收不到新帧 → 强制收尾(并把结束时刻回拨)
 MAX_TRACK_POINTS = 3000          # 单段轨迹点存储上限(6 秒采样 ≈ 5 小时; 超出等距抽稀)
+# 单帧总里程跳变超过这个值判为毛刺(信号异常/云端串帧), 不记账也不立基线。
+# 依据: 对照 mate 的 `_RECONSTRUCT_MAX_TRIP_KM`(1500 km) —— 一次未观测区间再长,
+# 也不该长到 1500 km; 真跳这么大只能是脏数据。
+MAX_ODO_JUMP_KM = 1500
+# 补记行程的"隐含均速"合理区间(km/h)。落在区间外说明观测区间里混着停车(太慢)或者
+# 里程是一段以上行程凑出来的(太快), 时长都不代表任何真实行程 → 留空而不是写个骗人的数字。
+RECON_MIN_SPEED_KMH = 8.0
+RECON_MAX_SPEED_KMH = 160.0
 KEEP_WITH_TRACK = 100            # 保留轨迹的行程条数
 KEEP_SUMMARY = 1000              # 只保留摘要的行程条数
+PERSIST_HEARTBEAT_SECONDS = 600  # 帧基准(_last_frame_ts/_last_fresh_wall)的落盘心跳间隔
 DEFAULT_CAPACITY_KWH = 69.9      # 电池可用容量(仅用于 ΔSOC → kWh 折算; 可在配置里改)
 
 
@@ -120,6 +132,22 @@ def downsample(points: list, max_points: int) -> list:
     return out
 
 
+def reconstruction_duration_min(distance_km: float | None,
+                                seconds: float | None) -> float | None:
+    """补记行程的时长: 观测区间秒数 → 分钟; **隐含均速不合理时返回 None**。
+
+    补记的时间窗只是"两次观测之间"—— 窗口里车可能停了半个小时、也可能中间回过家;
+    只有隐含均速落在 RECON_MIN/MAX_SPEED_KMH 内时, 这个窗口才大致等于"一段连续行驶"。
+    否则宁缺毋滥: 里程/耗电照记, 时长留空(卡片显示"—")。
+    """
+    if not seconds or seconds <= 0 or distance_km is None or distance_km <= 0:
+        return None
+    speed = float(distance_km) / (float(seconds) / 3600.0)
+    if not (RECON_MIN_SPEED_KMH <= speed <= RECON_MAX_SPEED_KMH):
+        return None
+    return round(float(seconds) / 60.0, 1) or None
+
+
 @dataclass
 class Trip:
     """一段行程。时间为 epoch 秒; 坐标对外一律 WGS-84。"""
@@ -189,6 +217,10 @@ class TripRecorder:
         self._prev_pos: tuple[float, float] | None = None  # 最后已知的 WGS 坐标
         self._last_seen_wall: float = 0.0            # 上次"看到车"的墙钟时刻(补记的起点边界)
         self._started_wall: float = 0.0
+        self._last_saved_frame_ts: float | None = None   # 上次落盘的帧基准(心跳节流用)
+        self._last_persist_wall: float = 0.0             # 上次因心跳而落盘的墙钟
+        self._odo_glitch_count: int = 0                  # 连续多少个**新帧**的总里程跳变超限
+        self._last_odo_glitch_log: float = 0.0           # 里程毛刺日志节流(毛刺持续时别刷屏)
 
     # ── 持久化 ──
     async def async_load(self) -> None:
@@ -211,6 +243,12 @@ class TripRecorder:
         self.gaps = list(data.get("gaps") or [])
         self._last_odo = data.get("last_odo")
         self._last_soc = data.get("last_soc")
+        # 帧基准也要接回来: 重启后云端常把**同一帧**再回一遍 —— 没有旧基准就会把
+        # 重复帧误当新帧(基准前移), 补记的起点被推到重启时刻; 接回来才能认出
+        # "这不是新观测", 补记区间也才是真正的观测区间。旧存储里没有这两个键 → None/0。
+        self._last_frame_ts = data.get("last_frame_ts")
+        self._last_fresh_wall = float(data.get("last_fresh_wall") or 0.0)
+        self._last_saved_frame_ts = self._last_frame_ts
         active = data.get("active")
         if isinstance(active, dict):
             self._active = Trip(**{k: v for k, v in active.items()
@@ -220,11 +258,14 @@ class TripRecorder:
         log.info("行程记录: 已载入 %d 段历史行程, %d 条漏采记录", len(self.trips), len(self.gaps))
 
     def _dump(self) -> dict[str, Any]:
+        self._last_saved_frame_ts = self._last_frame_ts   # 落盘即"基准已保存"(心跳节流)
         return {
             "trips": [asdict(t) for t in self.trips],
             "gaps": self.gaps,
             "last_odo": self._last_odo,
             "last_soc": self._last_soc,
+            "last_frame_ts": self._last_frame_ts,
+            "last_fresh_wall": self._last_fresh_wall or None,
             "active": (lambda t: {**asdict(t), "points": self._points})(self._active)
             if self._active is not None else None,
         }
@@ -248,12 +289,18 @@ class TripRecorder:
         stale = frame_ts is not None and frame_ts == self._last_frame_ts
         if frame_ts is not None:
             self._last_frame_ts = frame_ts
+            # 帧基准落盘心跳: 重启后云端常先把**同一帧**再回一遍, 落过盘才认得出它是重复帧
+            # (详见 async_load 与 PERSIST_HEARTBEAT_SECONDS)。限频: 10 分钟最多多写一次。
+            if (frame_ts != self._last_saved_frame_ts
+                    and (now - self._last_persist_wall) >= PERSIST_HEARTBEAT_SECONDS):
+                self._last_persist_wall = now
+                self._save_soon(delay=10)
         if not stale:
             self._last_fresh_wall = now
         frame_time = (frame_ts / 1000.0) if frame_ts else now
         driving = bool(st.vehicle_state == "driving" or (st.get("speed") or 0) > 1)
         soc = st.soc
-        odo = st.get("odometer")
+        odo = self._guard_odometer(st.get("odometer"), fresh=not stale, now=now)
         # 注意: `_last_soc` / `_last_odo` 是"**上一帧**的值", 漏采补记要拿它做对比,
         # 所以只能在函数末尾更新 —— 之前把它提前更新, 导致能耗算成 0、"期间充过电"判不出来。
         prev_soc, prev_odo = self._last_soc, self._last_odo
@@ -267,7 +314,7 @@ class TripRecorder:
                     self._add_gap_or_reconstruct(
                         prev_odo, odo, prev_soc, soc, (prev_seen_wall or prev_time), now, st,
                         reason="行程开始前观测到里程跳变", prev_pos=prev_pos)
-                self._start(st, frame_time, now)
+                self._start(st, frame_time, now, odo)
                 if not stale:
                     self._add_point(st)
                 self._last_moving_ts = frame_time
@@ -296,7 +343,7 @@ class TripRecorder:
                 log.debug("车已停下, %d 秒内不再动就收尾这段行程", self._confirm_seconds())
             plugged = bool(st.get("charge_connection")) or bool(st.charging)
             if plugged or (now - self._parked_since) >= self._confirm_seconds():
-                self._finish(st, now, frozen=False)
+                self._finish(st, now, frozen=False, odo=odo)
                 self._last_odo = odo if odo is not None else prev_odo
                 if soc is not None:
                     self._last_soc = soc
@@ -308,7 +355,7 @@ class TripRecorder:
                 and (now - self._last_fresh_wall) > FROZEN_LIMIT_SECONDS:
             log.info("行程记录: %d 秒收不到新车端帧 -> 强制收尾(结束时刻回拨)",
                      int(now - self._last_fresh_wall))
-            self._finish(st, now, frozen=True)
+            self._finish(st, now, frozen=True, odo=odo)
         self._last_odo = odo if odo is not None else prev_odo
         if soc is not None:
             self._last_soc = soc
@@ -324,6 +371,32 @@ class TripRecorder:
         self._prev_pos = (lat, lon) if lat is not None and lon is not None else None
 
     # ── 状态机 ──
+    def _guard_odometer(self, odo: float | None, *, fresh: bool, now: float) -> float | None:
+        """总里程毛刺护栏: 单个**新帧**比上一帧跳变超过 ±MAX_ODO_JUMP_KM → 按缺失处理。
+
+        真车场景: 云端偶发给一帧错里程(信号异常/串帧), 若照单全收, 下一帧"跳回来"就会
+        被补记逻辑记成一条横跨上千公里的假行程。判废后**不更新基线**(返回值 None 时调用方
+        保留 prev_odo), 所以本帧既不记账也不污染下一帧的对比。
+
+        连续多帧同向超限(一直读到坏值)先不判废 —— 真换了车/读错表盘这类极端情形宁可
+        如实记录, 也不能把真的跳变永远吞掉。
+        """
+        if odo is None:
+            return None
+        prev = self._last_odo
+        if prev is not None and abs(float(odo) - float(prev)) > MAX_ODO_JUMP_KM:
+            if fresh:
+                self._odo_glitch_count += 1
+            if self._odo_glitch_count < 3:
+                if now - self._last_odo_glitch_log >= 3600:
+                    self._last_odo_glitch_log = now
+                    log.warning("总里程毛刺: 单帧跳变 %.0f → %.0f km(超 ±%d), 本帧按缺失处理",
+                                prev, odo, MAX_ODO_JUMP_KM)
+                return None
+        elif fresh:
+            self._odo_glitch_count = 0
+        return float(odo)
+
     def _confirm_seconds(self) -> float:
         """停车确认窗口: 至少 60 秒, 且不少于 3 个采样周期(采样 300s 时也要能判)。"""
         poll = 0
@@ -334,12 +407,12 @@ class TripRecorder:
                 poll = 0
         return max(float(PARKED_CONFIRM_SECONDS), poll * 3.0)
 
-    def _start(self, st, frame_time: float, now: float) -> None:
+    def _start(self, st, frame_time: float, now: float, odo: float | None = None) -> None:
         self._active = Trip(
             id=uuid.uuid4().hex[:12],
             started_at=frame_time,
             start_soc=st.soc,
-            start_odo=st.get("odometer"),
+            start_odo=odo if odo is not None else self._last_odo,
             start_lat=st.latitude_wgs,
             start_lon=st.longitude_wgs,
         )
@@ -360,14 +433,14 @@ class TripRecorder:
         if len(self._points) > MAX_TRACK_POINTS:
             self._points = downsample(self._points, MAX_TRACK_POINTS)
 
-    def _finish(self, st, now: float, frozen: bool) -> None:
+    def _finish(self, st, now: float, frozen: bool, odo: float | None = None) -> None:
         trip, self._active = self._active, None
         self._parked_since = None
         if trip is None:
             return
         trip.ended_at = max(trip.started_at, self._last_moving_ts or now)
         trip.end_soc = st.soc if st.soc is not None else self._last_soc
-        trip.end_odo = st.get("odometer")
+        trip.end_odo = odo if odo is not None else self._last_odo   # 毛刺帧被过滤时用最后可信值, 不碰原始信号
         trip.end_lat = st.latitude_wgs
         trip.end_lon = st.longitude_wgs
         trip.frozen = frozen
@@ -433,6 +506,12 @@ class TripRecorder:
         delta = float(odo - prev_odo)
         if delta < 1:
             return
+        if delta > MAX_ODO_JUMP_KM:
+            # 二级护栏(一级在 _guard_odometer): 基线本身曾经被坏帧改小过时, 差值可能仍然巨大 ——
+            # 补记一条上千公里的"行程"毫无意义, 丢给日志留痕即可。
+            log.warning("漏采里程 %.0f km 超过 ±%d km 上限, 判为脏数据不记账(%s)",
+                        delta, MAX_ODO_JUMP_KM, reason)
+            return
         gap_s = None
         if started and ended and ended > started:
             gap_s = float(ended - started)
@@ -461,7 +540,9 @@ class TripRecorder:
                     start_odo=float(prev_odo), end_odo=float(odo),
                     start_lat=lat0, start_lon=lon0, end_lat=lat1, end_lon=lon1,
                     reconstructed=True, approx_time=True, gap_seconds=gap_s)
-        trip.duration_min = round(max(0.0, (t_end - t_start) / 60.0), 1) or None
+        # 时长要过"隐含均速"护栏: 观测区间里混着停车/失联时, 写一个 40 小时 3 公里的
+        # duration 不如留空(里程/耗电照记, 卡片显示 "—")。见 reconstruction_duration_min。
+        trip.duration_min = reconstruction_duration_min(delta, gap_s)
         if delta >= MIN_EFFICIENCY_KM and energy:
             trip.efficiency = energy / delta * 100.0
         self.trips.append(trip)

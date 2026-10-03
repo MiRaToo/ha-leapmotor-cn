@@ -18,7 +18,8 @@ sys.path.insert(0, str(ROOT / "poller"))
 
 import api_client  # noqa: E402
 from trips import (  # noqa: E402
-    Trip, TripRecorder, downsample, haversine_km, pick_distance_km, track_length_km,
+    Trip, TripRecorder, downsample, haversine_km, pick_distance_km,
+    reconstruction_duration_min, track_length_km,
 )
 
 LAT, LON = 31.230416, 121.473701          # 示例坐标(GCJ-02, 与其它测试一致)
@@ -333,3 +334,78 @@ def test_reconstruction_after_stale_period_uses_last_fresh_boundaries():
     assert gap.start_lat == pytest.approx(f0.latitude_wgs, abs=1e-5), "起点坐标取最后已知位置"
     assert gap.end_lat > f0.latitude_wgs, "终点应更北(车往北开了)"
     assert rec.active is not None, "同时正常行程应已开始"
+
+
+# ── 补记护栏(2026-10-02, 对照 mate 的 _RECONSTRUCT_MAX_TRIP_KM) ──
+def test_odometer_glitch_frame_is_ignored_without_rebasing():
+    """单帧总里程毛刺(信号异常/串帧)按"缺失"处理: 不记账, 也不能改基线。
+
+    若照单全收, 下一帧"跳回来"就会被补记逻辑记成一条横跨十几万公里的假行程。
+    """
+    rec = recorder()
+    rec.process(frame(T0, odo=1000, soc=80, gear=0, speed=0), now=T0)
+    rec.process(frame(T0 + 60, odo=158_000, soc=80, gear=0, speed=0), now=T0 + 60)   # 坏帧
+    assert rec.trips == [], "单帧里程毛刺不该补记成行程"
+    assert rec._last_odo == pytest.approx(1000.0), "坏帧不能改基线"
+    # 下一帧恢复正常: 只补记真实的 3 km(而不是 157000)
+    rec.process(frame(T0 + 120, odo=1003, soc=79, gear=0, speed=0), now=T0 + 120)
+    assert len(rec.trips) == 1
+    assert rec.trips[-1].distance_km == pytest.approx(3.0)
+
+
+def test_reconstruction_jump_over_1500_km_is_discarded_as_dirty_data():
+    """二级护栏: 基线本身被污染过时差值仍可能巨大 —— 超过 ±1500 km 直接不记账。"""
+    rec = recorder()
+    rec.process(frame(T0, odo=1000, soc=80, gear=0, speed=0), now=T0)
+    rec._add_gap_or_reconstruct(1000, 1000 + 1600, 80, 70, T0, T0 + 3600, frame(T0))
+    assert rec.trips == [] and rec.gaps == [], "上千公里的'补记'只能是脏数据"
+
+
+def test_reconstruction_duration_guard_blank_vs_keep():
+    """补记时长要过"隐含均速"护栏: 不合理宁可留空, 也不写骗人的数字。"""
+    assert reconstruction_duration_min(10.0, 900) == pytest.approx(15.0)   # 40 km/h → 留
+    assert reconstruction_duration_min(4.0, 60) is None                    # 240 km/h → 空
+    assert reconstruction_duration_min(1.0, 3600) is None                  # 1 km/h(区间里全是停车) → 空
+    assert reconstruction_duration_min(10.0, None) is None
+
+
+def test_reconstructed_trip_keeps_mileage_but_blanks_absurd_duration():
+    """4 km / 60 秒(隐含 240 km/h)在现实中不可能 —— 里程/耗电照记, 时长留空。"""
+    rec = recorder()
+    rec.process(frame(T0, odo=3000, soc=50, gear=0, speed=0), now=T0)
+    rec.process(frame(T0 + 60, odo=3004, soc=46, gear=0, speed=0), now=T0 + 60)
+    trip = rec.trips[-1]
+    assert trip.distance_km == pytest.approx(4.0) and trip.energy_kwh
+    assert trip.duration_min is None, "不可信的时长不该写进行程"
+    assert trip.approx_time is True and trip.reconstructed is True
+
+
+def test_restart_recognizes_reserved_frame_as_stale_via_persisted_baseline():
+    """HA 重启后云端常把**同一帧**再回一遍 —— 帧基准要落盘, 才认得出这是旧观测。
+
+    真机现象: 不持久化时, 重启后第一帧(旧的)会被当成新观测, 补记的起点被推到重启时刻,
+    观测区间凭空缩水, 甚至把早已发生的里程跳变记到错误的窗口里。
+    """
+    store = FakeStore()
+    rec = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                       poll_seconds_getter=lambda: 6, store=store)
+    rec.process(frame(T0, odo=1000, soc=80, gear=0, speed=0), now=T0)
+    dumped = rec._dump()
+    assert dumped["last_frame_ts"] == int(T0 * 1000), "帧基准要落盘"
+    assert dumped["last_fresh_wall"] == pytest.approx(T0)
+
+    # 模拟重启: 4 分钟后云端先把同一帧再回一遍
+    rec2 = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                        poll_seconds_getter=lambda: 6, store=FakeStore(dumped))
+    asyncio.run(rec2.async_load())
+    assert rec2._last_frame_ts == int(T0 * 1000)
+    rec2.process(frame(T0 + 240, odo=1000, soc=80, gear=0, speed=0, sts=T0 * 1000),
+                 now=T0 + 240)
+    assert rec2.trips == [], "重启后重发的旧帧不该被当成新观测"
+    assert rec2._last_fresh_wall == pytest.approx(T0), "重复帧不该把观测边界推到重启时刻"
+
+    # 云端终于给出新帧(车出去跑了一圈, 里程 +9): 补记区间应是 T0 → 现在(5 分钟)
+    rec2.process(frame(T0 + 300, odo=1009, soc=72, gear=0, speed=0), now=T0 + 300)
+    trip = rec2.trips[-1]
+    assert trip.reconstructed is True and trip.distance_km == pytest.approx(9.0)
+    assert trip.gap_seconds == pytest.approx(300, abs=2), "起点要回到重启前最后一次真实观测"
