@@ -79,7 +79,7 @@
  * 用户不需要把它拷到 www/ 或手配资源。
  */
 
-const CARD_VERSION = "1.4.1";
+const CARD_VERSION = "1.4.2";
 
 /* 区块顺序(show 配置按这个顺序渲染; 缺键的区块自动隐藏)
  * 注意: 这里没有 tires —— 胎压在 v3 并进了车模区, 但 show 里写 "tires" 仍然被接受(忽略即可)。
@@ -2317,13 +2317,21 @@ this._index = {};            // translation_key → entity_id
         .csRow { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-items: stretch; }
         .card.narrow .csRow { grid-template-columns: 1fr; }
         .csRow > * { min-width: 0; }
-        .csRow > .sec { height: 100%; box-sizing: border-box; }
+        /* ⚠️ .sec 嵌在 .p-charging / .p-comfort 里面, **不是** .csRow 的直接子元素 ——
+           原来写成 .csRow > .sec 谁也匹配不到, 于是"没有摘要的那张卡"真的矮一截、标题也跟着错位。
+           现在两层都撑满, 并让内容垂直居中: 两张卡等高、标题同高。 */
+        .csRow > .p-charging, .csRow > .p-comfort { height: 100%; }
+        .csRow > .p-charging > .sec, .csRow > .p-comfort > .sec {
+          height: 100%; box-sizing: border-box;
+          display: flex; flex-direction: column; justify-content: center;
+        }
         .csDetail { grid-column: 1 / -1; }
         /* 并排的两张卡只有半幅宽, 标题和摘要挤一行放不下 —— 摘要换到标题下面一行,
            箭头仍在右上角竖着居中(和折叠块"标题+摘要"的读法一致)。 */
         .csRow .foldH {
           display: grid; grid-template-columns: minmax(0, 1fr) auto;
           grid-template-areas: "t c" "s c"; align-items: center; column-gap: 6px;
+          width: 100%;
         }
         .csRow .foldT { grid-area: t; }
         .csRow .foldS {
@@ -2332,6 +2340,8 @@ this._index = {};            // translation_key → entity_id
              最多两行 —— grid 拉伸会让两张卡保持等高 */
           white-space: normal; overflow: hidden;
           display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+          /* 摘要为空(例如座椅全关)时也占住这一行, 否则两张卡的标题会一高一低 */
+          min-height: 15px;
         }
         .csRow .foldC { grid-area: c; align-self: center; }
         /* 窄屏退回上下堆叠后宽度又够了 —— 标题和摘要回到原来的一行式排版 */

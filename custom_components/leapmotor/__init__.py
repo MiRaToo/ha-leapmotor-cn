@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 # CARD_VERSION 与各自 JS 文件头里的同名常量保持一致(改 JS 记得一起升, 好让浏览器拿到新文件)。
 CARD_VERSION = "1.5.0"            # leapmotor-map.js
 TRIPS_CARD_VERSION = "1.1.2"      # leapmotor-trips.js
-CONTROL_CARD_VERSION = "1.4.1"    # leapmotor-control.js
+CONTROL_CARD_VERSION = "1.4.2"    # leapmotor-control.js
 _CARDS = (
     ("leapmotor-map.js", "/leapmotor-card/leapmotor-map.js", CARD_VERSION),
     ("leapmotor-trips.js", "/leapmotor-card/leapmotor-trips.js", TRIPS_CARD_VERSION),
