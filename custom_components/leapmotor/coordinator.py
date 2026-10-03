@@ -259,12 +259,17 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #   1. `get_car_state` 对"被服务端拒收/没有 signalMap"的响应**不抛异常**,
         #      而是回一个**空 CarState** —— 直接赋值会把好数据覆盖成一片 null
         #      (表现为: 电量/续航/位置全变 unknown, 日志里却什么都没有)。
-        #   2. 刚重新交换过车端 token 的头一次请求最容易被拒(`302010205` 一族)。
-        # 所以: 空结果要重试一次(必要时换 token), 两次都拿不到就**沿用上一份**, 并把
-        # 原因写进 `car_state_problem`(会出现在「会话状态」传感器上, 不再静默)。
+        #   2. 服务端会**不定时把签名材料换掉**(2026-10-03 连续观测定性: 每天约 40 次
+        #      首拉被 `302010205` 拒签, 换一次车端 token 后重试**必成功**; 与 HA 重启
+        #      无关 —— 09-29 零重启那天也有 59 次)。换 token 是签名族错误的唯一解药。
+        # 所以: 空结果重试一次 —— **只有签名族错误才换 token**(`is_signature_error`),
+        # 网络抖动/未知错误码原样重试即可: 换 token 对它们是白费请求, 还会让别处的
+        # 会话失效(单账号单会话)。两次都拿不到就**沿用上一份**, 并把原因写进
+        # `car_state_problem`(会出现在「会话状态」传感器上, 不再静默)。
         state = None
         why = "未知原因"
         for attempt in (1, 2):
+            code = None
             try:
                 state = await self.hass.async_add_executor_job(
                     self.client.get_car_state, self.vin)
@@ -279,13 +284,16 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._enter_rate_limit("车况接口返回风控/限流提示")
                     break
             if attempt == 1:
-                log.warning("车况拉取为空(%s), 换一次车端 token 后重试", why)
-                try:
-                    if await self.hass.async_add_executor_job(
-                            functools.partial(self._renew_if_needed, force=True)):
-                        self._persist()
-                except Exception as err:  # noqa: BLE001
-                    log.warning("重试前换 token 异常: %s", err)
+                if is_signature_error({"code": code}):
+                    log.warning("车况拉取为空(%s), 换一次车端 token 后重试", why)
+                    try:
+                        if await self.hass.async_add_executor_job(
+                                functools.partial(self._renew_if_needed, force=True)):
+                            self._persist()
+                    except Exception as err:  # noqa: BLE001
+                        log.warning("重试前换 token 异常: %s", err)
+                else:
+                    log.warning("车况拉取为空(%s), 原样重试一次(不换 token)", why)
         if state is not None and state.raw:
             self.state = state
             self.car_state_problem = ""

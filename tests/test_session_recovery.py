@@ -57,6 +57,34 @@ def test_signature_and_auth_error_sets_are_disjoint():
     assert not (api_client.SIGNATURE_ERROR_CODES & api_client.AUTH_ERROR_CODES)
 
 
+# ── "车况首拉为空 → 换 token 重试"的触发条件(2026-10-03 连续观测定性) ──
+# 真机证据: 每天约 40 次首拉被服务端拒签(302010205), 换一次车端 token 后重试必成功;
+# 与 HA 重启无关(09-29 零重启那天也有 59 次)。签名族错误因此是"换 token"的唯一条件;
+# 其它原因(网络抖动/未知码)换 token 是白费请求, 还会让别处的会话失效(单账号单会话)。
+def test_renew_retry_is_reserved_for_signature_errors():
+    # 观测到的实际原因(302010205): 必须换 —— 换完重试必成功
+    assert api_client.is_signature_error({"code": 302010205, "message": "签名信息校验失败"})
+    # 不该换的典型: 网络异常(code=None)/业务错误/限流(限流另有专门分支处理, 不会走到这)
+    assert not api_client.is_signature_error({"code": None})
+    assert not api_client.is_signature_error({"code": -1, "message": "网络错误: timeout"})
+    assert not api_client.is_signature_error({"code": 4, "message": "操作密码错误"})
+    assert not api_client.is_rate_limited({"code": 302010205}), "签名族错误不当限流处理"
+
+
+def test_coordinator_only_renews_on_signature_error():
+    """防回归: 车况重试的换 token 条件必须按签名族判定。
+
+    (旧写法对**任何**空响应/异常都 force 换 token —— 观测显示签名族恰是最常见原因,
+    所以它能自愈; 但网络抖动也会连带换 token, 属于白费请求 + 挤掉别处会话。)
+    """
+    import pathlib
+    import re
+    src = (pathlib.Path(__file__).resolve().parent.parent / "custom_components"
+           / "leapmotor" / "coordinator.py").read_text(encoding="utf-8")
+    assert 'is_signature_error({"code": code})' in src, "车况重试必须按签名族错误判定"
+    assert "原样重试一次(不换 token)" in src, "非签名错误应原样重试"
+
+
 # ── 指令是否被受理(决定要不要给用户弹失败提示 + 要不要记乐观状态) ──
 def test_command_failed_detection():
     assert api_client.command_failed({"code": 0, "message": "请求成功"}) is None
