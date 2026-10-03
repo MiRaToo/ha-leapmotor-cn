@@ -248,6 +248,7 @@ class TripRecorder:
         # "这不是新观测", 补记区间也才是真正的观测区间。旧存储里没有这两个键 → None/0。
         self._last_frame_ts = data.get("last_frame_ts")
         self._last_fresh_wall = float(data.get("last_fresh_wall") or 0.0)
+        self._last_moving_ts = float(data.get("last_moving_ts") or 0.0)
         self._last_saved_frame_ts = self._last_frame_ts
         active = data.get("active")
         if isinstance(active, dict):
@@ -266,6 +267,8 @@ class TripRecorder:
             "last_soc": self._last_soc,
             "last_frame_ts": self._last_frame_ts,
             "last_fresh_wall": self._last_fresh_wall or None,
+            # 用"最后确实在动"的帧时刻: 重启后又遇冻结收尾时, 结束时刻要能回拨到它
+            "last_moving_ts": self._last_moving_ts or None,
             "active": (lambda t: {**asdict(t), "points": self._points})(self._active)
             if self._active is not None else None,
         }
@@ -393,6 +396,7 @@ class TripRecorder:
                     log.warning("总里程毛刺: 单帧跳变 %.0f → %.0f km(超 ±%d), 本帧按缺失处理",
                                 prev, odo, MAX_ODO_JUMP_KM)
                 return None
+            self._odo_glitch_count = 0        # 三帧同向 → 接受新值, 计数归零(规则对新基线重新生效)
         elif fresh:
             self._odo_glitch_count = 0
         return float(odo)

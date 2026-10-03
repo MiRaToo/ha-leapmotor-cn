@@ -409,3 +409,27 @@ def test_restart_recognizes_reserved_frame_as_stale_via_persisted_baseline():
     trip = rec2.trips[-1]
     assert trip.reconstructed is True and trip.distance_km == pytest.approx(9.0)
     assert trip.gap_seconds == pytest.approx(300, abs=2), "起点要回到重启前最后一次真实观测"
+
+
+def test_frozen_finish_after_restart_rewinds_to_persisted_moving_time():
+    """重启后又遇"车端不再上报": 结束时刻要回拨到重启前最后一次确实在动的帧, 不算进失联时间。"""
+    store = FakeStore()
+    rec = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                       poll_seconds_getter=lambda: 6, store=store)
+    rec.process(frame(T0, odo=2000, soc=60, gear=1, speed=40), now=T0)
+    rec.process(frame(T0 + 120, odo=2002, soc=59, gear=1, speed=40,
+                      lat=LAT + 0.01), now=T0 + 120)
+    dumped = rec._dump()
+    assert dumped["last_moving_ts"] == pytest.approx(T0 + 120), "最后在动的帧时刻要落盘"
+
+    rec2 = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                        poll_seconds_getter=lambda: 6, store=FakeStore(dumped))
+    asyncio.run(rec2.async_load())
+    # 重启后云端一直回同一帧(时间戳停在 T0+120), 轮询转了一小时
+    for i in range(1, 11):
+        rec2.process(frame(T0 + 120 + i * 360, odo=2002, soc=59, gear=1, speed=40,
+                           sts=(T0 + 120) * 1000), now=T0 + 120 + i * 360)
+    trip = rec2.trips[-1]
+    assert trip.frozen is True
+    assert trip.ended_at == pytest.approx(T0 + 120, abs=1), "结束时刻应回拨, 不算进失联的一小时"
+    assert trip.duration_min == pytest.approx(2.0, abs=0.1)
