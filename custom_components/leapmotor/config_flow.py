@@ -211,15 +211,33 @@ class LeapmotorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return LeapmotorOptionsFlow(entry)
 
 
-class LeapmotorOptionsFlow(config_entries.OptionsFlow):
-    """选项: 操作密码 + 轮询间隔。"""
+# HA 有 `OptionsFlowWithReload`(保存后由 HA 自动重载条目)时优先用它; 老版本没有
+# 这个基类 —— 退回普通 OptionsFlow 并在保存后手动调度一次重载(见 async_step_init)。
+_OptionsFlowBase = getattr(config_entries, "OptionsFlowWithReload", config_entries.OptionsFlow)
+
+
+class LeapmotorOptionsFlow(_OptionsFlowBase):
+    """选项: 操作密码 + 轮询间隔。
+
+    设计约束(2026-10-03 重载风暴的教训, 改动前先读):
+      * 集成里**不得**再注册 update listener —— 它在任何条目变化(含集成自己落盘
+        token 的 data 变化)时都会触发, 会造成每天几十次整批实体 unavailable;
+      * 选项变更后的重载由 `OptionsFlowWithReload` 负责(HA 源码里与 update listener
+        明确互斥); 老版本 HA 退回手动调度(见 async_step_init);
+      * 重新认证的重载由它自己的流程调度(见 reauth 分支的 async_update_reload_and_abort)。
+    """
 
     def __init__(self, entry: config_entries.ConfigEntry) -> None:
         self._entry = entry
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            result = self.async_create_entry(title="", data=user_input)
+            if _OptionsFlowBase is config_entries.OptionsFlow:
+                # 老版本 HA: 没有自动重载的基类, 这里补一次。
+                # (选项本身每轮都被热读, 重载只是让实体/卡片立刻换到新设置。)
+                self.hass.config_entries.async_schedule_reload(self._entry.entry_id)
+            return result
         opts = self._entry.options
         return self.async_show_form(
             step_id="init",

@@ -152,7 +152,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    # ⚠️ 这里**故意不注册"条目更新就重载"的监听器**(2026-10-03 定位到的重载风暴):
+    # 集成每 ~2 小时把续期后的 token 写回条目(data 变化), 而 HA 的 update listener
+    # 在**任何**条目变化(含仅 data)时都会触发 —— 于是每天几十次整批实体 unavailable、
+    # 内存态(乐观状态/照片窗口/行程记录器)反复重建。正确做法:
+    #   * 选项变更 → 由 OptionsFlowWithReload 自动重载(见 config_flow), 两者 HA 明确互斥;
+    #   * token 落盘 → 什么都不该发生;
+    #   * 重新认证写回新会话 → 由认证流程自己调度一次重载。
     return True
 
 
@@ -170,8 +176,3 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if ok:
         hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     return ok
-
-
-async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """选项变更(如填了操作密码)后重载。"""
-    await hass.config_entries.async_reload(entry.entry_id)

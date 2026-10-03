@@ -330,19 +330,30 @@ def gcj02_to_wgs84(lat: float, lon: float) -> tuple[float, float]:
 #
 # 做法: 命令成功后记下"我认为它现在是什么状态", 直到车端上报了**更新的**
 # collectTime 才恢复用真实信号(另加一个兜底 TTL, 防止车端长时间不更新)。
-class StateOverrides:
-    """按 key 记住命令后的临时状态, 车端一上报新数据就自动失效。"""
+#
+# ⚠️ "更新的帧"必须**新到车来得及执行**(2026-10-03 真机回弹事故):
+# 用户 17:43:35 开遮阳帘, 17:43:36 云端就给了一帧 collect=09:43:36 的新采集 ——
+# 它只比命令晚 1 秒, 车根本还没动, 信号 1724 仍是 0。旧逻辑"只要帧更新就失效"
+# 被这一帧清掉了乐观状态, 界面 1 秒后从"开"弹回"关", 60 秒后才由真实上报改回 "开"。
+# 所以: 帧比命令时戳新、但 **新得不足 OVERRIDE_GRACE_SECONDS** 时, 仍以覆盖值为准。
+OVERRIDE_GRACE_SECONDS = 120.0     # 命令后至少"宽限"这么久, 才允许新帧改写状态
 
-    def __init__(self, ttl_seconds: float = 900.0) -> None:
+
+class StateOverrides:
+    """按 key 记住命令后的临时状态, 车端上报"新到足以生效"的数据后自动失效。"""
+
+    def __init__(self, ttl_seconds: float = 900.0,
+                 grace_seconds: float = OVERRIDE_GRACE_SECONDS) -> None:
         self._items: dict[str, tuple[Any, int, float]] = {}
         self.ttl = ttl_seconds
+        self.grace_ms = int(max(0.0, grace_seconds) * 1000)
 
     def remember(self, key: str, value: Any, collect_time: int = 0) -> None:
         """记下 key 的临时值; `collect_time` 是当前这帧车况的采集时刻。"""
         self._items[key] = (value, int(collect_time or 0), time.time() + self.ttl)
 
     def recall(self, key: str, collect_time: int = 0) -> Any:
-        """取临时值; 若车端已上报更新的状态(或已超时)则返回 None(表示"用真实值")。"""
+        """取临时值; 车端给出"命令后且已过宽限期"的新状态(或超时)时返回 None。"""
         item = self._items.get(key)
         if item is None:
             return None
@@ -351,8 +362,10 @@ class StateOverrides:
             self._items.pop(key, None)
             return None
         if collect_time and stamp and int(collect_time) > stamp:
-            self._items.pop(key, None)          # 车端已给出新状态 → 以车端为准
-            return None
+            # 帧是命令后的采集, 但命令刚发出时车还没执行 —— 宽限期内的旧值不能作数
+            if int(collect_time) - stamp >= self.grace_ms:
+                self._items.pop(key, None)      # 车端已有充分时间执行 → 以车端为准
+                return None
         return value
 
     def forget(self, key: str) -> None:
