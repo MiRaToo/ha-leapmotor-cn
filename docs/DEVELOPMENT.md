@@ -16,6 +16,28 @@
    不要往"重新认证"上引导(两套判定见 `api_client.SIGNATURE_ERROR_CODES`
    与 `AUTH_ERROR_CODES`, 测试保证二者互斥)。
 
+### 为什么**不能**注册条目更新监听器(`entry.add_update_listener`)
+
+HA 的 update listener 在**任何**条目变化时都会触发 —— 包括集成自己把续期后的
+token 落盘(`config_entries.async_update_entry(entry, data=...)`)。历史事故:
+原监听器无条件 `async_reload`, 于是每 ~2 小时一次的 token 续期都会重载整个条目,
+每天几十次整批实体同时 `unavailable`(2026-10-03 实测某日 49 实体同秒掉线 ≥39 次;
+连重启前一周就已存在)。正确设计:
+
+* 选项变更 → `OptionsFlowWithReload`(保存后由 HA 调度一次重载, 与 update listener **互斥**);
+* 重新认证 → 认证流程里的 `async_update_reload_and_abort` 自己调度;
+* token 落盘等 data 变化 → **什么也不做**(选项本来就被协调器每轮热读)。
+
+`tests/test_reload_guard.py` 会挡住"又把监听器加回来"。
+
+### 乐观状态的失效条件(`StateOverrides`)
+
+命令成功后实体先记本地值, 等车端状态。**不要让"任何更新的帧"立刻作废它**:
+车端执行要几十秒, 命令后 1 秒到达的新帧里信号还是旧值, 早作废会导致
+"点一下开关立刻回弹"(2026-10-03 遮阳帘事故)。失效条件是
+"帧时间戳比命令时戳晚 **≥ `OVERRIDE_GRACE_SECONDS`(默认 120s)**"或 TTL 超时;
+新增"慢执行"的指令(遮阳帘/车窗/后备箱这类)时照此办理即可。
+
 新增指令时: 在 `poller/api_client.py` 里加 `xxx()` 方法(形状参考
 `docs/PROTOCOL.md` §6.2), 跑 `python tools/sync_api.py` 同步到集成,
 再用 `python -m pytest tests/test_command_payloads.py` 把形状钉住。
@@ -36,7 +58,7 @@ custom_components/leapmotor/     ★ HA 自定义集成(用户实际安装的东
   api.py               ← 由 poller/api_client.py 同步而来, 不要手改
   lock/climate/switch/number/time/button/sensor/device_tracker/image/text.py
   brand/               集成页显示的项目图标
-  www/leapmotor-map.js 高德底图地图卡(注册为前端模块)
+  www/leapmotor-{map,trips,control,energy,lastweek}.js  五张自带卡片(注册为前端模块)
   translations/*.json  中英文字符串
 
 tools/
@@ -138,7 +160,7 @@ HA_HOST=<你的HA> HA_USER=hassio HA_PASSWORD=<密码> python tools/deploy_ha.py
 
 ## 6. 前端卡片(地图)
 
-`custom_components/leapmotor/www/leapmotor-map.js` 由集成在 `async_setup` 里注册成前端模块
+`custom_components/leapmotor/www/` 下的五张卡片(map/trips/control/energy/lastweek)由集成在 `async_setup` 里注册成前端模块
 (`/leapmotor-card/leapmotor-map.js`),用户不需要 HACS 或手动加资源。改完记得**改版本号**
 (`__init__.py` 的 `CARD_VERSION`),否则浏览器缓存旧文件。
 

@@ -30,6 +30,10 @@
  *   satellite: true     # 用卫星底图(默认用路网图)
  *   follow: true        # 车动了自动跟随居中(默认 true; 手动拖动后自动关闭)
  *
+ * 这张卡专注"看车的位置 + 编辑/新增地理围栏": 只画车标与 HA 的区域(围栏)圆圈,
+ * 行程轨迹改由「零跑·行程浏览」卡片负责(那里有缩略图/大图/叠加)。
+ * (v1.6 起不再画 `sensor.*_xing_cheng_gui_ji` 的最近一段轨迹。)
+ *
  * 这个文件由集成自动注册为前端模块(见 custom_components/leapmotor/__init__.py),
  * 用户不需要把它拷到 www/ 或手配资源。
  */
@@ -98,7 +102,7 @@ const TILE_SOURCES = {
 /* 高德连不上时回落到 OSM(海外用户/高德故障时至少还能看图) */
 const TILE_FALLBACK = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 
-const CARD_VERSION = "1.4.1";
+const CARD_VERSION = "1.6.0";
 
 /** 经纬度 → 世界像素坐标(标准 Web 墨卡托, 与高德/OSM 一致)。 */
 function project(lat, lon, zoom) {
@@ -490,13 +494,21 @@ class LeapmotorMapCard extends HTMLElement {
           position: absolute; right: 8px; top: 8px; z-index: 8; display: flex; flex-direction: column;
           gap: 6px;
         }
+        /* 小按钮统一: 白底(卡片同款) + 灰边 + 与外框同款轻阴影; hover 淡蓝; 选中主题蓝 */
         .btns button {
           width: 32px; height: 32px; border-radius: 8px; cursor: pointer;
-          border: 1px solid var(--divider-color, #ccc);
-          background: var(--card-background-color, #fff); color: var(--primary-text-color, #222);
+          border: 1px solid var(--divider-color, rgba(0, 0, 0, .09));
+          background: var(--ha-card-background, var(--card-background-color, #fff));
+          color: var(--primary-text-color, #222);
+          box-shadow: 0 1px 3px rgba(0, 0, 0, .13);
           font-size: 16px; line-height: 1;
+          transition: background .15s ease;
         }
-        .btns button.on { border-color: var(--primary-color, #03a9f4); color: var(--primary-color, #03a9f4); }
+        .btns button:not(.on):hover { background: rgba(var(--rgb-primary-color, 3, 169, 244), .12); }
+        .btns button.on {
+          background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff);
+          border-color: transparent;
+        }
         .zones { position: absolute; left: 0; top: 0; width: 100%; height: 100%; z-index: 3; pointer-events: none; }
         .zone {
           position: absolute; border: 2px solid rgba(33,150,243,.85); border-radius: 50%;
@@ -533,8 +545,14 @@ class LeapmotorMapCard extends HTMLElement {
         .panel button {
           flex: 1; padding: 5px 6px; font-size: 12px; cursor: pointer; border-radius: 8px;
           white-space: nowrap;
-          border: 1px solid var(--divider-color, #ccc);
-          background: var(--card-background-color, #fff); color: inherit;
+          border: 1px solid var(--divider-color, rgba(0, 0, 0, .09));
+          background: var(--ha-card-background, var(--card-background-color, #fff));
+          color: inherit;
+          box-shadow: 0 1px 3px rgba(0, 0, 0, .13);
+          transition: background .15s ease;
+        }
+        .panel button:not(.primary):not(.armed):not(.danger):not([disabled]):hover {
+          background: rgba(var(--rgb-primary-color, 3, 169, 244), .12);
         }
         .panel button.primary {
           background: var(--primary-color, #03a9f4); border-color: var(--primary-color, #03a9f4);
@@ -654,6 +672,7 @@ class LeapmotorMapCard extends HTMLElement {
       this._ro = new ResizeObserver(() => {
         if (this._center) this._renderTiles();
         this._renderMarker();
+        this._renderZones();    // 改列宽/切视图后圈的大小与位置同样要重算
       });
       this._ro.observe(this._wrap);
     }
@@ -680,6 +699,9 @@ class LeapmotorMapCard extends HTMLElement {
       this._center = unproject(cx - dx, cy - dy, this._zoom);
       this._renderTiles();
       this._renderMarker();
+      // 围栏(zone 圆圈)必须跟瓦片/车标一起走, 否则拖动时它停在原地、松手后
+      // 要等下一次 hass 推送才"跳"到位(用户报告过的"延迟一下"就是这个)
+      this._renderZones();
     });
     const end = (ev) => {
       if (!start) return;
@@ -727,6 +749,7 @@ class LeapmotorMapCard extends HTMLElement {
     this._center = unproject(nx - px + fx, ny - py + fy, z1);
     this._renderTiles();
     this._renderMarker();
+    this._renderZones();      // 缩放同理: 圈的大小/位置都要当场重算
   }
 
   _onButton(action) {

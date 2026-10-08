@@ -53,10 +53,38 @@ def test_soc_prefers_precise_value_and_accepts_zero():
 
 
 def test_range_fallback_chain():
-    assert state({"3260": 170, "2188": 168}).range_km == 170
-    assert state({"2188": 168}).range_km == 168
-    assert state({"3261": 512.5}).range_km == pytest.approx(512.5)
+    """续航 = 官方 App 主页那个大数字: 纯电取表显(2188); 增程取油电总续航(按工况)。"""
+    assert state({"2188": 168, "3260": 170}).range_km == 168          # 纯电优先表显
+    assert state({"3261": 512.5}).range_km == pytest.approx(512.5)     # 增程(WLTC 总续航)
+    assert state({"3262": 0, "3258": 350, "3261": 999}).range_km == pytest.approx(350)  # CLTC
+    assert state({"3260": 170}).range_km == 170                        # 只有纯电续航也认
     assert state({}).range_km is None
+
+
+# ── 增程(REEV): 信号语义与工况选择 ──
+def test_reev_ranges_picks_by_working_condition():
+    """注意: `reev_ranges` 吃的是**翻译后的字段名**(不是信号号)。"""
+    two_modes = {"range_fuel_cltc": 200, "range_ev_cltc": 150, "range_total_cltc": 350,
+                 "range_fuel_wltc": 180, "range_ev_wltc": 130, "range_total_wltc": 310}
+    r = api_client.reev_ranges({**two_modes, "range_mode_code": 1})
+    assert (r["fuel_km"], r["ev_km"], r["total_km"], r["mode"]) == (180, 130, 310, "WLTC")
+    r = api_client.reev_ranges({**two_modes, "range_mode_code": 0})
+    assert (r["fuel_km"], r["ev_km"], r["total_km"], r["mode"]) == (200, 150, 350, "CLTC")
+    # 工况缺失 → 按 WLTC(与 App 的分支默认一致); 车端只报一套时互相回退
+    only_wltc = {"range_fuel_wltc": 180, "range_total_wltc": 310}
+    r = api_client.reev_ranges(only_wltc)
+    assert r["mode"] == "WLTC" and r["fuel_km"] == 180 and r["total_km"] == 310
+    r = api_client.reev_ranges({"range_fuel_cltc": 200, "range_total_cltc": 350})
+    assert r["fuel_km"] == 200 and r["total_km"] == 350, "只报 CLTC 时也要能取到"
+    # 纯电车 → 全 None
+    assert api_client.reev_ranges({"range_live": 131})["total_km"] is None
+
+
+def test_is_reev_only_true_when_fuel_signals_present():
+    assert api_client.is_reev({"range_live": 131, "soc": 56}) is False   # C10 纯电
+    assert api_client.is_reev({"fuel_level": 55}) is True
+    assert api_client.is_reev({"range_fuel_wltc": 180}) is True
+    assert api_client.is_reev({}) is False
 
 
 # ── 胎压 ──
@@ -80,10 +108,15 @@ def test_lock_status_semantics():
 
 
 def test_charging_requires_cable_and_current():
+    """旧版按"电流绝对值"判充电 —— 2026-10-02 已按官方 App 的 1149 语义改掉(见下一条测试)。
+
+    保留这条是作为**反例**: 同样"有电流", 1149=2 现在不再算充电中, 只有 1149=1 才算。
+    """
     assert state({"1149": 0, "1178": 0.0}).charging is False        # 没插枪
     assert state({"1149": 2, "1178": 0.0}).charging is False        # 插着但没进电流
-    assert state({"1149": 2, "1178": -12.5}).charging is True       # 真在充
-    assert state({"1298": 1}).charging is None                      # 两个关键信号都缺
+    assert state({"1149": 1, "1178": -12.5}).charging is True       # 真在充(1149=1 且进电流)
+    assert state({"1149": 2, "1178": -12.5}).charging is False      # 有电流但 1149 不是 1 -> 不算
+    assert state({"1298": 1}).charging is None                      # 关键信号缺席
 
 
 def test_vehicle_state_from_gear_then_speed():
@@ -198,3 +231,167 @@ def test_sunshade_percent_and_flag():
     assert state({"1724": 100}).sunshade_open is True
     assert state({"1724": 46}).sunshade_open is True
     assert state({}).sunshade_open is None
+
+
+def test_resp_code_is_exposed_for_rate_limit_detection():
+    """解析失败时不能抛异常, 但要把业务码带出来 —— 限流/风控判定要用它。"""
+    from api_client import parse_car_state
+    ok = parse_car_state({"code": 0, "data": {"vin": "V", "collectTime": 1, "signalMap": {"1318": 5}}})
+    assert ok.resp_code == 0
+    rl = parse_car_state({"code": 1023, "message": "环境被风控", "data": None})
+    assert rl.resp_code == 1023
+    assert rl.raw == {}
+    assert api_client.is_rate_limited({"code": rl.resp_code})
+
+
+def test_seat_rows_gates_on_abilities_with_third_row_signal_fallback():
+    """后排座椅门控: **能力位**为主(信号值会假阳性), 三排用信号是否存在兜底。
+
+    实测教训: 纯电 C10 照样上报 1879/1880/3727/3728 = 0 —— 只看"信号有值"会让它平白
+    长出后排实体; 它的 abilities 里没有 22/67/85/93, 所以用能力位判定才对。
+    """
+    c10_signals = {"seat_heat_rear_left": 0, "seat_vent_rear_left": 0}   # 有值但是 0
+    r = api_client.seat_rows(c10_signals, ["1", "20", "21", "32", "42", "43"])
+    assert r == {"rear_heat": False, "rear_vent": False,
+                 "third_heat_left": False, "third_heat_right": False}, "纯电 C10 不该有后排实体"
+    # C16 这类: 能力位给 22(二排)/67(二排通风)/85·93(三排左·右)
+    r = api_client.seat_rows({}, ["22", "67", "85", "93"])
+    assert r == {"rear_heat": True, "rear_vent": True,
+                 "third_heat_left": True, "third_heat_right": True}
+    # 能力位缺失(老数据)时, 三排还能靠 12276/12277 是否存在兜底(纯电车这两个信号缺席)
+    r = api_client.seat_rows({"seat_heat_third_left": 3})
+    assert r["third_heat_left"] is True and r["third_heat_right"] is False
+    assert api_client.seat_rows({})["rear_heat"] is False
+
+
+# ── 充电判定: 按官方 App 的 1149 语义(2026-10-02 修"行驶中误报充电") ──
+def test_charging_only_when_code_is_1():
+    """只有 1149 == 1 才是充电中; 5 = 非连接(既不是充电中, 也不是"插枪待机")。
+
+    2026-10-02: 旧代码按"电流绝对值>1"判充电, 行驶/能量回收时电流非零 → 误报"充电中"。
+    """
+    assert state({"1149": 1}).charging is True
+    assert state({"1149": 5}).charging is False
+    assert state({"1149": 0}).charging is False
+    assert state({"1149": 2}).charging is False          # 已插枪待机也不是充电中
+    assert state({}).charging is None
+    # 行驶中: 电流非零 + 1149=5 -> 仍然不是充电
+    assert state({"1149": 5, "1178": 12.0, "1319": 40, "1010": 1}).charging is False
+
+
+# ── 插枪判定: 1149 白名单 {1,2,3,4}(2026-10-06 修"没插枪却显示已插枪") ──
+def test_charge_plugged_whitelist_excludes_5():
+    """真机事故: 车没插枪时 1149 在 0 与 5 之间每 6~12 秒交替, 旧判据"非 0 即插枪"
+    把 5 当成"已插枪" → 控制卡凭空多出一颗「已插枪未充电」胶囊(用户报告)。
+
+    证据: ①当晚实测(0↔5 交替, 同期 1197 直流枪恒 0); ②官方 App `OooOo00` 把
+    `chargeState == 0 || == 5` **并列**当作"未插枪"; ③EU 版同名项目注释
+    "state 5 is observed while driving and is not a connection", 其插枪集合 = {1,2,3,4}。
+    """
+    assert state({"1149": 0}).charge_plugged is False
+    assert state({"1149": 5}).charge_plugged is False    # ★ 本次修的: 5 不是插枪
+    assert state({"1149": 1}).charge_plugged is True     # 充电中必然插着
+    assert state({"1149": 2}).charge_plugged is True     # 2026-10-03 实测出现过
+    assert state({"1149": 3}).charge_plugged is True
+    assert state({"1149": 4}).charge_plugged is True
+    assert state({"1149": 9}).charge_plugged is False    # 未知值宁可漏报, 不误报
+    assert state({}).charge_plugged is None
+
+
+def test_charging_state_maps_codes_to_three_states():
+    """三态映射(传感器用): 1→charging / {2,3,4}→plugged / {0,5}→unplugged。"""
+    for code, want in ((1, "charging"), (2, "plugged"), (3, "plugged"), (4, "plugged"),
+                       (0, "unplugged"), (5, "unplugged")):
+        st = state({"1149": code})
+        got = "charging" if st.charging else ("plugged" if st.charge_plugged else "unplugged")
+        assert got == want, "1149=%s -> %s(期望 %s)" % (code, got, want)
+
+
+# ── 拨号策略: IPv4 优先(2026-10-02 修"每轮被 IPv6 黑洞拖 40 秒") ──
+def test_order_addresses_prefers_ipv4():
+    """DNS 把 AAAA 排在前面时, 我们要把 IPv4 提到前面 —— 但不是禁用 v6。
+
+    背景: 本机 IPv6 出口变成黑洞时, 标准库会顺着地址表逐个串行等超时;
+    2 条 AAAA × 20 秒 = 每轮白等 40 秒(HA 里 351 个慢样本全是 40.2 的整数倍)。
+    """
+    v6a = (10, 1, 6, "", ("240e::1", 443, 0, 0))
+    v6b = (10, 1, 6, "", ("240e::2", 443, 0, 0))
+    v4 = (2, 1, 6, "", ("1.2.3.4", 443))
+    out = api_client.order_addresses_by_family([v6a, v6b, v4])
+    assert out[0] == v4, "IPv4 必须排第一"
+    assert out[1:] == [v6a, v6b], "v6 仍保留且保持原顺序(不是禁用)"
+    # 只有 v6 时不该丢
+    assert api_client.order_addresses_by_family([v6a]) == [v6a]
+    # 空/异常输入
+    assert api_client.order_addresses_by_family([]) == []
+    assert api_client.order_addresses_by_family([(99, 0, 0, "", "x")]) == [(99, 0, 0, "", "x")]
+
+
+def test_build_opener_uses_ipv4_first_connections():
+    """构造出来的 opener 必须用我们自己的连接类(而不是标准 HTTPConnection)。"""
+    import ssl as _ssl
+    hc = api_client._build_opener(_ssl.create_default_context())
+    handlers = [h for h in getattr(hc, "handlers", [])]
+    names = " ".join(type(h).__name__ for h in handlers)
+    assert "_HTTPSHandler" in names or "HTTPSHandler" in names
+    # 连接类存在且是 http.client 的子类
+    import http.client as _hc
+    assert issubclass(api_client._IPv4FirstHTTPSConnection, _hc.HTTPSConnection)
+    assert issubclass(api_client._IPv4FirstHTTPConnection, _hc.HTTPConnection)
+
+
+def test_connect_timeout_is_short_but_read_timeout_kept():
+    """连接超时要短(对付黑洞地址), 但读响应的超时不能被改短。"""
+    assert api_client.CONNECT_TIMEOUT <= 8, "连接超时太长就失去意义"
+    cli = api_client.LeapmotorClient(api_client.Session(car_vin="VIN"))
+    assert cli.timeout >= 15, "读响应的大超时(默认 20s)要保持"
+
+
+def test_connection_dials_ipv4_first_and_uses_short_connect_timeout(monkeypatch):
+    """用伪造 socket 验证拨号行为(不依赖网络环境):
+
+    * 先试 IPv4(即使 DNS 把 AAAA 放在前面) —— 这是"IPv6 黑洞拖 40 秒"的根治点;
+    * 建连阶段用短超时(CONNECT_TIMEOUT=5), 避免坏地址等满 20 秒;
+    * 建连成功后把超时换回调用方的值(读响应可能慢);
+    * 第一个地址失败时继续试下一个(不是直接放弃)。
+    """
+    import socket as _socket
+
+    v6 = (10, 1, 6, "", ("2001:db8::1", 80, 0, 0))
+    v4 = (2, 1, 6, "", ("192.0.2.5", 80))
+    v4b = (2, 1, 6, "", ("192.0.2.6", 80))
+    calls = []
+
+    class FakeSock:
+        def __init__(self, fam, typ, proto):
+            self.fam = fam
+            self.timeouts = []
+
+        def settimeout(self, v):
+            self.timeouts.append(v)
+
+        def connect(self, addr):
+            calls.append((self.fam, addr))
+            if addr[0] == "192.0.2.5":
+                raise OSError("第一个 v4 不通(模拟)")   # 验证会继续试下一个
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(_socket, "socket", lambda f, t, p: FakeSock(f, t, p))
+    monkeypatch.setattr(_socket, "getaddrinfo",
+                        lambda *a, **k: [v6, v6, v4, v4b])     # AAAA 在最前
+    conn = api_client._IPv4FirstHTTPConnection("example.com", 80, timeout=20)
+    conn.connect()
+
+    assert [c[0] for c in calls] == [2, 2], "应当先试 IPv4(且失败后继续试下一个)"
+    assert calls[0][1][0] == "192.0.2.5" and calls[1][1][0] == "192.0.2.6"
+    assert conn.sock.timeouts[0] == api_client.CONNECT_TIMEOUT, "建连用短超时"
+    assert conn.sock.timeouts[-1] == 20, "建连后换回调用方的超时(读响应)"
+
+    # 两个 v6 排在前面时, 也不该被跳过(只是排后面)
+    monkeypatch.setattr(_socket, "getaddrinfo", lambda *a, **k: [v6])
+    calls.clear()
+    conn2 = api_client._IPv4FirstHTTPConnection("example.com", 80, timeout=20)
+    conn2.connect()
+    assert calls and calls[0][0] == 10, "只有 v6 时仍然要用它"

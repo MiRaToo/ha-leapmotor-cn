@@ -18,6 +18,15 @@ from homeassistant.config_entries import ConfigFlowResult
 
 from .api import LeapmotorClient, Session, new_device_id
 from .const import (
+    CONF_BATTERY_KWH,
+    CONF_SHORT_STOP_SECONDS,
+    DEFAULT_SHORT_STOP_SECONDS,
+    MAX_SHORT_STOP_SECONDS,
+    CONF_LAUNCH_BOOST,
+    DEFAULT_BATTERY_KWH,
+    DEFAULT_LAUNCH_BOOST,
+    MAX_BATTERY_KWH,
+    MIN_BATTERY_KWH,
     CONF_DRIVING_POLL_SECONDS,
     DEFAULT_DRIVING_POLL_SECONDS,
     MIN_DRIVING_POLL_SECONDS,
@@ -42,7 +51,7 @@ SMS_TOO_OFTEN = 36        # 验证码发送频繁
 class LeapmotorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """手机号 + 验证码登录 → 换取车端 token → 建条目。"""
 
-    VERSION = 1
+    VERSION = 4      # v2: 行程记录(采样 6s / 停车 60s / 提速 / 电池容量); v4: 可用容量 67.0
 
     def __init__(self) -> None:
         self._phone = ""
@@ -202,15 +211,33 @@ class LeapmotorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return LeapmotorOptionsFlow(entry)
 
 
-class LeapmotorOptionsFlow(config_entries.OptionsFlow):
-    """选项: 操作密码 + 轮询间隔。"""
+# HA 有 `OptionsFlowWithReload`(保存后由 HA 自动重载条目)时优先用它; 老版本没有
+# 这个基类 —— 退回普通 OptionsFlow 并在保存后手动调度一次重载(见 async_step_init)。
+_OptionsFlowBase = getattr(config_entries, "OptionsFlowWithReload", config_entries.OptionsFlow)
+
+
+class LeapmotorOptionsFlow(_OptionsFlowBase):
+    """选项: 操作密码 + 轮询间隔。
+
+    设计约束(2026-10-03 重载风暴的教训, 改动前先读):
+      * 集成里**不得**再注册 update listener —— 它在任何条目变化(含集成自己落盘
+        token 的 data 变化)时都会触发, 会造成每天几十次整批实体 unavailable;
+      * 选项变更后的重载由 `OptionsFlowWithReload` 负责(HA 源码里与 update listener
+        明确互斥); 老版本 HA 退回手动调度(见 async_step_init);
+      * 重新认证的重载由它自己的流程调度(见 reauth 分支的 async_update_reload_and_abort)。
+    """
 
     def __init__(self, entry: config_entries.ConfigEntry) -> None:
         self._entry = entry
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            result = self.async_create_entry(title="", data=user_input)
+            if _OptionsFlowBase is config_entries.OptionsFlow:
+                # 老版本 HA: 没有自动重载的基类, 这里补一次。
+                # (选项本身每轮都被热读, 重载只是让实体/卡片立刻换到新设置。)
+                self.hass.config_entries.async_schedule_reload(self._entry.entry_id)
+            return result
         opts = self._entry.options
         return self.async_show_form(
             step_id="init",
@@ -235,20 +262,48 @@ class LeapmotorOptionsFlow(config_entries.OptionsFlow):
                     default=opts.get(CONF_POLL_SECONDS, DEFAULT_POLL_SECONDS),
                 ): selector.NumberSelector(
                     selector.NumberSelectorConfig(
-                        min=MIN_POLL_SECONDS, max=3600, step=30,
+                        min=MIN_POLL_SECONDS, max=3600, step=10,
                         mode=selector.NumberSelectorMode.BOX,
                         unit_of_measurement="秒",
                     )
                 ),
-                # 行驶中的轮询间隔(开车时位置/速度才有意义, 默认调快)
+                # 行程采样间隔: 行驶中的车况轮询(也是行程轨迹点的时间分辨率)。
+                # 官方 App 前台对同一个接口就是 6 秒一次, 所以默认 6s; 调大可省请求。
                 vol.Optional(
                     CONF_DRIVING_POLL_SECONDS,
                     default=opts.get(CONF_DRIVING_POLL_SECONDS, DEFAULT_DRIVING_POLL_SECONDS),
                 ): selector.NumberSelector(
                     selector.NumberSelectorConfig(
-                        min=MIN_DRIVING_POLL_SECONDS, max=600, step=10,
+                        min=MIN_DRIVING_POLL_SECONDS, max=300, step=1,
                         mode=selector.NumberSelectorMode.BOX,
                         unit_of_measurement="秒",
+                    )
+                ),
+                vol.Optional(
+                    CONF_LAUNCH_BOOST,
+                    default=opts.get(CONF_LAUNCH_BOOST, DEFAULT_LAUNCH_BOOST),
+                ): selector.BooleanSelector(),
+                # 短停快档: 一趟行程结束后, 继续按"行程采样间隔"轮询这么久 ——
+                # 便于抓住"下车买个东西/接人, 很快又出发"这种短停再出发(0 = 关闭)。
+                vol.Optional(
+                    CONF_SHORT_STOP_SECONDS,
+                    default=opts.get(CONF_SHORT_STOP_SECONDS, DEFAULT_SHORT_STOP_SECONDS),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=0, max=MAX_SHORT_STOP_SECONDS, step=60,
+                        mode=selector.NumberSelectorMode.BOX,
+                        unit_of_measurement="秒",
+                    )
+                ),
+                # 电池可用容量: 只用于把 ΔSOC 折算成 kWh(行程耗电/能耗)
+                vol.Optional(
+                    CONF_BATTERY_KWH,
+                    default=opts.get(CONF_BATTERY_KWH, DEFAULT_BATTERY_KWH),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=MIN_BATTERY_KWH, max=MAX_BATTERY_KWH, step=0.1,
+                        mode=selector.NumberSelectorMode.BOX,
+                        unit_of_measurement="kWh",
                     )
                 ),
             }),

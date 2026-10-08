@@ -21,6 +21,7 @@ from homeassistant.const import (
     UnitOfTemperature,
 )
 
+from .api import is_reev, reev_ranges
 from .const import DOMAIN
 from .coordinator import LeapmotorCoordinator, token_expiry
 from .entity import LeapmotorEntity
@@ -29,6 +30,8 @@ from .entity import LeapmotorEntity
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry,
                             add: AddEntitiesCallback) -> None:
     c = hass.data[DOMAIN][entry.entry_id]
+    st0 = c.car_state
+    _reev = is_reev(st0.signals if st0 is not None else {})
     add([
         # ── 实时车况(电量/续航/充电/车辆状态/车内温度 → 胎压) ──
         LeapmotorBattery(c),
@@ -48,6 +51,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry,
         LeapmotorHundredKmEc(c),
         LeapmotorEnergyRank(c),
         LeapmotorDeliveryDays(c),
+        # ── 增程车型的燃油数据(纯电车上这些信号缺失 → 不创建; 见 is_reev) ──
+        *([LeapmotorFuelLevel(c), LeapmotorFuelRange(c), LeapmotorTotalRange(c),
+           LeapmotorFuelConsumption(c)] if _reev else []),
+        # ── 行程记录(自己采样; 云端没有逐条行程接口, 见 trips.py) ──
+        LeapmotorLastTrip(c),
+        LeapmotorTripTrack(c),
+        LeapmotorTripStats(c),
         # ── 诊断 / 杂项(设备页里会归到"诊断"区) ──
         LeapmotorParkingUrl(c),
         LeapmotorChargeConfig(c),
@@ -218,11 +228,13 @@ class LeapmotorVehicleState(_Base):
                 "3": st.get("window_state_3"),
                 "4": st.get("window_state_4"),
             },
-            "windows_percent_raw": {
-                "front_left": st.get("window_front_left"),
-                "front_right": st.get("window_front_right"),
-                "rear_left": st.get("window_rear_left"),
-                "rear_right": st.get("window_rear_right"),
+            # 车窗开度 % —— CN 车端用 644/645/865/866(左前/左后/右前/右后);
+            # EU 表里的 3727/3728/1879/1880 在 CN 车上是**后排座椅**, 别再混用。
+            "windows_percent": {
+                "left_front": st.get("window_percent_left_front"),
+                "left_rear": st.get("window_percent_left_rear"),
+                "right_front": st.get("window_percent_right_front"),
+                "right_rear": st.get("window_percent_right_rear"),
             },
             "locked": st.locked,
             # 遮阳帘: 实测 1724 跟随指令 240(0=全关, 100=全开)
@@ -250,8 +262,7 @@ class LeapmotorChargingState(_Base):
             return None
         if st.charging:
             return "charging"
-        conn = st.get("charge_connection")
-        return "plugged" if conn is not None and int(conn) > 0 else "unplugged"
+        return "plugged" if st.charge_plugged else "unplugged"
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -318,9 +329,9 @@ class LeapmotorChargeConfig(_Base):
 
 
 class LeapmotorParkingUrl(_Base):
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-    """驻车/底盘照片的 OSS 地址。"""
+    """驻车/底盘照片的 OSS 地址 + 照片新旧信息(upload_time / pending)。"""
 
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
     key = "parking_url"
 
     def __init__(self, c: LeapmotorCoordinator) -> None:
@@ -329,6 +340,21 @@ class LeapmotorParkingUrl(_Base):
     @property
     def native_value(self) -> str | None:
         return (self.coordinator.data or {}).get("parking_url") or None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """照片的新旧信息: uploadTime(车端拍照/上传时刻)与 pending(还在等新照片)。
+
+        用途: 一眼看出"这张照片是什么时候拍的、是不是还在等上传" —— 车端拍照是异步上传的,
+        停车后可能需要几分钟才会换成新照片(见 coordinator 的照片重试窗口)。
+        """
+        d = self.coordinator.data or {}
+        ms = d.get("photo_upload_ms") or 0
+        return {
+            "upload_time": (datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+                            .astimezone().isoformat(timespec="seconds")) if ms else None,
+            "pending": bool(d.get("photo_pending")),
+        }
 
 
 class LeapmotorTotalMileage(_Base):
@@ -380,6 +406,12 @@ class LeapmotorSession(_Base):
             # 车况这一路是否取到: 空值说明"车端信号没拉回来", 与账号会话无关
             "车况": (self.coordinator.data or {}).get("car_state_problem")
                     or self.coordinator.car_state_problem or "正常",
+            # 诊断: 请求本身约 0.2 秒; 这里若常年几十秒, 说明在网络层等超时(见 PROTOCOL §3)
+            "上一轮轮询耗时_秒": round(getattr(self.coordinator, "last_cycle_seconds", 0.0), 1),
+            # 诊断: 这辆车的能力位/授权清单 —— 后排座椅(22/67/85/93)与增程的实体是否出现,
+            # 就取决于它; 远程排查时, 把这两个值报回来即可
+            "能力位": list(getattr(self.coordinator.vehicle, "abilities", None) or []),
+            "授权清单": list(getattr(self.coordinator.vehicle, "right_list", None) or []),
         }
 
 
@@ -432,7 +464,13 @@ class LeapmotorEnergyRank(_Base):
 
 
 class LeapmotorMileage7d(_Base):
-    """近 7 天累计里程(km)+ 逐日明细(绘图用)。"""
+    """近 7 天累计里程(km)+ 逐日明细(绘图用)。
+
+    数值/明细与「里程耗电」卡片同源(`coordinator.energy_days_view`): 里程优先本机自记、
+    缺的日子退回云端逐日里程。原先直接暴露云端 `mileage/energy/detail` 的逐日数组 ——
+    那份**每天取整**(整数 km), 与卡片的 0.1 km 口径肉眼可见地不一致, 也带着那个实测
+    不可靠的 `accumulatedEnergyConsume`(见 `docs/PROTOCOL.md`), 已换掉。
+    """
 
     key = "mileage_7d"
 
@@ -441,27 +479,38 @@ class LeapmotorMileage7d(_Base):
         self._attr_native_unit_of_measurement = "km"
 
     @property
-    def _range(self) -> dict[str, Any]:
-        return ((self.coordinator.data or {}).get("mileage") or {}).get("mileage7") or {}
+    def _view(self) -> dict[str, Any]:
+        try:
+            return self.coordinator.energy_days_view(7)
+        except Exception:  # noqa: BLE001 — 传感器属性不该因数据源异常炸掉
+            return {"days": [], "pending": 0}
 
     @property
     def native_value(self) -> float | None:
-        v = self._range.get("totalAccumulatedMileage")
-        return float(v) if v is not None else None
+        km = [d["km"] for d in self._view.get("days", []) if d.get("km") is not None]
+        return round(sum(km), 1) if km else None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        det = self._range.get("detail") or []
+        days = self._view.get("days") or []
+        det = (((self.coordinator.data or {}).get("mileage") or {}).get("mileage7") or {}).get("detail") or []
+        odo = {str(x.get("day") or ""): x.get("currentMileage") for x in det}
         return {
-            "days": [x.get("day") for x in det],
-            "daily_km": [x.get("accumulatedMileage") for x in det],
-            "daily_kwh": [x.get("accumulatedEnergyConsume") for x in det],
-            "odometer": [x.get("currentMileage") for x in det],
+            "days": [d.get("day") for d in days],
+            "daily_km": [d.get("km") for d in days],
+            "daily_kwh": [d.get("kwh") for d in days],
+            "odometer": [odo.get(str(d.get("day") or "")) for d in days],
+            "pending_days": self._view.get("pending"),
         }
 
 
 class LeapmotorEnergy7d(_Base):
-    """近 7 天累计能耗(kWh)。"""
+    """近 7 天累计能耗(kWh)。
+
+    口径 = 官方 getEC 逐日拆分(驱动+空调+其它, **不含驻停/待机**; 与官方 App 周报同源),
+    官方缺的日子用本机自记 ΔSOC 兜底。原先读云端逐日字段 `accumulatedEnergyConsume` ——
+    实测不可靠(逐日为 0、求和远小于官方聚合), 已换掉(见 `docs/PROTOCOL.md`)。
+    """
 
     key = "energy_7d"
 
@@ -470,10 +519,28 @@ class LeapmotorEnergy7d(_Base):
         self._attr_native_unit_of_measurement = "kWh"
 
     @property
+    def _view(self) -> dict[str, Any]:
+        try:
+            return self.coordinator.energy_days_view(7)
+        except Exception:  # noqa: BLE001
+            return {"days": [], "pending": 0, "source": "official"}
+
+    @property
     def native_value(self) -> float | None:
-        det = (((self.coordinator.data or {}).get("mileage") or {}).get("mileage7") or {}).get("detail") or []
-        vals = [x.get("accumulatedEnergyConsume") or 0 for x in det]
-        return float(sum(vals)) if vals else None
+        vals = [d["kwh"] for d in self._view.get("days", []) if d.get("kwh") is not None]
+        return round(sum(vals), 2) if vals else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        v = self._view
+        days = v.get("days") or []
+        return {
+            "source": v.get("source"),
+            "pending_days": v.get("pending"),
+            "daily": [{"day": d.get("day"), "kwh": d.get("kwh"),
+                       "kwh_src": d.get("kwh_src"), "km": d.get("km")}
+                      for d in days],
+        }
 
 
 class LeapmotorLastResult(_Base):
@@ -497,3 +564,251 @@ class LeapmotorLastResult(_Base):
             return {"json": json.loads(v)}
         except Exception:  # noqa: BLE001
             return {}
+
+
+# ── 行程记录(见 trips.py) ──
+def _trips(c: LeapmotorCoordinator):
+    return getattr(c, "trips", None)
+
+
+def _iso(ts: float | None) -> str | None:
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+class LeapmotorLastTrip(_Base):
+    """最近一次行程: 里程 / 时长 / 耗电 / 能耗。
+
+    状态是**里程(km)**; 详情都在属性里。带 `reconstructed` 的表示"车端失联期间只靠
+    总里程跳变补记的行程"(没有轨迹)。
+    """
+
+    key = "last_trip"
+
+    def __init__(self, c: LeapmotorCoordinator) -> None:
+        super().__init__(c, "最近行程")
+        self._attr_native_unit_of_measurement = "km"
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+
+    @property
+    def native_value(self) -> float | None:
+        rec = _trips(self.coordinator)
+        trip = rec.last_trip if rec else None
+        return round(trip.distance_km, 2) if trip and trip.distance_km is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        rec = _trips(self.coordinator)
+        trip = rec.last_trip if rec else None
+        if trip is None:
+            return {"备注": "还没有记录到行程"}
+        return {
+            "id": trip.id,
+            "开始": _iso(trip.started_at),
+            "结束": _iso(trip.ended_at),
+            "时长_分钟": round(trip.duration_min, 1) if trip.duration_min else None,
+            "里程_km": trip.distance_km,
+            "里程口径": ("总里程差分(整数, 误差±1km)"
+                        if getattr(trip, "distance_source", "") == "odo"
+                        else "GPS 轨迹(采样稀疏时会偏小)"
+                        if getattr(trip, "distance_source", "") == "gps" else None),
+            "耗电_kwh": round(trip.energy_kwh, 2) if trip.energy_kwh else None,
+            "百公里能耗_kwh": round(trip.efficiency, 1) if trip.efficiency else None,
+            "平均速度_kmh": round(trip.avg_speed_kmh, 1) if trip.avg_speed_kmh else None,
+            "起始电量_%": trip.start_soc,
+            "结束电量_%": trip.end_soc,
+            "起点": [trip.start_lat, trip.start_lon] if trip.start_lat else None,
+            "终点": [trip.end_lat, trip.end_lon] if trip.end_lat else None,
+            "轨迹点数": len(trip.points),
+            "靠里程跳变补记": trip.reconstructed,
+            "时间近似": trip.approx_time,          # 补记时: 时间只是"两次观测之间"
+            "未观测区间_秒": trip.gap_seconds,
+            "车端失联收尾": trip.frozen,
+        }
+
+
+class LeapmotorTripTrack(_Base):
+    """最近一次行程的轨迹(抽稀到 ≤100 点, WGS-84)。
+
+    给自带的地图卡画线用; **每段行程只更新一次**(行程结束时), 所以不会把 recorder 写爆。
+    需要完整轨迹或多段历史 → 走 `leapmotor/trips/track` 命令(见 ws_api.py)。
+    """
+
+    key = "trip_track"
+    _attr_icon = "mdi:map-marker-path"
+
+    def __init__(self, c: LeapmotorCoordinator) -> None:
+        super().__init__(c, "行程轨迹")
+        self._attr_native_unit_of_measurement = "点"
+
+    @property
+    def _trip(self):
+        rec = _trips(self.coordinator)
+        return rec.last_trip if rec else None
+
+    @property
+    def native_value(self) -> int | None:
+        trip = self._trip
+        return len(trip.points) if trip and trip.points else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        from .trips import downsample
+        trip = self._trip
+        if trip is None or not trip.points:
+            return {"trip_id": None, "points": []}
+        return {
+            "trip_id": trip.id,
+            "coordinate_system": "WGS-84",
+            "points": downsample(trip.points, 100),      # 属性要小: recorder 每次变化都会存一份
+            "point_count_full": len(trip.points),
+        }
+
+
+class LeapmotorTripStats(_Base):
+    """行程统计: 今日里程 + 今日/近7天/近30天 的次数·里程·耗电·能耗, 以及最近 10 段摘要。"""
+
+    key = "trip_stats"
+    _attr_icon = "mdi:car-traction-control"
+
+    def __init__(self, c: LeapmotorCoordinator) -> None:
+        super().__init__(c, "行程统计")
+        self._attr_native_unit_of_measurement = "km"
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+
+    @property
+    def native_value(self) -> float | None:
+        rec = _trips(self.coordinator)
+        if rec is None:
+            return None
+        return rec.stats().get("today", {}).get("km")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        rec = _trips(self.coordinator)
+        if rec is None:
+            return {}
+        st = rec.stats()
+        return {
+            "今日": st.get("today"),
+            "近7天": st.get("days7"),
+            "近30天": st.get("days30"),
+            "累计": st.get("total"),
+            "补记段数": st.get("reconstructed"),
+            "漏采记录数": st.get("gaps"),
+            "最近行程": [
+                {k: v for k, v in item.items() if k in (
+                    "id", "started_at", "ended_at", "distance_km", "duration_min",
+                    "energy_kwh", "efficiency", "reconstructed")}
+                for item in rec.recent(10)
+            ],
+        }
+
+
+# ── 增程(REEV)的燃油数据 ──
+#   只在**车端确实在报燃油信号**的车上创建实体(见 api.is_reev):
+#   纯电车没有这些信号, 自然就没有这几个实体, 不需要用户配置。
+class LeapmotorFuelLevel(_Base):
+    """剩余燃油(%): 车端信号 3235;升数在属性里(3263 的单位是**毫升**)。"""
+
+    key = "fuel_level"
+    _attr_icon = "mdi:gas-station"
+    _attr_native_unit_of_measurement = "%"
+
+    def __init__(self, c: LeapmotorCoordinator) -> None:
+        super().__init__(c, "剩余燃油")
+
+    @property
+    def native_value(self) -> float | None:
+        st = self.coordinator.car_state
+        return st.get("fuel_level") if st else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        st = self.coordinator.car_state
+        if st is None:
+            return {}
+        ml = st.get("fuel_ml")
+        return {
+            "燃油量_L": round(ml / 1000.0, 2) if ml is not None else None,
+            "燃油加热器档位": st.get("fuel_heater_level"),
+            "说明": "3263 的单位是毫升(48L 油箱报 45382), 已换算成升",
+        }
+
+
+class LeapmotorFuelRange(_Base):
+    """燃油续航(km): 按工况取(3262: 0=CLTC/1=WLTC), 见 api.reev_ranges。"""
+
+    key = "fuel_range"
+    _attr_icon = "mdi:gas-station-outline"
+    _attr_native_unit_of_measurement = "km"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, c: LeapmotorCoordinator) -> None:
+        super().__init__(c, "燃油续航")
+
+    @property
+    def native_value(self) -> float | None:
+        st = self.coordinator.car_state
+        return reev_ranges(st.signals)["fuel_km"] if st else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        st = self.coordinator.car_state
+        return {"工况": reev_ranges(st.signals)["mode"]} if st else {}
+
+
+class LeapmotorTotalRange(_Base):
+    """(油电)总续航(km) —— 就是增程车 App 主页那个大数字。"""
+
+    key = "total_range"
+    _attr_icon = "mdi:map-marker-distance"
+    _attr_native_unit_of_measurement = "km"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, c: LeapmotorCoordinator) -> None:
+        super().__init__(c, "油电总续航")
+
+    @property
+    def native_value(self) -> float | None:
+        st = self.coordinator.car_state
+        return reev_ranges(st.signals)["total_km"] if st else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        st = self.coordinator.car_state
+        if st is None:
+            return {}
+        r = reev_ranges(st.signals)
+        return {"工况": r["mode"], "纯电续航_km": r["ev_km"], "燃油续航_km": r["fuel_km"],
+                "说明": "总续航 = 纯电 + 燃油;两个数值由车端分别上报"}
+
+
+class LeapmotorFuelConsumption(_Base):
+    """油耗(L/100km)+ 电耗(属性): 来自云端接口 getPlugInLastNweeks100kmEC。"""
+
+    key = "fuel_consumption"
+    _attr_icon = "mdi:fuel"
+    _attr_native_unit_of_measurement = "L/100km"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, c: LeapmotorCoordinator) -> None:
+        super().__init__(c, "油耗")
+
+    @property
+    def _ec(self) -> dict:
+        d = (self.coordinator.data or {}).get("plug_energy") or {}
+        ec = d.get("hundredKmEC") if isinstance(d, dict) else None
+        return ec if isinstance(ec, dict) else {}
+
+    @property
+    def native_value(self) -> float | None:
+        v = self._ec.get("oc100km")
+        return float(v) if v is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        ec = self._ec
+        return {"电耗_kwh_100km": ec.get("ec100km"),
+                "说明": "增程车的电耗/油耗是分开上报的(App 里也是两张图)"}

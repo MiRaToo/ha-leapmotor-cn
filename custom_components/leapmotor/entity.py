@@ -22,6 +22,11 @@ class LeapmotorEntity(CoordinatorEntity[LeapmotorCoordinator]):
     def __init__(self, coordinator: LeapmotorCoordinator, key: str) -> None:
         super().__init__(coordinator)
         self._attr_unique_id = f"{coordinator.vin}_{key}"
+        # `translation_key` = 这个实体的**机器可读名字**(就是各平台传进来的 key, 全局唯一)。
+        # 前端卡片不该靠 entity_id 拼字符串认实体(中文名/语言一变就失效) —— 用
+        # "platform=leapmotor + 同一设备 + translation_key" 才是稳的, 我们的卡片就是这么找的。
+        # 注意: 这里**不影响**实体显示名 —— 显式 `_attr_name` 优先于翻译, 中文名照旧。
+        self._attr_translation_key = key
 
     @property
     def device_info(self) -> DeviceInfo:

@@ -1,48 +1,54 @@
 {
- "config": {
-  "step": {
-   "user": {
-    "title": "Leapmotor (China) login",
-    "description": "Use a SECONDARY account — Leapmotor allows only one active session per account, so using your main account will sign out the official app on your phone.",
-    "data": {
-     "phone": "Phone number"
-    }
-   },
-   "code": {
-    "title": "Enter SMS code",
-    "description": "A code was sent to {phone} and is **valid for 5 minutes**.\n\nExpired or never arrived? Tick “Resend code” below and submit again.",
-    "data": {
-     "sms_code": "Code",
-     "resend": "Resend code"
-    }
-   }
-  },
-  "error": {
-   "cannot_connect": "Network error, please retry",
-   "invalid_auth": "Wrong or expired code (valid 5 minutes). Tick “Resend code” and submit again.",
-   "risk_cooldown": "Account flagged by risk control (1023). Wait 30+ minutes silently; retrying extends the cooldown",
-   "sms_too_often": "SMS requested too often (36), retry in a few minutes",
-   "sms_failed": "Failed to request SMS code, see logs",
-   "car_login_failed": "Vehicle token exchange failed, see logs",
-   "no_vehicle": "No vehicle on this account — make sure the car is shared with the secondary account",
-   "unknown": "Unknown error"
-  },
-  "abort": {
-   "already_configured": "This vehicle is already configured",
-   "reauth_successful": "Re-authenticated successfully"
-  }
- },
- "options": {
-  "step": {
-   "init": {
-    "title": "Leapmotor (China) options",
-    "data": {
-     "operate_pwd": "Vehicle operation PIN (4 digits, needed by sensitive commands)",
-     "poll_seconds": "Poll interval (parked)",
-     "driving_poll_seconds": "Poll interval (driving)"
+  "config": {
+    "step": {
+      "user": {
+        "title": "Leapmotor (China) login",
+        "description": "Use a SECONDARY account — Leapmotor allows only one active session per account, so using your main account will sign out the official app on your phone.",
+        "data": {
+          "phone": "Phone number"
+        }
+      },
+      "code": {
+        "title": "Enter SMS code",
+        "description": "A code was sent to {phone} and is **valid for 5 minutes**.\n\nExpired or never arrived? Tick “Resend code” below and submit again.",
+        "data": {
+          "sms_code": "Code",
+          "resend": "Resend code"
+        }
+      }
     },
-    "description": "Poll interval: 5 min while parked, 60 s while driving (position/speed only matter when moving). Slow-changing data (mileage/energy) is skipped while driving to keep request volume low."
-   }
+    "error": {
+      "cannot_connect": "Network error, please retry",
+      "invalid_auth": "Wrong or expired code (valid 5 minutes). Tick “Resend code” and submit again.",
+      "risk_cooldown": "Account flagged by risk control (1023). Wait 30+ minutes silently; retrying extends the cooldown",
+      "sms_too_often": "SMS requested too often (36), retry in a few minutes",
+      "sms_failed": "Failed to request SMS code, see logs",
+      "car_login_failed": "Vehicle token exchange failed, see logs",
+      "no_vehicle": "No vehicle on this account — make sure the car is shared with the secondary account",
+      "unknown": "Unknown error"
+    },
+    "abort": {
+      "already_configured": "This vehicle is already configured",
+      "reauth_successful": "Re-authenticated successfully"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Leapmotor (China) options",
+        "data": {
+          "operate_pwd": "Vehicle operation PIN (4 digits, needed by sensitive commands)",
+          "poll_seconds": "Poll interval (parked)",
+          "driving_poll_seconds": "Trip sampling interval (driving)",
+          "launch_boost": "Speed up polling when about to depart (unlock / power on)",
+          "battery_kwh": "Usable battery capacity",
+          "short_stop_seconds": "Short-stop fast polling (seconds)"
+        },
+        "description": "Polling: 60 s parked, 6 s driving (same as the official app), and only the vehicle-state frame is fetched each round; mileage/energy/photo are fetched on demand.\n\nBattery capacity is only used to turn SoC delta into kWh for trips.",
+        "data_description": {
+          "battery_kwh": "Used only to convert battery-% changes into kWh (trip energy / consumption). Enter the USABLE capacity, not the nominal (gross) pack size - they differ by a buffer (e.g. C10 RWD: 69.9 gross vs 67.0 usable). A wrong value scales every kWh figure."
+        }
+      }
+    }
   }
- }
 }

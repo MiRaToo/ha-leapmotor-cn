@@ -40,5 +40,7 @@ class LeapmotorRefreshButton(LeapmotorEntity, ButtonEntity):
         super().__init__(coordinator, "refresh_state")
 
     async def async_press(self) -> None:
+        # 手动刷新 = 明确要"现在就去拿一遍": 强制重取驻车照片与里程/能耗(绕过节流)
+        self.coordinator.force_photo_refresh()
         await self.coordinator.async_request_refresh()
 

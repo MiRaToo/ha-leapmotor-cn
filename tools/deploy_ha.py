@@ -22,11 +22,23 @@ FILES = [
     "__init__.py", "api.py", "const.py", "coordinator.py", "entity.py",
     "config_flow.py", "lock.py", "climate.py", "switch.py", "number.py",
     "time.py", "button.py", "sensor.py", "device_tracker.py", "image.py", "text.py",
+    "trips.py", "energy_daily.py", "ws_api.py",
     "manifest.json", "strings.json",
     # HA 2025.2+ 的本地品牌图(集成页显示项目图标)
     "brand/icon.png", "brand/logo.png",
     # 自带的前端卡片(注册为全局 Lovelace 模块, 用户不用手动放 www/)
     "www/leapmotor-map.js",
+    "www/leapmotor-trips.js",
+    "www/leapmotor-control.js",
+    "www/leapmotor-energy.js",
+    "www/leapmotor-lastweek.js",
+    # 车模图(按车型的官方外观图; 控制卡按设备 model 引用 /leapmotor-card/carimg/<车型>.png)
+    "www/carimg/b10.png",
+    "www/carimg/c01.png",
+    "www/carimg/c10.png",
+    "www/carimg/c11.png",
+    "www/carimg/c16.png",
+    "www/carimg/t.png",
 ]
 TRANS = ["zh-Hans.json", "en.json"]
 
