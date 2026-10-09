@@ -1,13 +1,14 @@
 {
   "domain": "leapmotor",
   "name": "零跑汽车",
+  "after_dependencies": ["lovelace"],
   "codeowners": ["@MiRaToo"],
   "config_flow": true,
+  "dependencies": ["http"],
   "documentation": "https://github.com/MiRaToo/ha-leapmotor-cn",
-  "issue_tracker": "https://github.com/MiRaToo/ha-leapmotor-cn/issues",
-  "iot_class": "cloud_polling",
   "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/MiRaToo/ha-leapmotor-cn/issues",
   "loggers": ["custom_components.leapmotor"],
-  "requirements": ["cryptography>=42"],
   "version": "0.2.1"
 }

@@ -16,11 +16,16 @@ from pathlib import Path
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv
 
 from .const import DOMAIN, DEFAULT_POLL_SECONDS, PLATFORMS
 from .coordinator import LeapmotorCoordinator
 
 log = logging.getLogger(__name__)
+
+# 本集成只通过「配置条目」接入(手机号验证码登录), 不支持 YAML 配置。
+# `async_setup` 仅用于注册自带卡片, 因此声明 config-entry-only 的 schema。
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 # 前端模块: 把 www/ 下的五张卡片注册成全局卡片(用户无需手动放 www/ 或配资源)。
 # CARD_VERSION 与各自 JS 文件头里的同名常量保持一致(改 JS 记得一起升, 好让浏览器拿到新文件)。
