@@ -32,7 +32,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry,
                               signals=("sunshade_percent",), icon="mdi:window-shutter"),
         LeapmotorSimpleSwitch(c, "steering_heat", "方向盘加热", method="steering_heat",
                               # ⚠️ 用 1816(开关位), **不能**用 1624 —— 后者实测常驻 15,
-                              # 会让实体永远显示"开"(用户实测: App 里从未开过)
+                              # 会让实体永远显示"开"(App 里从未开过)
                               signals=("steering_wheel_heating",), icon="mdi:steering"),
         LeapmotorSimpleSwitch(c, "mirror_heat", "后视镜加热", method="mirror_heat",
                               signals=("mirror_heat_left", "mirror_heat_right"),

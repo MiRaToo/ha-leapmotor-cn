@@ -219,7 +219,7 @@ _OptionsFlowBase = getattr(config_entries, "OptionsFlowWithReload", config_entri
 class LeapmotorOptionsFlow(_OptionsFlowBase):
     """选项: 操作密码 + 轮询间隔。
 
-    设计约束(2026-10-03 重载风暴的教训, 改动前先读):
+    设计约束(重载风暴的教训, 改动前先读):
       * 集成里**不得**再注册 update listener —— 它在任何条目变化(含集成自己落盘
         token 的 data 变化)时都会触发, 会造成每天几十次整批实体 unavailable;
       * 选项变更后的重载由 `OptionsFlowWithReload` 负责(HA 源码里与 update listener

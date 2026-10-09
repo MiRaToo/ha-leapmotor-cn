@@ -4,7 +4,7 @@
  * 为什么按天(而不是把轮询采样点直接画出来): 里程/能耗这类数据只在"天"的粒度上有意义 ——
  * 采样点连成的线反映的是轮询节奏, 不是车用了多少; 云端官方也只提供逐日明细。
  *
- * 数据来源(服务端 assemble; 卡片上**不标注来源** —— 2026-10-08 用户要求去掉,
+ * 数据来源(服务端 assemble; 卡片上**不标注来源**,
  * 角落仅在有补拉时提示进度):
  *   * **耗电(橙)**: 官方 getEC 逐日拆分(`getLastweekEC` 传任意窗口, 与官方 App 周报同源;
  *     驱动/空调/其它, **不含驻停/待机**)。官方缺的日子用本机自记 ΔSOC 兜底。
@@ -19,7 +19,8 @@
  *   里程(蓝, km) — 每日行驶里程;  耗电(橙, kWh) — 每日驱动+空调+其它;
  *   百公里能耗(绿, kWh/100km) — 当日效率。
  * 图表最多标两根刻度轴, 按 里程 → 耗电 → 百公里能耗 的顺序分配给左/右(三条全开时
- * 第三条不标刻度, 点一下看精确值); 点某天会浮出当天所有可见数值。
+ * 第三条不标刻度, 点一下看精确值); 点某天会浮出当天所有可见数值(各指标逐行显示,
+ * 官方拆分 驱动/空调/其它 合占一行)。
  *
  * 配置:
  *   type: custom:leapmotor-energy
@@ -33,7 +34,7 @@
  * 颜色全部走 HA 主题变量(深色主题自适应)。
  */
 
-const CARD_VERSION = "1.2.1";
+const CARD_VERSION = "1.2.2";
 
 const PENDING_RETRY_MS = 8000;   // pending>0 时自动续拉前的等待(分批取数, 不阻塞首屏)
 
@@ -51,13 +52,13 @@ function esc(s) {
 }
 function pad2(n) { return (n < 10 ? "0" : "") + n; }
 
-/** "2026-10-04" → "10月4日"(气泡里用) */
+/** 日期串 → "10月4日"(气泡里用) */
 function fmtDayCn(day) {
   const p = String(day || "").split("-");
   if (p.length < 3) return String(day || "");
   return parseInt(p[1], 10) + "月" + parseInt(p[2], 10) + "日";
 }
-/** "2026-10-04" → "10/4"(横轴标签) */
+/** 日期串 → "10/4"(横轴标签) */
 function fmtDayShort(day) {
   const p = String(day || "").split("-");
   if (p.length < 3) return String(day || "");
@@ -561,7 +562,7 @@ class LeapmotorEnergyCard extends HTMLElement {
   _renderChart() {
     if (!this._boxEl) return;
     const d = this._data;
-    // 角落只留"补拉中"这个**进度**提示; 不再标注数据来源(2026-10-08 用户要求去掉)
+    // 角落只留"补拉中"这个**进度**提示; 不再标注数据来源
     this._noteEl.textContent = d && d.pending > 0
       ? "官方数据补拉中(" + d.pending + " 天)" : "";
     if (!d || !d.days || !d.days.length) {
@@ -660,29 +661,32 @@ class LeapmotorEnergyCard extends HTMLElement {
         '" y="' + PAD.t + '" width="' + bw.toFixed(1) + '" height="' + plotH + '"/>';
     }
     svg += "</svg>";
-    // 气泡
+    // 气泡: 逐项一行(整条拼成一行时信息过长会横向溢出);
+    // 官方拆分(驱动/空调/其它)也各占一行 —— 不再用 "+" 连接。
     let tip = "";
     if (this._day >= 0 && this._day < n) {
       const i = this._day;
-      const parts = [];
+      const lines = [];
       for (const x of live) {
         const v = x.vals[i];
-        if (v != null) parts.push(x.tipFmt(v));
+        if (v != null) lines.push(x.tipFmt(v));
       }
       const dd = days[i];
       if (this._showKwh && dd && dd.kwh != null && dd.kwh > 0
           && dd.kwh_src === "official"
           && (dd.drv != null || dd.ac != null || dd.oth != null)) {
-        // 官方 getEC 的当日拆分(驱动/空调/其它)—— 纯数据细节, 不标注来源(2026-10-08 用户要求)
-        parts.push("驱动 " + fmtKwh(dd.drv || 0) + " + 空调 " + fmtKwh(dd.ac || 0)
-                   + " + 其它 " + fmtKwh(dd.oth || 0));
+        // 官方 getEC 的当日拆分: 三项**合占一行**, 用「·」分隔
+        // (不再用 "+" 连接); 其余指标各自一行
+        lines.push("驱动 " + fmtKwh(dd.drv || 0) + " · 空调 " + fmtKwh(dd.ac || 0)
+                   + " · 其它 " + fmtKwh(dd.oth || 0));
       }
-      if (!parts.length) parts.push("没有数据");
+      if (!lines.length) lines.push("没有数据");
       const cssW = Math.max(1, this._boxEl.clientWidth || W);
       const half = Math.min(90, cssW / 2);
       const tipX = Math.min(cssW - half, Math.max(half, xs[i] * cssW / W));
       tip = '<div class="tip" style="left:' + tipX.toFixed(1) + "px;top:2px;transform:translateX(-50%)" +
-        '">' + esc(fmtDayCn(days[i].day)) + " · " + parts.join(" · ") + "</div>";
+        '"><div>' + esc(fmtDayCn(days[i].day)) + "</div>" +
+        lines.map((s) => "<div>" + esc(s) + "</div>").join("") + "</div>";
     }
     this._boxEl.innerHTML = svg + tip;
     this._clampTip();

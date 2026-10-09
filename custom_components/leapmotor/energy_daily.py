@@ -1,6 +1,6 @@
 """官方逐日能耗(getEC)缓存 + 逐日序列组装。
 
-背景(2026-10-08): 里程/能耗卡的「耗电」线原先用云端 `mileage/energy/detail` 的
+背景: 里程/能耗卡的「耗电」线原先用云端 `mileage/energy/detail` 的
 `accumulatedEnergyConsume` —— 实测该字段**不可靠**(逐日大量为 0、7 天求和 11 kWh vs
 官方聚合 44.6; 老日子也不"沉淀"; kerniger 版把它标 `presumed_driving_only / confirmed:false`,
 mate 干脆不用)。但官方 getEC(`getLastweekEC?begintime=&endtime=`)实测**支持任意窗口**
@@ -67,8 +67,8 @@ class EnergyDayStore:
     """逐日官方能耗的持久缓存(一天一条; 纯内存 + 延迟落盘)。
 
     数据结构:
-        days:  {"2026-10-07": {"driver":…, "ac":…, "other":…, "total":…, "empty": bool, "at": ts}}
-        tried: {"2026-10-08": ts}   # "今天"的拉取尝试记录(空结果/失败也节流, 免得反复问)
+        days:  {"<日期>": {"driver":…, "ac":…, "other":…, "total":…, "empty": bool, "at": ts}}
+        tried: {"<日期>": ts}   # "今天"的拉取尝试记录(空结果/失败也节流, 免得反复问)
     """
 
     def __init__(self, hass: Any, vin: str, store: Any = None) -> None:

@@ -1,6 +1,6 @@
 """上周能耗拆分: 窗口算法与响应解析(纯函数, 离线)。
 
-背景(2026-10-04 真车只读实测): `getLastweekEC` 传**整周窗口**(上周一 00:00:00 ~
+背景(真车只读实测): `getLastweekEC` 传**整周窗口**(上周一 00:00:00 ~
 上周日 23:59:59)返回 `{"driverEC":"86.9","acEC":"8.6","otherEC":"6.2"}`(字符串 kWh);
 传小窗口(15 分钟)会回 `code=100 未找到数据!` —— 它不是任意区间接口, 窗口必须由
 `previous_week_window_seconds()` 统一算。这里把窗口与解析钉住。
@@ -19,7 +19,7 @@ import api_client  # noqa: E402
 
 # ── 窗口: 上周一 00:00 ~ 上周日 23:59:59 ──
 def test_prev_week_window_on_sunday_night():
-    # 2026-10-04 是周日 → 上周 = 9-21(周一) ~ 9-27(周日)
+    # 固定时间点是周日 → "上周" = 其前一周(周一~周日)
     b, e = api_client.previous_week_window_seconds(datetime.datetime(2026, 10, 4, 23, 1))
     assert datetime.datetime.fromtimestamp(b) == datetime.datetime(2026, 9, 21, 0, 0, 0)
     assert datetime.datetime.fromtimestamp(e) == datetime.datetime(2026, 9, 27, 23, 59, 59)
@@ -28,7 +28,7 @@ def test_prev_week_window_on_sunday_night():
 
 
 def test_prev_week_window_flips_at_monday_midnight():
-    """周一零点一过, "上周"就翻成刚结束的那一周(2026-09-28 ~ 10-04)。"""
+    """周一零点一过, "上周"就翻成刚结束的那一周。"""
     b, e = api_client.previous_week_window_seconds(datetime.datetime(2026, 10, 5, 0, 30))
     assert datetime.datetime.fromtimestamp(b) == datetime.datetime(2026, 9, 28, 0, 0, 0)
     assert datetime.datetime.fromtimestamp(e).weekday() == 6

@@ -25,7 +25,7 @@ CONF_PHONE = "phone"
 CONF_SMS_CODE = "sms_code"
 CONF_OPERATE_PWD = "operate_pwd"          # 车辆操作密码(PIN), 4 位数字
 CONF_OPERATE_PWD_MODE = "operate_pwd_mode"  # 密码编码方式(不同车型可能不同)
-# 实测(2026-09-27): 唯一能被服务端接受的是 aes_jwt ——
+# 实测:  唯一能被服务端接受的是 aes_jwt ——
 #   oppwd = base64(AES-128-CBC(PKCS7(PIN), key=md5(车端JWT[:32])[8:24], iv=md5(车端JWT[32:64])[8:24]))
 # 其余模式保留仅为兼容排查(plain/md5mid16/md5/rsa 实测均被拒)。
 PWD_MODES = ["aes_jwt", "aes", "plain", "md5mid16", "md5", "rsa"]

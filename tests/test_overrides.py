@@ -21,7 +21,7 @@ def test_remembers_until_car_reports_newer_state():
 
 
 def test_override_survives_frames_collected_just_after_the_command():
-    """真机回弹事故(2026-10-03): 命令后 1 秒到达的"新帧"里车还没执行, 不能用它改写状态。
+    """真机回弹事故:  命令后 1 秒到达的"新帧"里车还没执行, 不能用它改写状态。
 
     遮阳帘: 17:43:35 下发开, 17:43:36 云端给了一帧只比命令晚 1 秒的采集(信号仍是 0),
     旧逻辑当场清掉乐观状态 → 界面从"开"弹回"关", 60 秒后才由真实上报改回来。

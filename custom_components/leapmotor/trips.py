@@ -1,7 +1,7 @@
 """行程记录: 状态机 + 记账 + 轨迹 + 持久化。
 
 数据**全部来自轮询到的车况帧**(见 `coordinator._refresh_car_data`), 不依赖任何云端行程接口
-—— 2026-09-28 实测: 云端的逐条行程 `drivingRecordList` **恒为空数组**(官方 App 里也写着
+—— 实测: 云端的逐条行程 `drivingRecordList` **恒为空数组**(官方 App 里也写着
 "因相关法规规定, 不再提供查看里程详情功能"), 所以行程只能自己记录。
 
 设计取舍(对照 EU 版 mate 的实测结论与官方 App 的行为):
@@ -17,7 +17,7 @@
 * **短行程(<0.2 km)丢弃** —— mate 在真车上踩出来的阈值(0.5 km 曾把"去便利店"的车丢掉)。
 * **漏采兜底**: 停车期间总里程跳变 >=1 km 且没有进行中的行程 → 记一条"重建行程"
   (只有里程/耗电, **没有轨迹**, 标 `reconstructed`); 若是充电造成的跳变, 记进 `offline_gaps`。
-* **补记护栏**(2026-10-02, 对照 mate 的 `_RECONSTRUCT_MAX_TRIP_KM`): 单帧总里程跳变超过
+* **补记护栏**(对照 mate 的 `_RECONSTRUCT_MAX_TRIP_KM`): 单帧总里程跳变超过
   ±1500 km 判为毛刺(本帧里程按缺失处理, 也不立成下一帧的基线); 补记出的时长若隐含均速
   不在 8~160 km/h 区间(观测区间里混着停车/失联), 时长留空 —— 里程照记, 不写不可信的数字。
 * 轨迹: 行驶中每帧 1 点(WGS-84), 跳过 (0,0) 与重复坐标; 单段上限 `MAX_TRACK_POINTS`。
@@ -40,6 +40,11 @@ if TYPE_CHECKING:                      # 只用于类型标注 —— 让本模�
 log = logging.getLogger(__name__)
 
 STORE_VERSION = 1
+# 存储里"坐标的空间版本"标记(独立于 STORE_VERSION, 只是 dump 里的一个键):
+#   1(或缺失)= 旧坐标空间 —— GCJ↔WGS 换算的经度多项式写错(已修复),
+#              当时对外发布的 WGS-84 偏东 300~800 米;
+#   2        = 修复后的正确 WGS-84。加载到 1 时自动迁移(见 _migrate_point)。
+COORDS_VERSION = 2
 
 MIN_TRIP_KM = 0.2                # 短于这个距离的行程丢弃(挪车)
 MIN_EFFICIENCY_KM = 0.5          # 里程太短时不给"百公里能耗"(除出来的数没有意义)
@@ -60,11 +65,78 @@ PERSIST_HEARTBEAT_SECONDS = 600  # 帧基准(_last_frame_ts/_last_fresh_wall)的
 DEFAULT_CAPACITY_KWH = 67.0      # C10 纯电 RWD **可用**容量(仅用于 ΔSOC → kWh 折算; 可在配置里改)
 
 
+# ── 坐标空间迁移(换算公式修复的配套) ──────────────────────────
+# 背景: GCJ↔WGS 换算的原实现把**经度**也用了纬度多项式(见 api_client._transform_lon 的
+# 说明), 于是"对外发布的 WGS-84"一直偏东 300~800 米。轨迹里存的正是这些错误坐标。
+# 好消息: 错公式的**正反变换自洽**(往返误差 <1 mm), 所以旧值可以被确定性还原:
+#     旧存储值 --(旧错误正向)--> 车端原始 GCJ-02 --(修复后的正确逆向)--> 正确的 WGS-84
+# 本段代码**冻结旧公式**(只服务迁移, 永不用于新数据), 并借用 api 里修好的逆向函数。
+_A_GCJ_LEGACY = 6378245.0
+_EE_GCJ_LEGACY = 0.00669342162296594323
+
+
+def _legacy_transform_lat(x: float, y: float) -> float:
+    """旧实现的纬度多项式(注释说它是"纬度" — 用于迁移还原)。"""
+    ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * math.sqrt(abs(x))
+    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(y * math.pi) + 40.0 * math.sin(y / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (160.0 * math.sin(y / 12.0 * math.pi) + 320 * math.sin(y * math.pi / 30.0)) * 2.0 / 3.0
+    return ret
+
+
+def _legacy_buggy_wgs_to_gcj(lat: float, lon: float) -> tuple[float, float]:
+    """**旧版(错误)**的 WGS-84 → GCJ-02 正向变换: 经度偏移也用了纬度多项式。
+
+    ⚠️ 只用于把旧存储里的坐标还原回车端原始值, 绝不用于新数据(新数据用 api 的正确实现)。
+    """
+    if not (73.66 < lon < 135.05 and 3.86 < lat < 53.55):
+        return lat, lon
+    x, y = lon - 105.0, lat - 35.0
+    d_lat = _legacy_transform_lat(x, y)
+    d_lon = _legacy_transform_lat(x, y)          # ← 就是当年那个 bug
+    rad_lat = lat / 180.0 * math.pi
+    magic = 1 - _EE_GCJ_LEGACY * math.sin(rad_lat) ** 2
+    sqrt_magic = math.sqrt(magic)
+    d_lat = (d_lat * 180.0) / ((_A_GCJ_LEGACY * (1 - _EE_GCJ_LEGACY)) / (magic * sqrt_magic) * math.pi)
+    d_lon = (d_lon * 180.0) / (_A_GCJ_LEGACY / sqrt_magic * math.cos(rad_lat) * math.pi)
+    return lat + d_lat, lon + d_lon
+
+
+def _migrate_point(lat: float, lon: float) -> tuple[float, float]:
+    """旧坐标空间的一点 → 修复后的 WGS-84(迁移用, 幂等性由版本标记保证, 不重复调用)。"""
+    try:
+        from .api import gcj02_to_wgs84       # HA 运行时
+    except ImportError:                        # 单测: trips 以裸模块名被导入
+        from api import gcj02_to_wgs84         # type: ignore[no-redef]
+    glat, glon = _legacy_buggy_wgs_to_gcj(float(lat), float(lon))
+    return gcj02_to_wgs84(glat, glon)
+
+
+def _migrate_trip_coords(tr: "Trip") -> int:
+    """把一个 Trip 的起终点与轨迹点从旧坐标空间迁到正确 WGS-84; 返回迁移的点数。"""
+    n = 0
+    for lat_attr in ("start_lat", "end_lat"):
+        lat = getattr(tr, lat_attr, None)
+        lon_attr = lat_attr[:-3] + "lon"       # start_lat → start_lon
+        lon = getattr(tr, lon_attr, None)
+        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+            wlat, wlon = _migrate_point(lat, lon)
+            setattr(tr, lat_attr, wlat)
+            setattr(tr, lon_attr, wlon)
+            n += 1
+    for p in getattr(tr, "points", None) or []:
+        if (isinstance(p, (list, tuple)) and len(p) >= 2
+                and isinstance(p[0], (int, float)) and isinstance(p[1], (int, float))):
+            p[0], p[1] = _migrate_point(p[0], p[1])
+            n += 1
+    return n
+
+
 def pick_distance_with_source(odo_delta: float | None,
                              gps_km: float | None) -> tuple[float | None, str]:
     """同 `pick_distance_km`, 但**同时告诉调用方这个值是按哪个口径算的**。
 
-    为什么要在意口径(2026-09-30 实测, C10):
+    为什么要在意口径(实测, C10):
       * 车端**只有整数公里的总里程**(信号 1318), 云端每日里程也是整数 ——
         所以按总里程算出来的行程里程天然是整数(17.0 而不是 17.4), 误差上界 ±1 km;
       * GPS 轨迹看着更"细", 但实测**更不准**: 采样稀疏时折线会抄近道 ——
@@ -171,7 +243,7 @@ def recent_day_starts(days: int = 7, now: float | None = None) -> list[tuple[str
 def recent_day_windows(days: int = 7, now: float | None = None) -> list[tuple[str, float, float]]:
     """同 `recent_day_starts`, 但每天附上**闭区间** [0点, 当天最后1秒]。
 
-    给"按天查询云端 getEC"用(2026-10-08 实测: 传任意窗口都返回, 单日也行; end 取
+    给"按天查询云端 getEC"用(实测: 传任意窗口都返回, 单日也行; end 取
     23:59:59 而不是次日 0 点, 跨 DST 的 23/25 小时日也安全)。今天那天的 end 收在
     `now` —— 云端对"窗口终点晚于现在"会回 `code=2 请求参数含非法字符`。
     """
@@ -301,6 +373,19 @@ class TripRecorder:
                                    if k in Trip.__dataclass_fields__})
             self._points = list(active.get("points") or [])
             log.info("行程记录: 接续上次未完成的行程(起点 %s)", self._dt(self._active.started_at))
+        # ── 坐标空间迁移(换算公式修复): 旧数据版本缺失/为 1 → 就地校正并回写 ──
+        coords_v = int(data.get("coords_version") or 1) if data else COORDS_VERSION
+        if coords_v < COORDS_VERSION:
+            try:
+                total = sum(_migrate_trip_coords(t) for t in self.trips)
+                if self._active is not None:
+                    total += _migrate_trip_coords(self._active)
+                    self._points = list(self._active.points or [])   # 同批点对象, 重挂引用
+                log.warning("行程记录: 坐标空间迁移 —— %d 个历史坐标已从旧空间(偏东数百米)"
+                            "校正到修复后的 WGS-84", total)
+            except Exception as err:  # noqa: BLE001 — 迁移失败也不能拖垮加载
+                log.warning("行程记录: 坐标空间迁移失败(保留旧值): %s", err)
+            self._save_soon(delay=1)      # 回写(含版本标记), 免得每次启动都重做
         log.info("行程记录: 已载入 %d 段历史行程, %d 条漏采记录", len(self.trips), len(self.gaps))
 
     def _dump(self) -> dict[str, Any]:
@@ -314,6 +399,8 @@ class TripRecorder:
             "last_fresh_wall": self._last_fresh_wall or None,
             # 用"最后确实在动"的帧时刻: 重启后又遇冻结收尾时, 结束时刻要能回拨到它
             "last_moving_ts": self._last_moving_ts or None,
+            # 坐标空间版本(见 COORDS_VERSION): 下次加载据此判断要不要迁移
+            "coords_version": COORDS_VERSION,
             "active": (lambda t: {**asdict(t), "points": self._points})(self._active)
             if self._active is not None else None,
         }
@@ -391,7 +478,7 @@ class TripRecorder:
                 log.debug("车已停下, %d 秒内不再动就收尾这段行程", self._confirm_seconds())
             # 插枪 = 立即收尾(不用等 60 秒确认)。⚠️ 必须用 `charge_plugged` 的白名单判据:
             # 直接 `bool(charge_connection)` 会把 1149=5 当成"插着枪", 而 5 其实是**非连接**
-            # (2026-10-06 真机: 没插枪时 0↔5 交替) —— 那样会把正常停车当成插枪、行程被提前切断。
+            # (真机: 没插枪时 0↔5 交替) —— 那样会把正常停车当成插枪、行程被提前切断。
             plugged = bool(st.charge_plugged) or bool(st.charging)
             if plugged or (now - self._parked_since) >= self._confirm_seconds():
                 self._finish(st, now, frozen=False, odo=odo)

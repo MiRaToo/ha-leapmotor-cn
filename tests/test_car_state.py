@@ -108,7 +108,7 @@ def test_lock_status_semantics():
 
 
 def test_charging_requires_cable_and_current():
-    """旧版按"电流绝对值"判充电 —— 2026-10-02 已按官方 App 的 1149 语义改掉(见下一条测试)。
+    """旧版按"电流绝对值"判充电 —— 已按官方 App 的 1149 语义改掉(见下一条测试)。
 
     保留这条是作为**反例**: 同样"有电流", 1149=2 现在不再算充电中, 只有 1149=1 才算。
     """
@@ -185,6 +185,21 @@ def test_gcj_to_wgs_roundtrip_is_millimetre_accurate():
     assert abs(back[1] - glon) * 98000 < 0.01
 
 
+def test_gcj_to_wgs_matches_public_reference_vector():
+    """黄金参考向量(eviltransform 公开样例), 防"经度用错多项式"类回归。
+
+    修: 旧实现经度偏移也用了纬度多项式, 对外发布的 WGS-84 偏东 300~800 米
+    (自家卡片因正反同错、误差相消看不出来; 第三方按标准换算就露馅)。
+    这组向量能同时抓住"经度用错公式"与"迭代方向写反"两类错误。
+    """
+    w = api_client.wgs84_to_gcj02(31.1774276, 121.5272106)
+    assert w[0] == pytest.approx(31.17530398364597, abs=1e-9)
+    assert w[1] == pytest.approx(121.531541859215, abs=1e-9)
+    back = api_client.gcj02_to_wgs84(*w)
+    assert back[0] == pytest.approx(31.1774276, abs=1e-7)
+    assert back[1] == pytest.approx(121.5272106, abs=1e-7)
+
+
 def test_gcj_to_wgs_offset_is_a_few_hundred_metres_in_china():
     glat, glon = 31.230416, 121.473701
     wlat, wlon = api_client.gcj02_to_wgs84(glat, glon)
@@ -202,8 +217,9 @@ def test_car_state_exposes_wgs_coordinates_for_ha():
     st = state({"2": 121.473701, "3": 31.230416})
     assert st.latitude == pytest.approx(31.230416)          # 原始 GCJ-02
     assert st.longitude == pytest.approx(121.473701)
-    assert st.latitude_wgs == pytest.approx(31.232364, abs=1e-4)   # 对外 WGS-84
-    assert st.longitude_wgs == pytest.approx(121.475968, abs=1e-4)
+    # 对外 WGS-84(修复后的正确值; 旧错误实现给的是 31.232364/121.475968)
+    assert st.latitude_wgs == pytest.approx(31.232345, abs=1e-4)
+    assert st.longitude_wgs == pytest.approx(121.469163, abs=1e-4)
     # 没定位时不能瞎编
     assert state({}).latitude_wgs is None
 
@@ -264,11 +280,11 @@ def test_seat_rows_gates_on_abilities_with_third_row_signal_fallback():
     assert api_client.seat_rows({})["rear_heat"] is False
 
 
-# ── 充电判定: 按官方 App 的 1149 语义(2026-10-02 修"行驶中误报充电") ──
+# ── 充电判定: 按官方 App 的 1149 语义(修"行驶中误报充电") ──
 def test_charging_only_when_code_is_1():
     """只有 1149 == 1 才是充电中; 5 = 非连接(既不是充电中, 也不是"插枪待机")。
 
-    2026-10-02: 旧代码按"电流绝对值>1"判充电, 行驶/能量回收时电流非零 → 误报"充电中"。
+    旧代码按"电流绝对值>1"判充电, 行驶/能量回收时电流非零 → 误报"充电中"。
     """
     assert state({"1149": 1}).charging is True
     assert state({"1149": 5}).charging is False
@@ -279,10 +295,10 @@ def test_charging_only_when_code_is_1():
     assert state({"1149": 5, "1178": 12.0, "1319": 40, "1010": 1}).charging is False
 
 
-# ── 插枪判定: 1149 白名单 {1,2,3,4}(2026-10-06 修"没插枪却显示已插枪") ──
+# ── 插枪判定: 1149 白名单 {1,2,3,4}(修"没插枪却显示已插枪") ──
 def test_charge_plugged_whitelist_excludes_5():
     """真机事故: 车没插枪时 1149 在 0 与 5 之间每 6~12 秒交替, 旧判据"非 0 即插枪"
-    把 5 当成"已插枪" → 控制卡凭空多出一颗「已插枪未充电」胶囊(用户报告)。
+    把 5 当成"已插枪" → 控制卡凭空多出一颗「已插枪未充电」胶囊。
 
     证据: ①当晚实测(0↔5 交替, 同期 1197 直流枪恒 0); ②官方 App `OooOo00` 把
     `chargeState == 0 || == 5` **并列**当作"未插枪"; ③EU 版同名项目注释
@@ -291,7 +307,7 @@ def test_charge_plugged_whitelist_excludes_5():
     assert state({"1149": 0}).charge_plugged is False
     assert state({"1149": 5}).charge_plugged is False    # ★ 本次修的: 5 不是插枪
     assert state({"1149": 1}).charge_plugged is True     # 充电中必然插着
-    assert state({"1149": 2}).charge_plugged is True     # 2026-10-03 实测出现过
+    assert state({"1149": 2}).charge_plugged is True     # 实测出现过
     assert state({"1149": 3}).charge_plugged is True
     assert state({"1149": 4}).charge_plugged is True
     assert state({"1149": 9}).charge_plugged is False    # 未知值宁可漏报, 不误报
@@ -307,7 +323,7 @@ def test_charging_state_maps_codes_to_three_states():
         assert got == want, "1149=%s -> %s(期望 %s)" % (code, got, want)
 
 
-# ── 拨号策略: IPv4 优先(2026-10-02 修"每轮被 IPv6 黑洞拖 40 秒") ──
+# ── 拨号策略: IPv4 优先(修"每轮被 IPv6 黑洞拖 40 秒") ──
 def test_order_addresses_prefers_ipv4():
     """DNS 把 AAAA 排在前面时, 我们要把 IPv4 提到前面 —— 但不是禁用 v6。
 

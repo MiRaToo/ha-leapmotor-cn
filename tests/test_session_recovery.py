@@ -1,6 +1,6 @@
 """会话失效判定 —— 决定集成是"弹重新认证"还是"沿用上一份数据"。
 
-实测背景(2026-09-27): 账号 token 只有约 6 小时有效期, 服务端失效后
+实测背景:  账号 token 只有约 6 小时有效期, 服务端失效后
 车列表返回空 + 错误码, 如果按"没有车辆"处理会把整个设备标成不可用 ——
 实际应该让 HA 弹「重新认证」, 用户收一条短信就能恢复。
 
@@ -39,7 +39,7 @@ def test_success_is_not_mistaken_for_expiry():
 
 
 # ── 签名类错误: 请求没被受理, 但**不等于**会话失效 ──
-# 实测(2026-09-27): 车端 JWT 被轮换后, 旧密钥签的请求会被 302010205 拒收;
+# 实测:  车端 JWT 被轮换后, 旧密钥签的请求会被 302010205 拒收;
 # 正确处置是"重新交换车端 token 再发一次", 若误判成会话失效就会反复弹重新认证。
 def test_signature_errors_are_recognized():
     assert api_client.is_signature_error({"code": 302010205, "message": "签名信息校验失败"})
@@ -57,7 +57,7 @@ def test_signature_and_auth_error_sets_are_disjoint():
     assert not (api_client.SIGNATURE_ERROR_CODES & api_client.AUTH_ERROR_CODES)
 
 
-# ── "车况首拉为空 → 换 token 重试"的触发条件(2026-10-03 连续观测定性) ──
+# ── "车况首拉为空 → 换 token 重试"的触发条件(连续观测定性) ──
 # 真机证据: 每天约 40 次首拉被服务端拒签(302010205), 换一次车端 token 后重试必成功;
 # 与 HA 重启无关(09-29 零重启那天也有 59 次)。签名族错误因此是"换 token"的唯一条件;
 # 其它原因(网络抖动/未知码)换 token 是白费请求, 还会让别处的会话失效(单账号单会话)。

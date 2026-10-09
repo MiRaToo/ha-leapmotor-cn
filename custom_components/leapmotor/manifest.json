@@ -9,5 +9,5 @@
   "integration_type": "hub",
   "loggers": ["custom_components.leapmotor"],
   "requirements": ["cryptography>=42"],
-  "version": "0.2.0"
+  "version": "0.2.1"
 }

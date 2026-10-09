@@ -4,13 +4,13 @@
 
 # ha-leapmotor-cn
 
-**零跑汽车 Home Assistant 集成** · **v0.2**
+**零跑汽车 Home Assistant 集成** · **v0.2.1**
 
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.12+-blue?logo=python&logoColor=white)
 ![Home Assistant](https://img.shields.io/badge/Home%20Assistant-%E8%87%AA%E5%AE%9A%E4%B9%89%E9%9B%86%E6%88%90-41BDF5?logo=homeassistant&logoColor=white)
 ![HACS](https://img.shields.io/badge/HACS-%E8%87%AA%E5%AE%9A%E4%B9%89%E4%BB%93%E5%BA%93-41BDF5)
-![version](https://img.shields.io/badge/version-v0.2-blue)
+![version](https://img.shields.io/badge/version-v0.2.1-blue)
 
 **在 Home Assistant 里使用你的零跑汽车** —— 远程车控、实时车况、行程记录与能耗统计，
 全部以 **HA 原生实体**呈现，并自带一套控车相关的**前端卡片**。
@@ -27,7 +27,7 @@
 | **里程能耗** | 总里程 · 近 7 天里程 · 近 7 天能耗 · 百公里能耗 · 能耗排名 · 交付天数 —— 逐日耗电采用**官方云端口径**，获取缺失时自动用本机自记兜底 |
 | **行程记录** | 每趟开车的**轨迹 · 起止时间 · 里程 · 耗电 · 百公里能耗**（本机采样记录，行驶中 6 秒一帧）· 今日 / 7 天 / 30 天统计 |
 | **照片与诊断** | 驻车照片（泊车后自动补齐）· 最近指令回执 · 原始指令（cmdId）· 会话状态 · 刷新车况 |
-| **界面（自带卡片）** | **控制卡** `custom:leapmotor-control`：App 风格（车况 / 空调 / 座椅 / 充电 / 燃油 / 胎压；车模按你的车型显示官方外观图²）· **地图卡** `custom:leapmotor-map`：高德底图，在卡片上拖圆创建地理围栏，围栏随地图拖动实时同步 · **行程卡** `custom:leapmotor-trips`：每段一张带缩略图的小卡 + 详情页 · **里程/耗电卡** `custom:leapmotor-energy`：逐日折线，周/月切换，三线可叠显 · **上周能耗卡** `custom:leapmotor-lastweek`：驱动 / 空调 / 其它拆分 |
+| **界面（自带卡片）** | **控制卡** `custom:leapmotor-control`：App 风格（车况 / 空调 / 座椅 / 充电 / 燃油 / 胎压；车模按你的车型显示官方外观图²）· **地图卡** `custom:leapmotor-map`：高德底图，在卡片上拖圆创建地理围栏，围栏随地图拖动实时同步 · **行程卡** `custom:leapmotor-trips`：每段一张带缩略图的小卡 + 详情页 · **里程/耗电卡** `custom:leapmotor-energy`：逐日折线，周/月切换，三线可叠显 · **上周能耗卡** `custom:leapmotor-lastweek`：驱动 / 空调 / 其它拆分 —— **五张卡的界面预览见 [docs/showcase.md](docs/showcase.md)** |
 
 ¹ 按车端实际上报的能力位 / 信号自动出现，纯电车型不会多出这些实体。
 ² 车模图只包含C10 / C01 / T03 / B10 / C11 / C16 ，目前无实际功能，其余车型自动回退内置简笔画。
@@ -134,6 +134,7 @@ ha-leapmotor-cn/
 | 文档 | 内容 |
 |---|---|
 | [docs/SETUP.md](docs/SETUP.md) | 安装与使用(子账号原则、首次登录、会话寿命、常见问题) |
+| [docs/showcase.md](docs/showcase.md) | **卡片展示**: 五张自带卡片的界面预览(模拟数据) |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | 协议: 服务拓扑、两种签名、密钥派生、车况信号表、指令码与实测结论 |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | 代码结构、如何新增实体/指令、调试与部署 |
 | [docs/trips.md](docs/trips.md) | 行程记录(原理、采样频率、实体与卡片、隐私、常见问题) |
