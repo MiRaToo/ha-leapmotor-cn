@@ -73,6 +73,11 @@ class LeapmotorTracker(LeapmotorEntity, TrackerEntity):
             "coordinate_system": "WGS-84",
             "latitude_gcj": st.latitude,
             "longitude_gcj": st.longitude,
+            # ha_gaode 生态的兼容约定: 它的服务端见到实体带 gcj02_* 属性就
+            # **跳过自己的 WGS→GCJ 转换、直接用** —— 放在这里正好是车端原始坐标(GCJ-02),
+            # 于是 ha_gaode 地图无需任何配置即显示正确, 也省它一次高德 API 调用。
+            "gcj02_latitude": st.latitude,
+            "gcj02_longitude": st.longitude,
             "raw_latitude": st.raw.get("3"),
             "raw_longitude": st.raw.get("2"),
             "alt_latitude": st.raw.get("3725"),

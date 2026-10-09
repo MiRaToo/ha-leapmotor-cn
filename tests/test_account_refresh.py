@@ -1,6 +1,6 @@
 """账号 token 免短信续期(``LeapmotorClient.refresh_account_token``)的形状回归测试。
 
-形状来源(2026-09-27 实测, 见 docs/PROTOCOL.md §3):
+形状来源(实测, 见 docs/PROTOCOL.md §3):
   * 抓取 App 自己发出的续期请求 —— `com.leapmotor.network.TokenRefreshManager`
   * `signStr` 与抓包**逐字节一致**;refreshToken 走请求头 `XFX-CDN-CROSS-REFRESH-NODE`
 

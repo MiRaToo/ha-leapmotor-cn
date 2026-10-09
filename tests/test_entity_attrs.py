@@ -2,7 +2,7 @@
 
 为什么需要
 ----------
-2026-09-27 踩过一次: `number.py` 里写了 `self._key`(用于 remember/recall),
+踩过一次: `number.py` 里写了 `self._key`(用于 remember/recall),
 但 `LeapmotorSeat.__init__` 从没给它赋值 —— 基类只存 `_attr_unique_id`。
 后果是 4 个座椅实体在运行时抛 `AttributeError` 变成 unavailable, 而单测
 (只测纯逻辑)完全没拦住。这个测试用 AST 做静态检查, 把这类问题挡在提交前。
@@ -92,7 +92,19 @@ def test_scan_actually_detects_a_missing_attribute(tmp_path):
     assert "_never_assigned" in read and "_never_assigned" not in assigned
 
 
-# ── 跨模块的字段名一致性(2026-09-30 真机踩到) ──
+def test_device_tracker_exposes_gcj02_compat_attrs_and_wgs84_self_declaration():
+    """车辆定位实体必须带: ①自声明 WGS-84(coordinate_system); ②gcj02_* 兼容属性。
+
+    gcj02_* 是 ha_gaode 生态的约定(它见到该属性就跳过自己的转换、直接用)——
+    新增该属性时, 顺带取代"把它塞进忽略列表"的老办法。静态断言防误删。
+    """
+    src = (PKG / "device_tracker.py").read_text(encoding="utf-8")
+    for key in ('"coordinate_system": "WGS-84"',
+                '"gcj02_latitude":', '"gcj02_longitude":'):
+        assert key in src, f"device_tracker.py 缺少 {key}"
+
+
+# ── 跨模块的字段名一致性(真机踩到) ──
 # 事故: `trips.py` 给 Trip 实例动态赋了 `distance_source`, 但 dataclass **没声明**该字段
 # → 从磁盘载入的历史行程没有这个属性 → `sensor.py` 一读就 AttributeError(实体添加失败)。
 # 这类"实体读了对方类里不存在的字段"靠运行时才发现太晚, 静态扫一遍最省事。

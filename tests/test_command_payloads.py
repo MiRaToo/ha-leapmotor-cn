@@ -107,8 +107,8 @@ def test_ac_payload_has_the_seven_expected_fields():
 def test_ac_off_uses_off_not_close():
     """关空调必须是 operate="off"。
 
-    实测(2026-09-27, 读车端信号 1938):
-      {"operate":"close"} → 云端 code=0, 车端**毫无反应**(用户反馈的"Siri 能开不能关")
+    实测(读车端信号 1938):
+      {"operate":"close"} → 云端 code=0, 车端**毫无反应**(表现为"Siri 能开不能关")
       {"operate":"off"}   → 18 秒内 1938 由 1 变 0 ✓
     """
     cli, calls = _capture()

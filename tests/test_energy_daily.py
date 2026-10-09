@@ -2,8 +2,8 @@
 
 背景: 新卡片「零跑·里程能耗」要按"天"画折线 —— 里程/能耗只在天的粒度上有意义。
 数据源几经更迭(见 docs/DEVLOG.md):
-  * 2026-10-04: 周视图曾优先用云端 `mileage/energy/detail` 的逐日明细, 月视图只用自记;
-  * 2026-10-08: 云端那个逐日字段实测不可靠(`accumulatedEnergyConsume` 逐日为 0、
+  * 周视图曾优先用云端 `mileage/energy/detail` 的逐日明细, 月视图只用自记;
+  * 云端那个逐日字段实测不可靠(`accumulatedEnergyConsume` 逐日为 0、
     求和远小于官方聚合), 耗电改用**官方 getEC 任意窗口**(见 tests/test_energy_daily_official.py),
     这里只保留仍被使用的纯函数(自记按天聚合 + 带 epoch 窗口的一天序列)。
 """

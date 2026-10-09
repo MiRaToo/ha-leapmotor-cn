@@ -106,7 +106,10 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # 车况这一路的问题(空 = 正常)。它和会话是两回事: token 有效也可能拉不到车况
         self.car_state_problem: str = ""
         self._last_renew = 0.0
-        self._expiry_warned = False             # 只提醒一次(重新登录后复位)
+        # 会话提醒: **只在真的续期失败、且已影响服务时**弹一次(见 _warn_expired);
+        # 会话恢复健康后自动清掉残留通知并把此标记复位(见 _clear_stale_session_notices)。
+        self._expiry_warned = False
+        self._notices_cleared = False           # 本轮健康期是否已清过历史通知(避免每轮都调服务)
         self._plug_energy = {}                   # 增程车的电耗/油耗(见 _refresh_heavy)
         self._last_heavy = 0.0                  # 上次拉"不常变"数据(配置/里程/能耗)的时刻
         # ── 驻车照片(只在泊车时拍一次, 之后请求拿回同一张)──
@@ -229,7 +232,7 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_resp = raw
             if is_auth_error(raw):
                 # ★ 账号 token 过期**不再等于必须短信重登**: 先用 refreshToken 免短信续期
-                #   (2026-09-27 实测 `getnewtoken` code=200; 哪怕 token 已过期也能救回)
+                #   (实测 `getnewtoken` code=200; 哪怕 token 已过期也能救回)
                 if not account_retried and self._account_refresh_if_needed(force=True):
                     self._persist()
                     return await self._collect(account_retried=True)
@@ -265,17 +268,20 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             —— 照片只在泊车那一刻拍一次并异步上传, 重复请求只会拿回同一张;
             用响应里的 `uploadTime` 判断**是否真的换了新照片**(见 `client.chassis_info`),
             没换就在窗口期内重试几次, 仍没有则标记「待补」交给下一个重数据周期。
+
+        注意: **不再有"账号会话快到期"的提前提醒** —— 账号 token 有免短信续期
+        通道(refreshToken 不轮换、可无限续, 见 `_account_refresh_if_needed`), 提前吓唬用户
+        纯属噪音; 现在只在**强制续期也失败、且车端被服务端拒收**时才提醒(见 `_warn_expired`)。
         """
-        await self._warn_before_expiry()
         now = time.time()
 
         # ── 车况帧(每轮必拉)──
         #
-        # 两个坑(2026-09-27 深夜实测踩到):
+        # 两个坑(深夜实测踩到):
         #   1. `get_car_state` 对"被服务端拒收/没有 signalMap"的响应**不抛异常**,
         #      而是回一个**空 CarState** —— 直接赋值会把好数据覆盖成一片 null
         #      (表现为: 电量/续航/位置全变 unknown, 日志里却什么都没有)。
-        #   2. 服务端会**不定时把签名材料换掉**(2026-10-03 连续观测定性: 每天约 40 次
+        #   2. 服务端会**不定时把签名材料换掉**(连续观测定性: 每天约 40 次
         #      首拉被 `302010205` 拒签, 换一次车端 token 后重试**必成功**; 与 HA 重启
         #      无关 —— 09-29 零重启那天也有 59 次)。换 token 是签名族错误的唯一解药。
         # 所以: 空结果重试一次 —— **只有签名族错误才换 token**(`is_signature_error`),
@@ -313,6 +319,9 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if state is not None and state.raw:
             self.state = state
             self.car_state_problem = ""
+            # 车况拉到了 = 会话是活的: 顺手清掉历史会话提醒(老版本留下的"快到期"通知,
+            # 或已恢复后残留的"已过期"通知), 并把提醒标记复位。
+            await self._clear_stale_session_notices()
         else:
             self.car_state_problem = f"车况未取到({why})"
             log.warning("本轮没取到车况, 沿用上一份数据: %s", why)
@@ -363,7 +372,7 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _refresh_heavy(self) -> None:
         """里程 / 能耗 / 配置 —— 变化慢, 只按需拉(见 `_refresh_car_data` 的说明)。
 
-        取数优化(2026-10-02):
+        取数优化:
           * **三个请求并发**(原来串行 ~0.85s → 现在约等于最慢的一个 ~0.3s);
           * **去掉一个重复请求**: `mileage/energy/detail` 带时间窗口时会同时返回
             `totalmileage` / `deliveryDays`(与不带窗口的调用同一个端点), 所以
@@ -573,18 +582,29 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self._car_token_left() > 120
 
     async def _warn_expired(self) -> None:
-        """账号会话已过期时提醒一次(车端还能顶一会儿)。"""
+        """**唯一**的会话提醒: 免短信续期也没救回来、且服务端已拒收时, 提醒用户重新认证。
+
+        触发条件(见 `_collect` 的登录分支): 车端请求被服务端判为会话失效, 且
+        `_account_refresh_if_needed(force=True)` 也没成功。此时车端 token 可能还活着
+        (能再撑约 2 小时), 所以是"提醒"而不是立刻停摆。
+        "快到期"之类的提前提醒已删除: 账号 token 平时会被静默续期,
+        提前提醒纯属噪音; 提醒发出后若会话恢复健康, 本通知会被
+        `_clear_stale_session_notices` 自动清掉。
+        """
         if self._expiry_warned:
             return
         self._expiry_warned = True
+        self._notices_cleared = False        # 发出提醒后, 等健康周期再清一遍(届时复位标记)
         try:
             await self.hass.services.async_call(
                 "persistent_notification", "create",
                 {
-                    "title": "零跑汽车: 账号会话已过期",
+                    "title": "零跑汽车: 账号会话需要重新认证",
                     "message": (
-                        "账号会话已过期, 车端 token 还能撑一会儿(数据仍在更新)。"
-                        "请在 设置 → 设备与服务 → 零跑 里点「重新认证」, 收一条短信填进去即可。"
+                        "自动续期失败, 账号会话已被云端拒收"
+                        "(车端 token 若仍有效, 数据还能再更新约两小时)。"
+                        "请到 设置 → 设备与服务 → 零跑 点「重新认证」, 收一条短信填进去即可"
+                        "(不需要删除集成)。"
                     ),
                     "notification_id": f"{DOMAIN}_session_expired",
                 },
@@ -597,39 +617,39 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._refresh_car_data()
         return self._build_result()
 
-    async def _warn_before_expiry(self) -> None:
-        """账号会话快到期时提前弹一条通知。
+    async def _clear_stale_session_notices(self) -> None:
+        """会话健康时清掉历史会话提醒, 并把"已提醒"标记复位。
 
-        零跑云的账号 token 实测只有约 6 小时, 而且**没有静默续期通道**(App 也没有,
-        只能短信重登 —— 见 docs/PROTOCOL.md §3)。所以提前 30 分钟提醒, 免得用户
-        在自动化跑到一半时突然发现实体不可用。
+        两个用途:
+          * 清掉**老版本**可能留下的「登录会话快到期」通知(该预提醒已删除, 但仍挂在
+            用户的通知栏里)—— 这条一律清, 因为那个概念已不存在;
+          * 「需要重新认证」通知: **只在会话已恢复健康时**才撤掉 —— 如果车端 token
+            还活着(账号会话死了但车还能用), 车况帧照常能拉到, 此时**不能**把刚发出的
+            提醒撤掉(否则等于没提醒)。
+
+        每次"健康期"只清一次(`_notices_cleared` 节流), 不用每轮都调服务;
+        对不存在的通知 dismiss 是无操作, 所以开机首轮也会顺手清一次老残留。
         """
-        exp = self.session.account_token_expires_at
-        if not exp:
+        if self._notices_cleared:
             return
-        left = exp - time.time()
-        if left <= 0:
-            return
-        if left > 1800 or self._expiry_warned:
-            return
-        self._expiry_warned = True
+        self._notices_cleared = True
         try:
             await self.hass.services.async_call(
-                "persistent_notification", "create",
-                {
-                    "title": "零跑汽车: 登录会话快到期",
-                    "message": (
-                        f"账号会话大约还有 {int(left / 60)} 分钟到期。到期后车辆实体"
-                        "会暂时不可用, 请在 设置 → 设备与服务 → 零跑 里点「重新认证」,"
-                        "收一条短信填进去即可(不需要删除集成)。"
-                    ),
-                    "notification_id": f"{DOMAIN}_session_expiry",
-                },
+                "persistent_notification", "dismiss",
+                {"notification_id": f"{DOMAIN}_session_expiry"},
                 blocking=False,
             )
-            log.info("已提醒用户账号会话即将到期(剩 %.0f 分钟)", left / 60)
+            if not self.session_problem:          # 会话真健康才撤"需重新认证"提醒
+                await self.hass.services.async_call(
+                    "persistent_notification", "dismiss",
+                    {"notification_id": f"{DOMAIN}_session_expired"},
+                    blocking=False,
+                )
+                if self._expiry_warned:
+                    self._expiry_warned = False   # 会话已恢复: 将来真出问题时还能再提醒
+                    log.info("会话已恢复健康: 已清理会话提醒, 后续失败仍会重新提醒")
         except Exception as err:  # noqa: BLE001
-            log.debug("发送到期提醒失败: %s", err)
+            log.debug("清理会话提醒失败: %s", err)
 
     # ── token 续期 ──
     def _renew_if_needed(self, *, force: bool = False) -> bool:
@@ -672,7 +692,7 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """账号 token(6 小时)**免短信续期** —— 车端 token 续期前顺手做掉。
 
         形状与实测来源见 `api_client.refresh_account_token()` 的 docstring:
-        实测 2026-09-27 `code=200`;refreshToken 不轮换, 只要在它有效期内调用就能
+        实测 `code=200`;refreshToken 不轮换, 只要在它有效期内调用就能
         一直续(6 小时 → 长期无需短信重登)。失败**不致命**: 交给 car_login()/
         服务端响应给出真实结论, 避免把还能用的会话误判成失效。
         """
@@ -703,7 +723,7 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                  *, force: bool = False) -> dict:
         """上周能耗拆分(驱动/空调/其它, kWh)—— 缓存读, 过期才去云端拉。
 
-        取数策略(2026-10-04 实测后定的): 这是**周汇总**(上周一~上周日, 周一零点才翻篇),
+        取数策略(实测后定的): 这是**周汇总**(上周一~上周日, 周一零点才翻篇),
         所以只在"卡片打开 / 手动刷新"这类按需时刻取; 缓存失效条件(任一满足):
           * 超过 `max_age`(默认 1 小时);
           * "上周"窗口本身翻篇了(周一凌晨, 缓存里记的 begin 与当前算出的不一致)。

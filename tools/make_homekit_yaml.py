@@ -37,7 +37,7 @@ RECOMMENDED: list[tuple[str, str, str]] = [
     ("climate", "kong_diao", "空调"),
     ("switch", "jian_kang_chong_dian", "健康充电"),
     ("switch", "yu_yue_chong_dian", "预约充电"),
-    ("switch", "hou_bei_xiang", "后备箱(开关, 2026-09-28 由两个按钮合并而来)"),
+    ("switch", "hou_bei_xiang", "后备箱(开关, 由两个按钮合并而来)"),
     ("switch", "zhe_yang_lian", "遮阳帘(开关, 同上)"),
     ("switch", "fang_xiang_pan_jia_re", "方向盘加热"),
     ("switch", "hou_shi_jing_jia_re", "后视镜加热"),
@@ -58,7 +58,7 @@ RECOMMENDED: list[tuple[str, str, str]] = [
 # 可能仍叫 ..._che_chuang_kai。哨兵模式**不在清单里**: 零跑主账号无法把哨兵授权
 # 给子账号(云端回 code=40), 本集成已移除该实体, 见 docs/PROTOCOL.md §6.2。
 
-# HomeKit 不支持的域(实测 2026-09-27 于 HA + C10: 写进去也不会进桥)
+# HomeKit 不支持的域(在 HA + C10 上实测: 写进去也不会进桥)
 UNSUPPORTED_DOMAINS = {
     "device_tracker": "车辆位置(界面里能选, 但 HomeKit 没有对应配件类型)",
     "time": "预约充电起止时间",

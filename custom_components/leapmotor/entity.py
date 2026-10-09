@@ -13,7 +13,7 @@ class LeapmotorEntity(CoordinatorEntity[LeapmotorCoordinator]):
     """所有实体共用的设备信息与命名。
 
     ⚠️ 只挂**一个**设备(整车) —— 曾经按官方 App 的分区把"空调与舒适"拆成子设备,
-    用户反馈"怎么变成两个设备了", 已改回。实体之间的顺序见 const.PLATFORMS 与
+    那会让设备页凭空多出一个条目, 已改回。实体之间的顺序见 const.PLATFORMS 与
     各平台的 add() 顺序(设备页按注册顺序显示)。
     """
 

@@ -24,10 +24,10 @@ log = logging.getLogger(__name__)
 
 # 前端模块: 把 www/ 下的五张卡片注册成全局卡片(用户无需手动放 www/ 或配资源)。
 # CARD_VERSION 与各自 JS 文件头里的同名常量保持一致(改 JS 记得一起升, 好让浏览器拿到新文件)。
-CARD_VERSION = "1.6.0"            # leapmotor-map.js
-TRIPS_CARD_VERSION = "1.1.5"      # leapmotor-trips.js
+CARD_VERSION = "1.6.1"            # leapmotor-map.js
+TRIPS_CARD_VERSION = "1.1.6"      # leapmotor-trips.js
 CONTROL_CARD_VERSION = "1.7.2"    # leapmotor-control.js
-ENERGY_CARD_VERSION = "1.2.1"     # leapmotor-energy.js
+ENERGY_CARD_VERSION = "1.2.2"     # leapmotor-energy.js
 LASTWEEK_CARD_VERSION = "1.0.1"   # leapmotor-lastweek.js
 _CARDS = (
     ("leapmotor-map.js", "/leapmotor-card/leapmotor-map.js", CARD_VERSION),
@@ -177,7 +177,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    # ⚠️ 这里**故意不注册"条目更新就重载"的监听器**(2026-10-03 定位到的重载风暴):
+    # ⚠️ 这里**故意不注册"条目更新就重载"的监听器**(定位到的重载风暴):
     # 集成每 ~2 小时把续期后的 token 写回条目(data 变化), 而 HA 的 update listener
     # 在**任何**条目变化(含仅 data)时都会触发 —— 于是每天几十次整批实体 unavailable、
     # 内存态(乐观状态/照片窗口/行程记录器)反复重建。正确做法:

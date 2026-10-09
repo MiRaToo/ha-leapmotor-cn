@@ -35,7 +35,7 @@ def test_choose_poll_seconds_tiers():
     # 限流退避: 取"停车档 × 2"与 120 的较大者
     assert c(parked=60, trip=6, driving=True, launch_boost=False, rate_limited=True) == 120
     assert c(parked=120, trip=6, driving=True, launch_boost=False, rate_limited=True) == 240
-    # 下限与钳制: 停车档的下限放宽到 20(2026-10-02 起可调), 行程档不会低于 floor(默认 6)
+    # 下限与钳制: 停车档的下限放宽到 20(可调), 行程档不会低于 floor(默认 6)
     assert c(parked=10, trip=6, driving=False, launch_boost=False) == api_client.MIN_PARKED_POLL_SECONDS
     assert c(parked=60, trip=1, driving=True, launch_boost=False) == 6
 
@@ -49,7 +49,7 @@ def test_is_rate_limited_detection():
 
 
 
-# ── 回归: 轮询间隔的最小值必须容许"行驶 6 秒"这一档(2026-10-02 真机踩到) ──
+# ── 回归: 轮询间隔的最小值必须容许"行驶 6 秒"这一档(真机踩到) ──
 def test_coordinator_allows_a_six_second_poll_interval():
     """`coordinator.timedelta_seconds` 曾经写死 `max(60, seconds)`, 让 6 秒档从未生效。
 
@@ -81,7 +81,7 @@ def test_coordinator_allows_a_six_second_poll_interval():
     assert max(floor, 6) == 6
 
 
-# ── 短停快档 & 可调停车下限(2026-10-02 加) ──
+# ── 短停快档 & 可调停车下限 ──
 def test_short_stop_uses_fast_interval():
     """行程刚结束后的一段时间内也用快档 —— 抓"短停再出发"(下车买东西/接人)。
 
@@ -122,7 +122,7 @@ def test_short_stop_defaults_and_bounds():
     assert m >= 600, "上限至少给到 10 分钟"
 
 
-# ── 驻车照片: 递增退避窗口(2026-10-02 A+C) ──
+# ── 驻车照片: 递增退避窗口(A+C) ──
 def test_photo_retry_backoff_is_increasing():
     """照片"等上传"的重试节奏必须**递增**(头几次快、之后慢), 且窗口给足。
 

@@ -186,7 +186,7 @@ def test_plugging_in_ends_trip_immediately():
 
 
 def test_code_5_is_not_plugged_and_does_not_cut_the_trip():
-    """1149=5 是**非连接**(2026-10-06 真机: 没插枪时 0↔5 交替)—— 不能当成"插枪"。
+    """1149=5 是**非连接**(真机: 没插枪时 0↔5 交替)—— 不能当成"插枪"。
 
     旧写法 `bool(st.get("charge_connection"))` 会在驻车等红灯、车端报 5 的那一帧
     立刻收尾行程(把一段行程切成两段)。插枪判据必须走 `charge_plugged` 的白名单。
@@ -220,6 +220,72 @@ def test_persistence_and_resume_after_restart():
     assert rec2.active.id == rec.active.id
     # 进行中的轨迹点存在记录器的 _points 里(dump 时一并落盘), 恢复后应完整回来
     assert rec2.active.points == rec._points and len(rec2.active.points) >= 2
+
+
+# ── 坐标空间迁移(公式修复的配套) ──
+def _legacy_inv(g_lat, g_lon):
+    """复刻**旧版(错误)** gcj02_to_wgs84 的输出: 数值逼近 legacy_fwd(x) = GCJ 的解。"""
+    from trips import _legacy_buggy_wgs_to_gcj
+    lat, lon = g_lat, g_lon
+    for _ in range(4):
+        f_lat, f_lon = _legacy_buggy_wgs_to_gcj(lat, lon)
+        lat -= f_lat - g_lat
+        lon -= f_lon - g_lon
+    return lat, lon
+
+
+def test_legacy_trip_coords_are_migrated_on_load_and_idempotent():
+    """旧存储(坐标空间 v1, 偏东数百米)→ 加载时自动校正为正确的 WGS-84; 且不重复迁移。"""
+    old_lat, old_lon = _legacy_inv(LAT, LON)        # 旧版对外发布的"WGS"(错误空间)
+    exp_lat, exp_lon = api_client.gcj02_to_wgs84(LAT, LON)   # 修复后的正确值
+    # 先证明构造出来的旧值确实偏了(≈几百米), 免得测了个假场景
+    assert abs(old_lon - exp_lon) > 0.004           # > 400 m
+    store = FakeStore({
+        "trips": [{
+            "id": "legacy1", "started_at": T0 - 600, "ended_at": T0, "distance_km": 5.0,
+            "start_lat": old_lat, "start_lon": old_lon,
+            "end_lat": old_lat, "end_lon": old_lon,
+            "points": [[old_lat, old_lon], [old_lat + 0.001, old_lon + 0.001]],
+        }],
+        # 旧存储里没有 coords_version 键(缺失 = v1)
+    })
+    rec = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                       poll_seconds_getter=lambda: 6, store=store)
+    asyncio.run(rec.async_load())
+    t = rec.trips[0]
+    assert t.start_lat == pytest.approx(exp_lat, abs=1e-6)
+    assert t.start_lon == pytest.approx(exp_lon, abs=1e-6)
+    assert t.end_lon == pytest.approx(exp_lon, abs=1e-6)
+    # 轨迹点也迁移了(首点=同一坐标)
+    assert t.points[0][0] == pytest.approx(exp_lat, abs=1e-6)
+    assert t.points[0][1] == pytest.approx(exp_lon, abs=1e-6)
+    # 迁移后落盘带版本标记
+    dumped = rec._dump()
+    assert dumped["coords_version"] == 2
+    # 幂等: 再加载一次(带版本标记)坐标不再变化
+    rec2 = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                        poll_seconds_getter=lambda: 6, store=FakeStore(dumped))
+    asyncio.run(rec2.async_load())
+    assert rec2.trips[0].start_lon == pytest.approx(exp_lon, abs=1e-9)
+    assert rec2.trips[0].points[0][1] == pytest.approx(exp_lon, abs=1e-9)
+
+
+def test_active_trip_coords_migrate_with_points_consistency():
+    """进行中的行程(active)也要迁移, 且 _points 与 active.points 保持一致。"""
+    old_lat, old_lon = _legacy_inv(LAT, LON)
+    exp_lat, exp_lon = api_client.gcj02_to_wgs84(LAT, LON)
+    pts = [[old_lat, old_lon], [old_lat + 0.0005, old_lon + 0.0005]]
+    store = FakeStore({"active": {
+        "id": "live1", "started_at": T0 - 300, "start_lat": old_lat, "start_lon": old_lon,
+        "points": pts,
+    }})
+    rec = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                       poll_seconds_getter=lambda: 6, store=store)
+    asyncio.run(rec.async_load())
+    assert rec.active is not None
+    assert rec.active.start_lon == pytest.approx(exp_lon, abs=1e-6)
+    assert rec._points[0][1] == pytest.approx(exp_lon, abs=1e-6), "_points 与 active 同步"
+    assert rec._points is not rec.active.points, "仍是各自独立的列表(避免共享引用)"
 
 
 def test_stats_buckets_and_prune():
@@ -256,7 +322,7 @@ def test_recent_list_and_delete():
     assert rec.get("def") is not None
 
 
-# ── 补记行程的时间戳(2026-09-30 真机暴露的问题) ──
+# ── 补记行程的时间戳(真机暴露的问题) ──
 def test_reconstructed_trip_time_is_observation_window_not_backwards():
     """补记的时间只能是"两次观测之间", 不能出现"结束早于开始"。
 
@@ -328,7 +394,7 @@ def test_distance_source_is_recorded():
 
 
 def test_reconstruction_after_stale_period_uses_last_fresh_boundaries():
-    """真机场景(2026-09-30 报告里的偏差 5): 云端反复给旧帧, 补记要能给出观测区间与起点坐标。
+    """真机场景(云端反复给旧帧时的偏差): 补记要能给出观测区间与起点坐标。
 
     起点取"最后一次**非重复帧**的墙钟", 位置取最后已知坐标 —— 重复帧的数据是旧的,
     不能拿来当观测边界; 但它的坐标仍然是"最后已知位置", 可以用来标起点。
@@ -353,7 +419,7 @@ def test_reconstruction_after_stale_period_uses_last_fresh_boundaries():
     assert rec.active is not None, "同时正常行程应已开始"
 
 
-# ── 补记护栏(2026-10-02, 对照 mate 的 _RECONSTRUCT_MAX_TRIP_KM) ──
+# ── 补记护栏(对照 mate 的 _RECONSTRUCT_MAX_TRIP_KM) ──
 def test_odometer_glitch_frame_is_ignored_without_rebasing():
     """单帧总里程毛刺(信号异常/串帧)按"缺失"处理: 不记账, 也不能改基线。
 

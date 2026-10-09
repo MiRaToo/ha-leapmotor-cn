@@ -50,7 +50,7 @@
 
 const TILE = 256;
 
-const CARD_VERSION = "1.1.5";
+const CARD_VERSION = "1.1.6";
 
 /* 断档阈值(km): 相邻轨迹点距离超过它 → 视为中间丢过采样, 用虚线连 */
 const TRACK_GAP_KM = 2;
@@ -86,10 +86,21 @@ function transformLat(x, y) {
   return r;
 }
 
+/* GCJ-02 的**经度**多项式(与 transformLat 是两个不同公式)。
+   ⚠️ 坑: 这里曾错误地复用 transformLat —— 与 leapmotor-map.js /
+   poller/api_client.py 同源, 三处一起改。 */
+function transformLon(x, y) {
+  let r = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x));
+  r += ((20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0) / 3.0;
+  r += ((20.0 * Math.sin(x * Math.PI) + 40.0 * Math.sin((x / 3.0) * Math.PI)) * 2.0) / 3.0;
+  r += ((150.0 * Math.sin((x / 12.0) * Math.PI) + 300.0 * Math.sin((x * Math.PI) / 30.0)) * 2.0) / 3.0;
+  return r;
+}
+
 function gcj02ToWgs84(lat, lon) {
   if (outOfChina(lat, lon)) return [lat, lon];
   let dLat = transformLat(lon - 105.0, lat - 35.0);
-  let dLon = transformLat(lon - 105.0, lat - 35.0);
+  let dLon = transformLon(lon - 105.0, lat - 35.0);
   const radLat = (lat / 180.0) * Math.PI;
   let magic = Math.sin(radLat);
   magic = 1 - EE_GCJ * magic * magic;
@@ -100,7 +111,7 @@ function gcj02ToWgs84(lat, lon) {
   const wLat = lat - dLat;
   const wLon = lon - dLon;
   let dLat2 = transformLat(wLon - 105.0, wLat - 35.0);
-  let dLon2 = transformLat(wLon - 105.0, wLat - 35.0);
+  let dLon2 = transformLon(wLon - 105.0, wLat - 35.0);
   const radLat2 = (wLat / 180.0) * Math.PI;
   let magic2 = Math.sin(radLat2);
   magic2 = 1 - EE_GCJ * magic2 * magic2;
@@ -113,7 +124,7 @@ function gcj02ToWgs84(lat, lon) {
 function wgs84ToGcj02(lat, lon) {
   if (outOfChina(lat, lon)) return [lat, lon];
   let dLat = transformLat(lon - 105.0, lat - 35.0);
-  let dLon = transformLat(lon - 105.0, lat - 35.0);
+  let dLon = transformLon(lon - 105.0, lat - 35.0);
   const radLat = (lat / 180.0) * Math.PI;
   let magic = Math.sin(radLat);
   magic = 1 - EE_GCJ * magic * magic;
@@ -682,7 +693,7 @@ class LeapmotorTripsCard extends HTMLElement {
     const mets = [
       ["耗时", (t.approx_time && t.duration_min != null ? "≈ " : "") + fmtDurShort(t.duration_min), "", "时长"],
       ["耗电", fmtKwh(t.energy_kwh), "kWh", "这段行程的耗电量"],
-      // 平均能耗: 单位要写全 "kWh/100km" —— 只写 "kWh" 会被读成"耗电量"(用户反馈)。
+      // 平均能耗: 单位要写全 "kWh/100km" —— 只写 "kWh" 会被读成"耗电量"。
       // 窄列放不下时由 _fitUnits() **整段隐藏**(而不是截成 "kWh/10…"); 无值时也不挂单位。
       ["平均能耗", t.efficiency == null ? "—" : fmtNum(t.efficiency, 1),
        t.efficiency == null ? "" : "kWh/100km", "百公里能耗 (kWh/100km)", 1],
@@ -709,7 +720,7 @@ class LeapmotorTripsCard extends HTMLElement {
   }
 
   /** 列表里的长单位(如 "kWh/100km")在窄列放不下时**整段隐藏**, 而不是截成 "kWh/10…"。
-      能放下就显示完整口径 —— 只写 "kWh" 会被读成耗电量, 缺了 /100km 是错的(用户反馈)。
+      能放下就显示完整口径 —— 只写 "kWh" 会被读成耗电量, 缺了 /100km 是错的。
       尺子: .v 是 nowrap + overflow:hidden, scrollWidth 超出 clientWidth 就是放不下。
       由 _renderList() 和 ResizeObserver(列宽变化)调用。 */
   _fitUnits() {

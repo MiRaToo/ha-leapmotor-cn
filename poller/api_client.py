@@ -3,7 +3,7 @@
 协议说明见 docs/PROTOCOL.md(公开文档)。
 全部常量与算法均在真车真账号上逐条实测过(详见各函数 docstring 里的「实测」标注)。
 
-★ 2026-09-26 关键突破:签名密钥可在**纯 Python** 下算出 ★
+★ 关键突破:签名密钥可在**纯 Python** 下算出 ★
 --------------------------------------------------------------------
 App 里 `LoginInfoManager` 用 native(360 VMP)函数把交换响应里的
 `signParam` 变成 HMAC 密钥。通过动态调试验证该 native 函数的
@@ -110,7 +110,7 @@ EP_LOGIN = "applogin/check_login_with_phone"             # POST 手机号+验证
 EP_TOKEN_EXIST = "applogin/tokenExist"
 EP_USER_INFO = "appuserinfo/compliance/queryuserinfo"
 EP_LOGOUT = "appuseroperate/logout"
-EP_ACCOUNT_REFRESH = "appuseroperate/getnewtoken"        # GET  账号 token 免短信续期(2026-09-27 实测可用)
+EP_ACCOUNT_REFRESH = "appuseroperate/getnewtoken"        # GET  账号 token 免短信续期(实测可用)
 
 # 登录用的 RSA 公钥(RSA-1024 / PKCS#1 v1.5),硬编码在 App 内,与商城 H5 同一把。
 RSA_PUBLIC_KEY = (
@@ -327,9 +327,25 @@ def _transform_lat(x: float, y: float) -> float:
     return ret
 
 
+def _transform_lon(x: float, y: float) -> float:
+    """经度偏移多项式。
+
+    ⚠️ GCJ-02 算法有**两个**不同多项式: 纬度用 `_transform_lat`、经度用本函数。
+    ⚠️ 坑(已修): 经度方向原来也调的是 `_transform_lat`(纬度多项式) —— 后果是
+    对外发布的 WGS-84 偏东 300~800 米(南北向只差米级); 自家卡片因为正反都用同一套
+    错误公式、误差往返相消, 界面上反而"看着准", 直到把坐标交给第三方(ha_gaode
+    的标准转换)才暴露。修复后: 与公开实现/eviltransform 的参考向量逐位吻合(有单测钉住)。
+    """
+    ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * math.sqrt(abs(x))
+    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(x * math.pi) + 40.0 * math.sin(x / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (150.0 * math.sin(x / 12.0 * math.pi) + 300.0 * math.sin(x / 30.0 * math.pi)) * 2.0 / 3.0
+    return ret
+
+
 def _delta(lat: float, lon: float) -> tuple[float, float]:
     d_lat = _transform_lat(lon - 105.0, lat - 35.0)
-    d_lon = _transform_lat(lon - 105.0, lat - 35.0)
+    d_lon = _transform_lon(lon - 105.0, lat - 35.0)
     rad_lat = lat / 180.0 * math.pi
     magic = math.sin(rad_lat)
     magic = 1 - _EE_GCJ * magic * magic
@@ -369,7 +385,7 @@ def gcj02_to_wgs84(lat: float, lon: float) -> tuple[float, float]:
 # 做法: 命令成功后记下"我认为它现在是什么状态", 直到车端上报了**更新的**
 # collectTime 才恢复用真实信号(另加一个兜底 TTL, 防止车端长时间不更新)。
 #
-# ⚠️ "更新的帧"必须**新到车来得及执行**(2026-10-03 真机回弹事故):
+# ⚠️ "更新的帧"必须**新到车来得及执行**(真机回弹事故):
 # 用户 17:43:35 开遮阳帘, 17:43:36 云端就给了一帧 collect=09:43:36 的新采集 ——
 # 它只比命令晚 1 秒, 车根本还没动, 信号 1724 仍是 0。旧逻辑"只要帧更新就失效"
 # 被这一帧清掉了乐观状态, 界面 1 秒后从"开"弹回"关", 60 秒后才由真实上报改回 "开"。
@@ -455,7 +471,7 @@ MIN_PARKED_POLL_SECONDS = 20
 def order_addresses_by_family(infos: list, prefer_ipv4: bool = True) -> list:
     """把 `socket.getaddrinfo` 的结果重排: **优先 IPv4**, 同族内保持原顺序。
 
-    为什么需要(2026-10-02 定位): 云端域名的 DNS 会返回 **两条 AAAA(IPv6) 且排在 IPv4 之前**;
+    为什么需要: 云端域名的 DNS 会返回 **两条 AAAA(IPv6) 且排在 IPv4 之前**;
     当本机/路由的 IPv6 出口变成"黑洞"(SYN 无响应)时, 标准库会顺着地址表**逐个串行**尝试,
     每个都等满客户端超时 —— 2 条 AAAA × 20 秒 = **每轮白等 40 秒**。
     证据: HA 里 351 个慢样本全部落在 40.2 秒的整数倍(×1/×2/×3/×5/×6), 2~40 秒之间一个都没有;
@@ -533,7 +549,7 @@ def seat_rows(signals: dict, abilities=()) -> dict:
     """这辆车有没有二排/三排座椅, 以及各有什么功能(纯函数, 可单测)。
 
     ★ 门控为什么用**能力位**而不是"信号有没有值" ★
-    实测(2026-09-30, 纯电 C10): 它**照样上报** `1879/1880/3727/3728 = 0` —— 值 0 既可能是
+    实测(纯电 C10): 它**照样上报** `1879/1880/3727/3728 = 0` —— 值 0 既可能是
     "座椅关着", 也可能是"没这套硬件", 从值上分不出来; 三排的 `12276/12277` 则干脆缺席,
     可以用"是否存在"兜底。而能力位里 22=二排、67=二排通风、85/93=三排左/右加热(见 CN App
     `LpCarTempActivity` 的显隐条件), 实测那辆 C10 的 abilities **不含** 22/67/85/93 → 不会误显示。
@@ -680,7 +696,7 @@ SIGNAL_IDS: dict[str, str] = {
     "2669": "fast_cooling",
     "2681": "fast_heating",
     # 其它
-    # 实测(2026-09-27 真车): 1724 精确跟随「遮阳帘」指令 240 —— 开后 0→100, 关后回 0,
+    # 实测(真车): 1724 精确跟随「遮阳帘」指令 240 —— 开后 0→100, 关后回 0,
     # 全量差分里只有它变化。EU 表把它叫天窗开度, 在本车就是**遮阳帘开度(%)**。
     "1724": "sunshade_percent",
     "2189": "park_assist_enabled",            # 自动泊车可用
@@ -704,7 +720,7 @@ SIGNAL_IDS: dict[str, str] = {
     "1279": "raw_1279",
     "1280": "raw_1280",
     "1282": "raw_1282",
-    # 四窗状态: 0=关, 2=开(2026-09-27 目视确认: 发 "2" 后四条一起变 2, 四窗全开)
+    # 四窗状态: 0=关, 2=开(目视确认: 发 "2" 后四条一起变 2, 四窗全开)
     # ⚠️ 1693~1696 与"左前/右前/左后/右后"的**对应顺序尚未确认**(只验证了同开同关)
     "1693": "window_state_1",
     "1694": "window_state_2",
@@ -871,20 +887,20 @@ class CarState:
     def charging(self) -> bool | None:
         """是否正在充电。
 
-        ★ 判据以官方 App 为准(2026-10-02 修): **只有 `1149 == 1` 才算充电中**。
+        ★ 判据以官方 App 为准(已修正): **只有 `1149 == 1` 才算充电中**。
         App 里就是这么写的 —— `LPCarOwnerFragment` 用 `chargeState != 1` 来隐藏"充电中"提示,
         `OooOo00` 把 **0 和 5 并列**当作"未插枪"。
 
         之前的写法是"电流绝对值 > 1" —— **错的**: 行驶/能量回收时电池电流本来就不为零,
-        于是出现过"车在开却显示充电中"(用户实测反馈)。历史数据证实那时的 1149 是 **5**,
+        于是出现过"车在开却显示充电中"。历史数据证实那时的 1149 是 **5**,
         而被我们当成了"插着枪"。
 
         已知取值(1149, 官方 App 与实测):
           0 = 未插枪 / 未充电
           1 = 充电中
-          2 = 已插枪待机(2026-10-03 实测出现过一次)
+          2 = 已插枪待机(实测出现过一次)
           3 / 4 = 已插枪(预约充电等待等; 见 EU 版同名项目的实测注释)
-          5 = **非连接**(2026-10-06 真机: 没插枪时与 0 交替出现, 详见 `charge_plugged`)
+          5 = **非连接**(真机: 没插枪时与 0 交替出现, 详见 `charge_plugged`)
         除 1 以外都不算充电中 —— 即便插着枪, 只要车端没报"充电中"就不误报。
         """
         conn = self.signals.get("charge_connection")
@@ -900,14 +916,14 @@ class CarState:
     def charge_plugged(self) -> bool | None:
         """充电枪是否插着(1149 **白名单** {1,2,3,4}; None = 车端没上报)。
 
-        ⚠️ 判据是"白名单"而不是"非 0 即插枪" —— **`5` 不是插枪**(2026-10-06 真机修正):
+        ⚠️ 判据是"白名单"而不是"非 0 即插枪" —— **`5` 不是插枪**(已修正):
           * 当晚实测: 车没插枪, 1149 在 **0 与 5 之间每 6~12 秒交替**, 同期 1197(直流枪)=0,
             传感器跟着在"已插枪/未插枪"之间跳 —— 用户看到"没插枪却显示已插枪未充电"。
           * 官方 App(`OooOo00`): 对 S01/T03 这类小车, `chargeState == 0 || == 5` **并列**
             当作"未插枪"; 对 C10 等车干脆不用 1149 判插枪(用 1197/47 枪信号)。
           * EU 版同名项目注释: "state 5 is observed while driving and is not a connection",
             其插枪集合正是 {1,2,3,4}。
-        取值语义(白名单): 1=充电中(必然插着) / 2=已插枪待机(2026-10-03 实测出现过) /
+        取值语义(白名单): 1=充电中(必然插着) / 2=已插枪待机(实测出现过) /
         3、4=已插枪(预约充电等待等, 见 EU 实测) / 0=未插枪 / 5=非连接(见上)。
         未知值一律**不算插枪**: 误报会凭空多出一颗"已插枪"胶囊, 漏报只是不显示 —— 宁可漏。
         """
@@ -1253,7 +1269,7 @@ class LeapmotorClient:
     def login(self, phone: str, sms_code: str) -> dict:
         """手机号 + 验证码登录 → 账号 token。
 
-        实测(2026-09-26 真实账号端到端跑通,抓包逐字段核对):
+        实测(真实账号端到端跑通,抓包逐字段核对):
 
             POST /app-user/applogin/check_login_with_phone
                  ?phoneNoCiphertext=<RSA(手机号)>&smsCode=<明文验证码>
@@ -1315,7 +1331,7 @@ class LeapmotorClient:
         return resp
 
     def refresh_account_token(self, phone: str | None = None) -> dict:
-        """**账号 token 续期(免短信)** —— 2026-09-27 实测拿到 `code=200`,token 延 6 小时。
+        """**账号 token 续期(免短信)** —— 实测拿到 `code=200`,token 延 6 小时。
 
         形状来源:抓取 App 自己发出的请求(叠加反汇编
         `com.leapmotor.network.TokenRefreshManager.getTokenRefreshCall()` +
@@ -1488,7 +1504,7 @@ class LeapmotorClient:
     def refresh_car_token(self) -> dict:
         """**车端 token 刷新**: 用 refreshToken 换新的 accessToken/refreshToken。
 
-        形状来自对官方 App 的反汇编(2026-09-27, 详见 docs/PROTOCOL.md §3):
+        形状来自对官方 App 的反汇编(详见 docs/PROTOCOL.md §3):
         类 `com.dahua.leapmotor.lpcar_login.OooO00o` 的字节码等价于
 
             body = hashMapOf("refreshToken" to LoginInfoManager.getRefreshToken())
@@ -1508,7 +1524,7 @@ class LeapmotorClient:
         签名规则(`_exchange_once`),只是 `RequestLabel` 从 LOGIN 换成 REFRESH。
         **不要**额外发 `token` 头 —— 实测带上它会变成签名校验失败(302002002)。
 
-        实测(2026-09-27):手里会话的账号 token 05:41 过期、车端 accessToken 07:06 过期,
+        实测: 手里会话的账号 token 05:41 过期、车端 accessToken 07:06 过期,
         之后该端点对正确形状返回 `302010219 登陆过期`(字段名认得出、会话已死);
         `{"refreshToken": <32位hex 账号refresh>}` 则返回 `TOKEN令牌刷新异常` ——
         即 body 里 `refreshToken` 字段是被服务端识别的,形状无误。**成功响应尚未实测到**。
@@ -1590,7 +1606,7 @@ class LeapmotorClient:
             车门 110     {"value":"lock"} / {"value":"unlock"}
             寻车 120     {"value":"true"}
             后备箱 130   {"value":"true"|"false"}
-            车窗 230     {"value":"2"|"0"}   ← "2"=开(2026-09-27 目视确认: 四窗全开)
+            车窗 230     {"value":"2"|"0"}   ← "2"=开(目视确认: 四窗全开)
             遮阳帘 240   {"value":"10"|"0"}
             电池预热 160 {"value":"ptcon"|"ptcoff"}
             充电开关 193 {"value":"start"|"stop"}
@@ -1757,7 +1773,7 @@ class LeapmotorClient:
         """关空调(cmdId 170)。
 
         ★★ 值必须是 `operate:"off"` —— **不是 `"close"`** ★★
-        2026-09-27 真车对比(读车端信号 1938):
+        真车对比(读车端信号 1938):
           `{"operate":"close"}`         → 云端 code=0「请求成功」, 但车端**毫无反应**
           `{"operate":"off", 完整字段}` → 18 秒内 1938 由 1 变 0, 空调确实关闭 ✓
         报文形状照抄 App 的 `AirController.OooO00o(false)`: operate=off 加上
@@ -1820,7 +1836,7 @@ class LeapmotorClient:
     def sentry(self, vin: str = "", on: bool = True) -> dict:
         """哨兵模式 —— **cmdId 400, 值用 "on"/"off"**。
 
-        ★ 怎么找到的(2026-09-28, 别再改回 220)★
+        ★ 怎么找到的(别再改回 220)★
         从 CN 版 App 的 dex 里挖出点击「哨兵模式」开关的真实链路:
 
             // LPCarOwnerFragment 的开关回调 → Lo0000O0/OooOo;->OooO00o(Z…)
@@ -1847,7 +1863,7 @@ class LeapmotorClient:
     def healthy_charging(self, vin: str = "", on: bool = True) -> dict:
         """健康充电开关。
 
-        ★ 实测(2026-09-27): 应该用**专用接口**而不是 cmdId 480 ——
+        ★ 实测: 应该用**专用接口**而不是 cmdId 480 ——
 
             POST /carownerservice/v3/api/healthyCharging/control
             表单: carvin=<VIN> & state=0|1 (& oppwd=<加密密码>)
@@ -1948,7 +1964,7 @@ class LeapmotorClient:
                         endtime: int | None = None) -> dict:
         """上周能耗拆分: 驱动 / 空调 / 其它(单位 kWh)。
 
-        实测(2026-10-04 真车只读): `GET .../getLastweekEC?carvin=&begintime=&endtime=`
+        实测(真车只读): `GET .../getLastweekEC?carvin=&begintime=&endtime=`
         传**整周窗口**(上周一 00:00:00 ~ 上周日 23:59:59, 秒)返回:
             {"driverEC": "86.9", "acEC": "8.6", "otherEC": "6.2"}
         值都是字符串(见 parse_lastweek_ec); 小窗口会回 `code=100 未找到数据!`,
@@ -1976,7 +1992,7 @@ class LeapmotorClient:
     def chassis_info(self, vin: str = "") -> dict:
         """驻车照片的**地址与上传时间**(给"照片更新了没有"用)。
 
-        实测(2026-09-28):
+        实测:
             {"data": {"fileUrl": "http://lp-carnet.oss-.../ChassisPicture/prod/<VIN>?Expires=…",
                       "uploadTime": 1790590434026}}
 

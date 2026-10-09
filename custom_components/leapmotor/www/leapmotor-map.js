@@ -56,10 +56,21 @@ function transformLat(x, y) {
   return r;
 }
 
+/* GCJ-02 的**经度**多项式(与 transformLat 是两个不同公式)。
+   ⚠️ 坑: 这里曾错误地复用 transformLat(经度也用纬度多项式) ——
+   与 Python 侧同源, 两处一起改; 见 poller/api_client.py `_transform_lon` 的说明。 */
+function transformLon(x, y) {
+  let r = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x));
+  r += ((20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0) / 3.0;
+  r += ((20.0 * Math.sin(x * Math.PI) + 40.0 * Math.sin((x / 3.0) * Math.PI)) * 2.0) / 3.0;
+  r += ((150.0 * Math.sin((x / 12.0) * Math.PI) + 300.0 * Math.sin((x * Math.PI) / 30.0)) * 2.0) / 3.0;
+  return r;
+}
+
 function gcj02ToWgs84(lat, lon) {
   if (outOfChina(lat, lon)) return [lat, lon];
   let dLat = transformLat(lon - 105.0, lat - 35.0);
-  let dLon = transformLat(lon - 105.0, lat - 35.0);
+  let dLon = transformLon(lon - 105.0, lat - 35.0);
   const radLat = (lat / 180.0) * Math.PI;
   let magic = Math.sin(radLat);
   magic = 1 - EE_GCJ * magic * magic;
@@ -70,7 +81,7 @@ function gcj02ToWgs84(lat, lon) {
   const wLat = lat - dLat;
   const wLon = lon - dLon;
   let dLat2 = transformLat(wLon - 105.0, wLat - 35.0);
-  let dLon2 = transformLat(wLon - 105.0, wLat - 35.0);
+  let dLon2 = transformLon(wLon - 105.0, wLat - 35.0);
   const radLat2 = (wLat / 180.0) * Math.PI;
   let magic2 = Math.sin(radLat2);
   magic2 = 1 - EE_GCJ * magic2 * magic2;
@@ -83,7 +94,7 @@ function gcj02ToWgs84(lat, lon) {
 function wgs84ToGcj02(lat, lon) {
   if (outOfChina(lat, lon)) return [lat, lon];
   let dLat = transformLat(lon - 105.0, lat - 35.0);
-  let dLon = transformLat(lon - 105.0, lat - 35.0);
+  let dLon = transformLon(lon - 105.0, lat - 35.0);
   const radLat = (lat / 180.0) * Math.PI;
   let magic = Math.sin(radLat);
   magic = 1 - EE_GCJ * magic * magic;
@@ -102,7 +113,7 @@ const TILE_SOURCES = {
 /* 高德连不上时回落到 OSM(海外用户/高德故障时至少还能看图) */
 const TILE_FALLBACK = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 
-const CARD_VERSION = "1.6.0";
+const CARD_VERSION = "1.6.1";
 
 /** 经纬度 → 世界像素坐标(标准 Web 墨卡托, 与高德/OSM 一致)。 */
 function project(lat, lon, zoom) {
@@ -700,7 +711,7 @@ class LeapmotorMapCard extends HTMLElement {
       this._renderTiles();
       this._renderMarker();
       // 围栏(zone 圆圈)必须跟瓦片/车标一起走, 否则拖动时它停在原地、松手后
-      // 要等下一次 hass 推送才"跳"到位(用户报告过的"延迟一下"就是这个)
+      // 要等下一次 hass 推送才"跳"到位(曾出现过的"延迟一下"就是这个)
       this._renderZones();
     });
     const end = (ev) => {
