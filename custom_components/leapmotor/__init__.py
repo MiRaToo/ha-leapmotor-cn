@@ -33,7 +33,7 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 # CARD_VERSION 与各自 JS 文件头里的同名常量保持一致(改 JS 记得一起升, 好让浏览器拿到新文件)。
 CARD_VERSION = "1.6.6"            # leapmotor-map.js
 TRIPS_CARD_VERSION = "1.4.5"      # leapmotor-trips.js
-CONTROL_CARD_VERSION = "1.8.6"    # leapmotor-control.js
+CONTROL_CARD_VERSION = "1.8.7"    # leapmotor-control.js
 ENERGY_CARD_VERSION = "1.3.1"     # leapmotor-energy.js
 LASTWEEK_CARD_VERSION = "1.1.5"   # leapmotor-lastweek.js
 _CARDS = (

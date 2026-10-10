@@ -1139,6 +1139,26 @@ def _build_opener(ctx):
     return urllib.request.build_opener(_HTTPHandler(), _HTTPSHandler())
 
 
+def parse_car_picture_url(response: Any) -> str:
+    """从车辆外观图接口响应中提取整车图片地址。"""
+    if not isinstance(response, dict):
+        return ""
+    payloads = (response.get("data"), response)
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        for key in ("shareBindUrl", "url", "imageUrl", "picUrl", "carPic"):
+            value = payload.get(key)
+            if not isinstance(value, str):
+                continue
+            url = value.strip()
+            if url.lower().startswith("http://"):
+                url = "https://" + url[7:]
+            if url.lower().startswith("https://"):
+                return url
+    return ""
+
+
 class LeapmotorClient:
     """零跑汽车客户端(仅标准库 + cryptography 做 RSA)。"""
 
