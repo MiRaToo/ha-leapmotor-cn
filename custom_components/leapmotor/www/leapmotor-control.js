@@ -81,7 +81,7 @@
  * 用户不需要把它拷到 www/ 或手配资源。
  */
 
-const CARD_VERSION = "1.7.2";
+const CARD_VERSION = "1.7.3";
 
 /* 区块顺序(show 配置按这个顺序渲染; 缺键的区块自动隐藏)
  * 注意: 这里没有 tires —— 胎压在 v3 并进了车模区, 但 show 里写 "tires" 仍然被接受(忽略即可)。
@@ -121,6 +121,7 @@ const KEY_NAMES = {
   last_result: "最近指令回执", session: "会话状态",
   charge_start: "预约充电-开始", charge_end: "预约充电-结束",
   tracker: "车辆位置", parking: "驻车照片", raw_cmd: "原始指令(cmdId)",
+  car_picture: "车辆外观图",
 };
 
 /* 已知键 → entity_id 拼音后缀(HA 会把中文名转成拼音实体 id; 兜底的第二道猜测) */
@@ -157,6 +158,7 @@ const KEY_SUFFIX = {
   charge_start: "yu_yue_chong_dian_kai_shi", charge_end: "yu_yue_chong_dian_jie_shu",
   tracker: "che_liang_wei_zhi", parking: "zhu_che_zhao_pian",
   raw_cmd: "yuan_shi_zhi_ling_cmdid",
+  car_picture: "che_liang_wai_guan_tu",
 };
 
 /* 键表按"名字/后缀从长到短"排序: 兜底猜测时先认长名, 免得 续航 抢走 燃油续航 的实体 */
@@ -210,11 +212,9 @@ const TIRE_DEFS = [["tire_fl", "左前"], ["tire_fr", "右前"], ["tire_rl", "�
 /* 低于它就在标题行给红色"胎压偏低"胶囊(固定阈值, 与 tire_range 无关; 正常不显示) */
 const LOW_TIRE_BAR = 2.0;
 
-/* ── 车模图(按车型的官方外观图) ──
- * 设备注册表的 `model` 字段(集成里 = 车辆 car_type)决定用哪张; 素材是官方 App 自带的
- * 3/4 视角外观渲染(淡显风格, 与原来的简笔画观感一致), 360×210 透明底, 由集成注册为
- * 静态路径 /leapmotor-card/carimg/。命中才用图; 未命中/加载失败 → 回退自绘 CAR_SVG(见 _carImg)。
- * 覆盖: B10 / C01 / C10 / C11 / C16 / S(01) / T(03); 其余车型走回退。 */
+/* ── 车模图(按车型) ──
+ * 所有车型优先使用按 VIN 获取的官方车辆外观图(image.car_picture); 加载失败时使用
+ * 集成内置的官方 App 外观图, 未收录车型或内置图也加载失败时回退自绘 CAR_SVG。 */
 const CAR_IMG = {
   B10: "b10", C01: "c01", C10: "c10", C11: "c11", C16: "c16", T03: "t",
 };
@@ -223,6 +223,7 @@ const CAR_IMG = {
  * 其余是 3/4 视角或自绘简笔画, 沿用旧的"左上=左前"四角排布。 */
 const CAR_IMG_TOP = { c10: 1, c01: 1, t: 1 };
 const CAR_IMG_BASE = "/leapmotor-card/carimg/";
+const CAR_IMG_RETRY_MS = 5 * 60 * 1000;
 
 /* ── 小工具(不引入任何依赖) ── */
 
@@ -390,6 +391,8 @@ this._index = {};            // translation_key → entity_id
     // 车模图(按车型): 与 _locBg 同一套"先探针再上屏"的缓存; 探不过就回退自绘 SVG
     this._carImgSrc = "";        // 当前在验证的地址
     this._carImgOk = "";         // 验证结果(ok / bad)
+    this._carImgRetryAt = 0;     // 官方图片失败后按退避间隔重试
+    this._carImgApiFailedSrc = ""; // 记录失败的官方图片地址, 到时重试
     this._narrow = false;        // 卡片宽度 < 420px(两卡改上下堆叠)
     this._ro = null;
   }
@@ -1129,36 +1132,59 @@ this._index = {};            // translation_key → entity_id
     return h;
   }
 
-  /** 车模主图: 命中车型且有官方外观图 → 用图, 否则回退自绘 SVG。
+  /** 车模主图: 优先用官方 VIN 图片, 失败后依次回退内置车型图和自绘 SVG。
    *
-   * 与 `_locBg`(位置卡背景)同一套"先探针、确认能加载才上屏"的做法 ——
-   * 直接 <img> 失败会留裂图/闪一下; 探针失败就永远走 SVG, 不打扰。
+   * 与 `_locBg`(位置卡背景)同一套"先探针、确认能加载才上屏"的做法 —— 直接 <img>
+   * 失败会留裂图/闪一下; 官方图失败后会暂用内置图并定时重试。
    */
   _carImg() {
-    const slug = CAR_IMG[String(this._model || "").trim().toUpperCase()];
-    if (!slug) {
+    const model = String(this._model || "").trim().toUpperCase();
+    const slug = CAR_IMG[model];
+    const officialSrc = this._attr("car_picture", "entity_picture") || "";
+    const fallbackSrc = slug ? CAR_IMG_BASE + slug + ".png" : "";
+    const apiFailed = officialSrc && this._carImgApiFailedSrc === officialSrc &&
+      Date.now() < this._carImgRetryAt;
+    const src = officialSrc && !apiFailed ? officialSrc : fallbackSrc;
+    if (!src) {
       this._carImgSrc = "";
       this._carImgOk = "";
       return CAR_SVG;
     }
-    const src = CAR_IMG_BASE + slug + ".png";
+    let probeNeeded = src !== this._carImgSrc;
     if (src === this._carImgSrc && this._carImgOk) {
-      return this._carImgOk === "ok"
-        ? '<img class="carImg" src="' + esc(src) + '" alt="车辆外观">' : CAR_SVG;
+      if (this._carImgOk === "ok") {
+        return '<img class="carImg" src="' + esc(src) + '" alt="车辆外观">';
+      }
+      return CAR_SVG;
     }
     if (src !== this._carImgSrc) {
       this._carImgSrc = src;
       this._carImgOk = "";
+      this._carImgRetryAt = 0;
+      probeNeeded = true;
+    }
+    if (probeNeeded) {
       const self = this;
       const probe = new Image();
       probe.onload = function () {
         if (self._carImgSrc !== src) return;
         self._carImgOk = "ok";
+        if (src === officialSrc) {
+          self._carImgApiFailedSrc = "";
+          self._carImgRetryAt = 0;
+        }
         self._scheduleRender();
       };
       probe.onerror = function () {
         if (self._carImgSrc !== src) return;
-        self._carImgOk = "bad";
+        if (src === officialSrc) {
+          self._carImgApiFailedSrc = src;
+          self._carImgRetryAt = Date.now() + CAR_IMG_RETRY_MS;
+          self._carImgSrc = "";
+          self._carImgOk = "";
+        } else {
+          self._carImgOk = "bad";
+        }
         self._scheduleRender();
       };
       probe.src = src;
