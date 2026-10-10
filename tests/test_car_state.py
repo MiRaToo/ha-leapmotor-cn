@@ -314,6 +314,23 @@ def test_charge_plugged_whitelist_excludes_5():
     assert state({}).charge_plugged is None
 
 
+# ── 行驶护栏: 行驶中一律不算充电/插枪(C16 反馈"行驶中踩电门显示充电中") ──
+def test_driving_never_charging_even_if_code_says_1():
+    """某些车型在行驶中踩电门时车端会把 1149 瞬时报成 1/2 —— 物理上行驶中不可能充电,
+    所以只要车辆在行驶(D/R 挡或车速 > 0), charging / charge_plugged 都必须为 False。"""
+    # 档位在 D(1010=1) → 行驶中
+    assert state({"1149": 1, "1010": 1}).charging is False
+    assert state({"1149": 1, "1010": 1}).charge_plugged is False
+    # 车速 > 0 (没档位) → 行驶中
+    assert state({"1149": 1, "1319": 45}).charging is False
+    assert state({"1149": 2, "1319": 45}).charge_plugged is False
+    # R 挡(1010=3) 同样算行驶
+    assert state({"1149": 1, "1010": 3, "1319": 5}).charging is False
+    # 对照: 停在 P(1010=0)、真插着枪充电 → 仍判为充电中(护栏不误伤正常充电)
+    assert state({"1149": 1, "1010": 0, "1319": 0}).charging is True
+    assert state({"1149": 1, "1010": 0, "1319": 0}).charge_plugged is True
+
+
 def test_charging_state_maps_codes_to_three_states():
     """三态映射(传感器用): 1→charging / {2,3,4}→plugged / {0,5}→unplugged。"""
     for code, want in ((1, "charging"), (2, "plugged"), (3, "plugged"), (4, "plugged"),

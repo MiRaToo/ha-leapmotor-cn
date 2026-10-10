@@ -902,7 +902,15 @@ class CarState:
           3 / 4 = 已插枪(预约充电等待等; 见 EU 版同名项目的实测注释)
           5 = **非连接**(真机: 没插枪时与 0 交替出现, 详见 `charge_plugged`)
         除 1 以外都不算充电中 —— 即便插着枪, 只要车端没报"充电中"就不误报。
+
+        ★ 行驶护栏(修 C16 反馈的"行驶中充电中"): 物理上行驶中不可能充电, 但**某些车型
+        在行驶中踩电门(能量回收/驱动电流变化)时, 车端会把 `charge_connection` 瞬时报成 1**
+        (疑似该信号在部分车型上混入了"能量流动"语义)。因此判据再加一条硬约束:
+        **只要车辆正在行驶(D/R 挡或车速 > 0)一律返回 False**, 无论 1149 报什么。
+        这样即便车端偶发脏帧, 也不会在行驶中凭空多出一颗"充电中"。
         """
+        if self.vehicle_state == "driving":
+            return False
         conn = self.signals.get("charge_connection")
         if conn is None:
             return None
@@ -926,7 +934,11 @@ class CarState:
         取值语义(白名单): 1=充电中(必然插着) / 2=已插枪待机(实测出现过) /
         3、4=已插枪(预约充电等待等, 见 EU 实测) / 0=未插枪 / 5=非连接(见上)。
         未知值一律**不算插枪**: 误报会凭空多出一颗"已插枪"胶囊, 漏报只是不显示 —— 宁可漏。
+        ★ 行驶护栏: 行驶中物理上不可能插着枪, 但个别车型在行驶中会瞬时把 1149 报成 1/2,
+        与 `charging` 同样加"行驶中一律 False"的硬约束, 免得行驶中冒出"已插枪未充电"胶囊。
         """
+        if self.vehicle_state == "driving":
+            return False
         conn = self.signals.get("charge_connection")
         if conn is None:
             return None

@@ -4,13 +4,13 @@
 
 # ha-leapmotor-cn
 
-**零跑汽车 Home Assistant 集成** · **v0.2.1**
+**零跑汽车 Home Assistant 集成** · **v0.2.2**
 
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.12+-blue?logo=python&logoColor=white)
 ![Home Assistant](https://img.shields.io/badge/Home%20Assistant-%E8%87%AA%E5%AE%9A%E4%B9%89%E9%9B%86%E6%88%90-41BDF5?logo=homeassistant&logoColor=white)
 ![HACS](https://img.shields.io/badge/HACS-%E8%87%AA%E5%AE%9A%E4%B9%89%E4%BB%93%E5%BA%93-41BDF5)
-![version](https://img.shields.io/badge/version-v0.2.1-blue)
+![version](https://img.shields.io/badge/version-v0.2.2-blue)
 
 **非官方的集成** —— **在 Home Assistant 里使用你的零跑汽车**：远程车控、实时车况、行程记录与能耗统计，
 全部以 **HA 原生实体**呈现，并自带一套控车相关的**前端卡片**。

@@ -111,6 +111,17 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._expiry_warned = False
         self._notices_cleared = False           # 本轮健康期是否已清过历史通知(避免每轮都调服务)
         self._plug_energy = {}                   # 增程车的电耗/油耗(见 _refresh_heavy)
+        # ── 重数据快照(里程/能耗/配置/照片地址)──
+        # 这些数据"变化慢、拉取重", 且**云端偶发取不到**。两处用它:
+        #   1) 取不到时**保留上一份**(不要把好数据洗成 unknown);
+        #   2) 落盘持久化 → HA 重启后先亮出上次的值, 不必等第二轮重数据周期(否则里程/能耗
+        #      传感器在重启后有一段时间是 unknown —— 用户反馈的"重启后实体未知")。
+        self._config: dict = {}
+        self._charge_plan: dict = {}
+        self._mileage: dict = {}
+        self._energy: dict = {}
+        self._heavy_store = None                 # 懒建 Store(见 async_load_heavy)
+        self._heavy_loaded = False
         self._last_heavy = 0.0                  # 上次拉"不常变"数据(配置/里程/能耗)的时刻
         # ── 驻车照片(只在泊车时拍一次, 之后请求拿回同一张)──
         self._photo_upload_ms = 0               # 上次取到的照片上传时刻(判"有没有新照片")
@@ -158,6 +169,46 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.session.operate_pwd_mode = str(
             self.entry.options.get(CONF_OPERATE_PWD_MODE) or DEFAULT_PWD_MODE
         )
+
+    # ── 重数据快照的持久化(重启后先亮上次的值, 免一段时间 unknown)──
+    async def async_load_heavy(self) -> None:
+        """载入上次的里程/能耗/配置/照片地址快照(在首轮刷新前调用)。失败静默。"""
+        if self._heavy_loaded:
+            return
+        self._heavy_loaded = True
+        try:
+            from homeassistant.helpers.storage import Store
+            if self._heavy_store is None:
+                self._heavy_store = Store(self.hass, 1, f"leapmotor_{self.vin}_heavy")
+            data = await self._heavy_store.async_load() or {}
+            self._config = data.get("config") or self._config or {}
+            self._charge_plan = data.get("charge_plan") or {}
+            self._mileage = data.get("mileage") or {}
+            self._energy = data.get("energy") or {}
+            self._plug_energy = data.get("plug_energy") or {}
+            self.parking_url = data.get("parking_url") or self.parking_url or ""
+            self._photo_upload_ms_acc = data.get("photo_upload_ms") or 0
+        except Exception as err:  # noqa: BLE001
+            log.debug("载入重数据快照失败(忽略): %s", err)
+
+    def _save_heavy(self) -> None:
+        """把重数据快照延迟落盘(有变化才写; 失败静默 —— 它只是优化, 不影响主流程)。"""
+        try:
+            if self._heavy_store is None:
+                from homeassistant.helpers.storage import Store
+                self._heavy_store = Store(self.hass, 1, f"leapmotor_{self.vin}_heavy")
+            self._heavy_store.async_delay_save(
+                lambda: {
+                    "config": self._config,
+                    "charge_plan": self._charge_plan,
+                    "mileage": self._mileage,
+                    "energy": self._energy,
+                    "plug_energy": self._plug_energy,
+                    "parking_url": self.parking_url,
+                    "photo_upload_ms": self._photo_upload_ms_acc,
+                }, 30)
+        except Exception as err:  # noqa: BLE001
+            log.debug("保存重数据快照失败(忽略): %s", err)
 
     # ── 数据刷新 ──
     async def _async_update_data(self) -> dict[str, Any]:
@@ -401,12 +452,21 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         energy = results[1] or {}
         mileage_raw = results[2] or {}
         if len(results) > 3:
-            self._plug_energy = results[3] or {}
+            plug = results[3] or {}
+            if plug:
+                self._plug_energy = plug
 
-        self._config = config
-        self._charge_plan = ((config.get("config") or {}) if isinstance(config, dict) else {}).get("3") or {}
-        self._mileage = {**mileage_raw, "mileage7": mileage_raw}
-        self._energy = energy
+        # ⚠️ 只在**取到**时才覆盖: 每个 `_call` 在异常时返回 `{}` —— 无条件赋值会把上一次
+        # 的好数据洗成空, 于是「百公里能耗/交付天数/总里程」等传感器在云端偶发抽风时变成
+        # unknown(用户反馈的"某些时候实体未知")。保留上一份, 下一轮自然会补上。
+        if config:
+            self._config = config
+            self._charge_plan = ((config.get("config") or {}) if isinstance(config, dict) else {}).get("3") or {}
+        if mileage_raw:
+            self._mileage = {**mileage_raw, "mileage7": mileage_raw}
+        if energy:
+            self._energy = energy
+        self._save_heavy()          # 快照落盘(重启后能先亮出上次的值)
 
         # ── 官方逐日能耗(getEC): 缓慢补拉缺的日子 ──
         # 刚升级时缓存是空的, 卡片按需路径会补大头; 这里每轮重数据周期再补几天兜底,
@@ -482,6 +542,7 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._photo_retry_until = now + PHOTO_RETRY_WINDOW_SECONDS
         if st is not None:
             self._photo_odo = st.get("odometer")
+        self._save_heavy()      # 照片地址/uploadTime 也进快照(重启后直接亮出上次的地址)
 
     def force_photo_refresh(self) -> None:
         """「刷新车况」按钮: 强制重取一次照片与重数据(不管节流)。"""

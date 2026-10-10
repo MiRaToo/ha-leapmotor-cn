@@ -18,6 +18,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 
+from .cardfiles import (CARD_URL_LOCAL, CARD_URL_STATIC, card_url_file_name,
+                        copy_tree, missing_files, MIRROR_DIR_NAME)
 from .const import DOMAIN, DEFAULT_POLL_SECONDS, PLATFORMS
 from .coordinator import LeapmotorCoordinator
 
@@ -29,19 +31,53 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 # 前端模块: 把 www/ 下的五张卡片注册成全局卡片(用户无需手动放 www/ 或配资源)。
 # CARD_VERSION 与各自 JS 文件头里的同名常量保持一致(改 JS 记得一起升, 好让浏览器拿到新文件)。
-CARD_VERSION = "1.6.1"            # leapmotor-map.js
-TRIPS_CARD_VERSION = "1.1.6"      # leapmotor-trips.js
-CONTROL_CARD_VERSION = "1.7.2"    # leapmotor-control.js
-ENERGY_CARD_VERSION = "1.2.2"     # leapmotor-energy.js
-LASTWEEK_CARD_VERSION = "1.0.1"   # leapmotor-lastweek.js
+CARD_VERSION = "1.6.6"            # leapmotor-map.js
+TRIPS_CARD_VERSION = "1.4.5"      # leapmotor-trips.js
+CONTROL_CARD_VERSION = "1.8.6"    # leapmotor-control.js
+ENERGY_CARD_VERSION = "1.3.1"     # leapmotor-energy.js
+LASTWEEK_CARD_VERSION = "1.1.5"   # leapmotor-lastweek.js
 _CARDS = (
-    ("leapmotor-map.js", "/leapmotor-card/leapmotor-map.js", CARD_VERSION),
-    ("leapmotor-trips.js", "/leapmotor-card/leapmotor-trips.js", TRIPS_CARD_VERSION),
-    ("leapmotor-control.js", "/leapmotor-card/leapmotor-control.js", CONTROL_CARD_VERSION),
-    ("leapmotor-energy.js", "/leapmotor-card/leapmotor-energy.js", ENERGY_CARD_VERSION),
-    ("leapmotor-lastweek.js", "/leapmotor-card/leapmotor-lastweek.js", LASTWEEK_CARD_VERSION),
+    ("leapmotor-map.js", CARD_VERSION),
+    ("leapmotor-trips.js", TRIPS_CARD_VERSION),
+    ("leapmotor-control.js", CONTROL_CARD_VERSION),
+    ("leapmotor-energy.js", ENERGY_CARD_VERSION),
+    ("leapmotor-lastweek.js", LASTWEEK_CARD_VERSION),
 )
 _FRONTEND_KEY = "_frontend_registered"
+
+# ── 卡片"可启动窗口"投递 ──────────────────────────────
+# 症状: 卡片"经常"显示「配置错误 / Custom element doesn't exist」, 刷新后又正常。
+# 根因(实测 + 上游 issue): 集成的静态路径 `/leapmotor-card/` 要等集成 setup 才注册,
+# 而 HA 重启后前端恢复连接会自动刷新页面 —— 这个窗口里这些 URL 返回 404, 模块加载失败;
+# 前端的资源加载是 fire-and-forget(官方明确不阻塞 UI), 失败后本次页面不再重试 ——
+# 卡片就停在「配置错误」, 必须手动刷新才恢复。
+# 修法: 把卡片**镜像**到 config/www/leapmotor-card/(即核心早期注册、内容常驻磁盘的
+# /local 静态目录) —— 镜像存在后, 重启窗口内也能取到文件, 404 窗口被消除。
+# 首次写入镜像的那次启动仍先用旧路径(原因见 _mirror_cards_to_www), 下一次启动起生效;
+# 镜像失败(www 不可写等)永远退回 /leapmotor-card/, 行为与以前一致。
+# 说明见 cardfiles.py; 上游追踪: home-assistant/frontend#52570(竞态), core#181190(404 长缓存)。
+
+
+async def _mirror_cards_to_www(hass: HomeAssistant) -> bool:
+    """把卡片镜像到 config/www/leapmotor-card/, 返回"本次启动是否可以用 /local URL"。
+
+    判定规则: **镜像在本次写入前已完整存在** → True(用 /local); 否则 False(本次沿用
+    /leapmotor-card/, 但镜像已写好, 下次启动即生效)。
+    为什么"首次写入的那次不切": `/local` 的 404 响应带 31 天强缓存(HA 2026.9 已知缺陷,
+    上游 core#181190)。若上一轮曾在 .storage 里登记过 /local 资源、而镜像又被外部删掉,
+    这次启动到集成 setup 之间会有一段窗口, 前端按旧资源表请求 /local 拿到 404 并被长期
+    记住 —— 先判"本来就在"才切, 可以把这类陈旧引用的窗口彻底避开。
+    """
+    src = Path(__file__).parent / "www"
+    names = [n for n, _ver in _CARDS]
+    dst = Path(hass.config.path("www")) / MIRROR_DIR_NAME
+    complete_before = not missing_files(dst, names)   # 写盘前先判"是不是本来就有"
+    try:
+        await hass.async_add_executor_job(copy_tree, src, dst)
+    except Exception as err:  # noqa: BLE001
+        log.warning("卡片镜像到 www 失败(退回集成静态路径): %s", err)
+        return False
+    return complete_before
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -96,31 +132,40 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         from homeassistant.components.http import StaticPathConfig
 
         base = Path(__file__).parent / "www"
+        # ① 集成自带静态路径: 始终注册 —— carimg 一直从这里取; 同时兜底"镜像失败/旧缓存页面"。
         await hass.http.async_register_static_paths(
-            [StaticPathConfig(url, str(base / name), cache_headers=False)
-             for name, url, _ver in _CARDS]
+            [StaticPathConfig(CARD_URL_STATIC + name, str(base / name), cache_headers=False)
+             for name, _ver in _CARDS]
             # 车模图(按车型的官方外观图, 控制卡用): 目录映射, **不要**放进 _CARDS
             # —— 上面那个循环会把每一项都当 JS 模块注入首页。
-            + [StaticPathConfig("/leapmotor-card/carimg", str(base / "carimg"),
+            + [StaticPathConfig(CARD_URL_STATIC + "carimg", str(base / "carimg"),
                                 cache_headers=False)]
         )
-        for _name, url, ver in _CARDS:
-            versioned = f"{url}?v={ver}"
+        # ② 镜像到 /local(把卡片文件常驻到核心早期注册的 www 目录, 消除重启窗口内的 404,
+        #    见 _mirror_cards_to_www 的说明); 镜像失败则退回 ① 的路径, 与以前一致。
+        prefix = CARD_URL_LOCAL if await _mirror_cards_to_www(hass) else CARD_URL_STATIC
+        # ③ 两个注册面(首页 extra module + 仪表盘资源)统一用镜像后的 URL。
+        for name, ver in _CARDS:
+            versioned = f"{prefix}{name}?v={ver}"
             add_extra_js_url(hass, versioned)
             await _ensure_lovelace_resource(hass, versioned)
-            log.debug("已注册卡片 %s", url)
+            log.debug("已注册卡片 %s", versioned)
     except Exception as err:  # noqa: BLE001
         log.warning("前端卡片注册失败(不影响控车): %s", err)
     return True
 
 
 async def _ensure_lovelace_resource(hass: HomeAssistant, url: str) -> None:
-    """把卡片同时登记成仪表盘"资源"。
+    """把卡片同时登记成仪表盘"资源"(幂等; 按**文件名**匹配 → 旧 URL 直接迁移)。
 
-    只靠 `add_extra_js_url` 有个坑:那行 import 是写进首页 HTML 的, 浏览器若缓存了
-    旧首页(或用了缓存很凶的 App), 卡片模块就永远不会被加载 —— 界面上表现为
-    "配置错误 / Custom element doesn't exist: leapmotor-map"。
-    资源列表是前端每次渲染仪表盘时读取的, 因此这条路不受首页缓存影响。
+    为什么还要这条路: `add_extra_js_url` 那行 import 是写进首页 HTML 的, 浏览器若缓存了
+    旧首页(或用了缓存很凶的 App), 卡片模块永远不会被加载 —— 界面上表现为
+    "配置错误 / Custom element doesn't exist"。资源列表是前端每次渲染仪表盘时读取的,
+    因此这条路不受首页缓存影响。
+
+    匹配规则: 按 URL 文件名匹配而不是完整 URL —— 这样"路径前缀 + 版本号"
+    任一变化都只是**更新同一条**; 同名重复条目(历史遗留)会被顺手删掉, 避免同款卡片被
+    加载两次。
     """
     try:
         from homeassistant.components.lovelace import LOVELACE_DATA
@@ -132,11 +177,16 @@ async def _ensure_lovelace_resource(hass: HomeAssistant, url: str) -> None:
             return
         if not getattr(resources, "loaded", True):
             await resources.async_load()          # 资源是懒加载的, 先拉一次
-        for item in resources.async_items():
-            if str(item.get("url", "")).split("?")[0] == url.split("?")[0]:
-                if item.get("url") != url:        # 版本变了就更新, 避免旧 URL 被缓存
-                    await resources.async_update_item(item["id"], {"url": url})
-                return
+        name = card_url_file_name(url)
+        matches = [item for item in resources.async_items()
+                   if card_url_file_name(item.get("url", "")) == name]
+        if matches:
+            head = matches[0]
+            if head.get("url") != url:            # 路径/版本变了 → 更新同一条
+                await resources.async_update_item(head["id"], {"url": url})
+            for extra in matches[1:]:             # 同名重复条目 → 清掉
+                await resources.async_delete_item(extra["id"])
+            return
         await resources.async_create_item({"res_type": "module", "url": url})
         log.debug("已登记仪表盘资源 %s", url)
     except Exception as err:  # noqa: BLE001
@@ -145,6 +195,9 @@ async def _ensure_lovelace_resource(hass: HomeAssistant, url: str) -> None:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = LeapmotorCoordinator(hass, entry)
+    # 先亮出上次的里程/能耗/配置/照片地址快照: HA 重启后这些"变化慢"的传感器不该有一段时间
+    # 是 unknown(首轮是轻量刷新, 重数据要到下一轮才拉; 见 light_first_refresh)。
+    await coordinator.async_load_heavy()
     # 首轮只拉车况帧: 里程/能耗/配置/照片留到下一个轮询周期。
     # 实测教训: 网络慢时首轮那 10 来个请求(车况 + 换 token 重试 + 4 个重数据 + 照片)
     # 每个都可能等满 20 秒超时, 把 HA 启动拖了 4 分钟; 而启动其实只需要"车况能用"。

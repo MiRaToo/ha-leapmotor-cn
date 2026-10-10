@@ -31,11 +31,14 @@
  *   actions   四个圆形动作按钮: 解锁·上锁 / 后备箱 / 车窗(弹气泡选四档) / 遮阳帘
  *             (电池预热与刷新车况分别挪进充电块和右上角, 功能一个不少)
  *   climate   左半空调卡: 大字车内温度 + 「车内」小角标 + 风扇图标(开关);
- *             展开是居中的温度行(数字位置恒定; ± 只在开着时显示) + 一排**圆形**模式图标按钮
+ *             温度行与一排**圆形**模式图标按钮**常态展开**(不再点击收起/展开);
+ *             数字位置恒定, ± 只在开着时显示
  *   location  右半位置卡: 区域名(不在区域就显示「外出」)+ 坐标 + 更新时间, 背景是驻车照片;
  *             底部「驻车照片」「鸣笛寻车」胶囊 + 一个 ⓘ
  *   charging  充电(上限滑条 / 预约开关 / 起止时间 / 健康充电 / 充电状态 / 电池预热)
- *   comfort   座椅与加热: 座舱俯视模型(方向盘/左右后视镜/前排/二排/三排, 档位用图标表示)
+ *   comfort   座椅与加热: **弹窗**显示(浮在卡片上层)。座舱俯视**位图底图**(5座/7座 × 浅色/深色,
+ *             见 www/carimg/cabinN_theme.jpg, 已裁掉多余留白 + 边缘渐隐)+ 方向盘/各排座椅控件按坐标叠加;
+ *             后视镜加热图标放在两侧后视镜位置(稍靠内); 状态只用颜色: 加热=红 / 通风=蓝且风扇转动;
  *   seats     后排座椅 —— v4 起并进上面的座舱模型, 这里只留面板位(兼容 show 配置)
  *   fuel      燃油(增程车才有)
  * charging / comfort / fuel 三个"常用块"标题行可点折叠, **默认全部收起**,
@@ -81,7 +84,7 @@
  * 用户不需要把它拷到 www/ 或手配资源。
  */
 
-const CARD_VERSION = "1.7.2";
+const CARD_VERSION = "1.8.6";
 
 /* 区块顺序(show 配置按这个顺序渲染; 缺键的区块自动隐藏)
  * 注意: 这里没有 tires —— 胎压在 v3 并进了车模区, 但 show 里写 "tires" 仍然被接受(忽略即可)。
@@ -191,6 +194,16 @@ const CHARGE_TIP = {
   unplugged: "充电枪未插",
 };
 
+/* 座舱俯视底图(内联 SVG): 通用布局, 头朝上。轮廓/座椅/方向盘的配色走卡片里的 CSS 变量
+ * (座椅用 --secondary-background-color 等) —— 因为要**内联**进 shadow DOM, 变量才能被继承并
+ * 跟随 HA 主题(作为 background-image 引外部 svg 时变量取不到)。各 <g> 带 id, 缺排时用 CSS 隐藏。 */
+/* 座舱俯视**位图**底图: 5座/7座 × 浅色/深色 四张(www/carimg/cabinN_theme.jpg),
+ * 由 _cabinImg() 按"HA 主题 + 是否 7 座"挑选。控件按下面的百分位坐标叠到各座位上。 */
+/* 座舱俯视 **位图** 底图: 5座/7座 × 浅色/深色 四张(www/carimg/, 已裁掉多余留白),
+ * 由 _cabin() 按"HA 主题 + 是否 7 座"挑图。每张自带 ar(宽高比) 与 pos(控件百分位坐标;
+ * 坐标是**裁图后**重新换算的, 随裁剪而变化, 所以四张各存一份)。 */
+const CABIN_IMG = {"5":{"light":{"src":"cabin5_light.jpg","ar":0.6802,"pos":{"steer":[25.0,27.0],"seat-front-left":[30.0,50.0],"seat-front-right":[70.0,50.0],"seat-rear-1":[30.0,82.0],"seat-rear-3":[70.0,82.0]}},"dark":{"src":"cabin5_dark.jpg","ar":0.6765,"pos":{"steer":[19.6,24.1],"seat-front-left":[25.7,49.3],"seat-front-right":[74.0,49.3],"seat-rear-1":[25.7,84.3],"seat-rear-3":[74.0,84.3]}}},"7":{"light":{"src":"cabin7_light.jpg","ar":0.5345,"pos":{"steer":[15.2,20.3],"seat-front-left":[21.0,36.9],"seat-front-right":[79.0,36.9],"seat-rear-1":[21.0,63.9],"seat-rear-3":[79.0,63.9],"seat-third-left":[21.0,88.8],"seat-third-right":[79.0,88.8]}},"dark":{"src":"cabin7_dark.jpg","ar":0.5135,"pos":{"steer":[12.1,19.1],"seat-front-left":[18.4,36.4],"seat-front-right":[81.4,36.4],"seat-rear-1":[18.4,64.6],"seat-rear-3":[81.4,64.6],"seat-third-left":[18.4,90.6],"seat-third-right":[81.4,90.6]}}}};
+
 /* 座舱俯视模型里的座位: 每个座位最多两个功能(加热 / 通风), 各自 0~3 档。
  * row 决定放在第几排, pos 决定左右, label 是图标下面那行小字的名字;
  * 三排车型只有加热(vent 留空), 缺键的座位/整排都不渲染(纯电 C10 只有前排)。 */
@@ -222,7 +235,10 @@ const CAR_IMG = {
  * 左前=左下 / 右前=左上 / 左后=右下 / 右后=右上(见 _tireCorners)。
  * 其余是 3/4 视角或自绘简笔画, 沿用旧的"左上=左前"四角排布。 */
 const CAR_IMG_TOP = { c10: 1, c01: 1, t: 1 };
-const CAR_IMG_BASE = "/leapmotor-card/carimg/";
+/* 车模图与卡片同一目录(集成的 www/ 被整目录暴露: /leapmotor-card/ 或 /local/leapmotor-card/)。
+   用**本模块自身的加载地址**推 base —— 这样卡片从哪个前缀加载, 车模图就走哪个前缀,
+   不会出现"卡片从 /local 来、车模图还去 /leapmotor-card 拿"的错配。 */
+const CAR_IMG_BASE = new URL("carimg/", import.meta.url).href;
 
 /* ── 小工具(不引入任何依赖) ── */
 
@@ -940,6 +956,7 @@ this._index = {};            // translation_key → entity_id
     this._renderComfort();
     this._renderSeats();
     this._renderCsDetail();
+    this._renderSeatModal();
     this._renderFuel();
     this._renderPhoto();
     this._renderToast();
@@ -1369,13 +1386,12 @@ this._index = {};            // translation_key → entity_id
     const interior = this._num("interior_temp") != null
       ? this._num("interior_temp")
       : (a.current_temperature != null ? Number(a.current_temperature) : null);
-    const open = this._open.climate;
 
     // v1.6 收起态: 不再摆"开/关/制冷"大字, 只留一个简洁的温度 + 角标胶囊标明它是
-    // **车内实测温度**(车速/阳光变化下它最直观; 设定温度在展开区里改)。
+    // **车内实测温度**。温度与模式**常态展开**(不再点击收起/展开)。
     const hasInterior = interior != null && Number.isFinite(interior);
     let h = '<section class="half sec">' +
-      '<div class="halfH" data-act="acc" title="点击展开温度与模式">' +
+      '<div class="halfH">' +
       '<div class="halfId"><span class="acTemp">' +
       (hasInterior ? fmtNum(interior, 1) : "—") + "<i>℃</i>" +
       '<span class="acTag">车内</span></span>' +
@@ -1387,7 +1403,7 @@ this._index = {};            // translation_key → entity_id
       '<ha-icon class="ico" icon="mdi:fan"></ha-icon></button>' +
       "</div>";
 
-    if (open) {
+    {
       const t = Number(a.temperature);
       const stepAttr = Number(a.target_temp_step);
       const step = Number.isFinite(stepAttr) && stepAttr > 0 ? stepAttr : 1;
@@ -1529,10 +1545,20 @@ this._index = {};            // translation_key → entity_id
       ["battery", "charging_state", "charge_limit", "charge_book", "charge_start",
         "charge_end", "healthy_charge", "preheat_on", "preheat_off"].some((k) => this._entId(k));
     if (chg) return this._setPanel("csdetail", '<section class="sec">' + this._chargeBody() + "</section>");
-    if (this._secOpen("comfort") && this._vis("comfort") && this._cabinAny()) {
-      return this._setPanel("csdetail", '<section class="sec"><div class="secB">' + this._cabin() + "</div></section>");
-    }
+    // 座椅与加热的正文改成**弹窗**(见 _renderSeatModal), 不再铺在这块跨整行容器里
     return this._setPanel("csdetail", "");
+  }
+
+  /** 座椅与加热的正文: 以**弹窗**浮在卡片上层(不再内联展开)。 */
+  _renderSeatModal() {
+    if (!this._smaskEl) return;
+    const open = this._secOpen("comfort") && this._vis("comfort") && this._cabinAny();
+    this._smaskEl.classList.toggle("on", !!open);
+    this._smodalEl.classList.toggle("on", !!open);
+    if (!open) { this._smbodyEl.innerHTML = ""; this._smMirEl.innerHTML = ""; return; }
+    // 后视镜加热按钮已放进底图的后视镜位置(见 _cabin), 标题行这里不再放
+    if (this._smMirEl) this._smMirEl.innerHTML = "";
+    this._smbodyEl.innerHTML = '<div class="secB">' + this._cabin() + "</div>";
   }
 
   /** 充电详情正文(顺序照官方 App: 健康充电 → 充电上限 → 预约 → 起止时间 → 电池预热) */
@@ -1663,35 +1689,70 @@ this._index = {};            // translation_key → entity_id
   }
 
   /**
-   * 座舱俯视图(官方 App 那种): 方向盘在上中, 左右后视镜在左上/右上角,
-   * 前排左右各一个(中间是中央扶手位), 下面依次是二排、三排。
-   * 缺键的座位/整排都不渲染 —— 纯电 C10 只有前排, C16 才有二/三排。
+   * 座舱俯视图(官方 App 那种): 内联 SVG 底图(车头朝上: 方向盘/后视镜/前排/二排/三排) 作背景,
+   * 各排的加热/通风控件**按底图坐标绝对定位**叠在对应座位上。
+   * 缺键的排/座位不渲染控件, 并用类名把那几处底图也隐去(纯电 C10 只有前排, C16 才有二/三排)。
    */
   _cabin() {
-    const stId = this._entId("steering_heat");
-    const mirId = this._entId("mirror_heat");
-    let h = '<div class="cabin">';
-    // ── 顶部: 左后视镜 / 方向盘 / 右后视镜 ──
-    if (mirId || stId) {
-      h += '<div class="cabRow top">';
-      if (mirId) h += this._cabSwitch("mirror_heat", "mirror", "后视镜加热", "左后视镜");
-      h += '<div class="cabMid">' + (stId ? this._cabSwitch("steering_heat", "steering", "方向盘加热", "方向盘") : "") + "</div>";
-      if (mirId) h += this._cabSwitch("mirror_heat", "mirror", "后视镜加热", "右后视镜");
-      h += "</div>";
+    const seats = this._is7Seat() ? "7" : "5";
+    const dark = !!(this._hass && this._hass.themes && this._hass.themes.darkMode);
+    const set = CABIN_IMG[seats] || CABIN_IMG["5"];
+    const cfg = set[dark ? "dark" : "light"] || set.light;
+    const pos = cfg.pos;
+    const url = CAR_IMG_BASE + cfg.src;
+    let h = '<div class="cabin" style="aspect-ratio:' + cfg.ar + '">' +
+      '<div class="cabMap">' +
+      '<div class="cabBlur" style="background-image:url(' + url + ')"></div>' +
+      '<img class="cabBg" alt="座舱" src="' + esc(url) + '">' +
+      '<div class="cabFade"></div></div>';
+    const at = (key, inner) => {
+      const q = pos[key];
+      if (!q || !inner) return "";
+      return '<div class="cabPos" style="left:' + q[0] + "%;top:" + q[1] + '%">' + inner + "</div>";
+    };
+    // 方向盘: 底图上就有方向盘, 按钮叠在它上面; 后视镜只保留图标(放弹窗标题行, 见 _renderSeatModal)
+    if (this._entId("steering_heat")) h += at("steer", this._cabSwitch("steering_heat", "steering", "方向盘加热", "方向盘"));
+    // 后视镜加热: 放在对应后视镜位置(不用后视镜图片, 所以稍靠内), 左右各一个图标
+    if (this._entId("mirror_heat")) {
+      h += '<div class="cabPos" style="left:11%;top:13%">' + this._cabIconBtn("mirror_heat", "mirror", "后视镜加热") + "</div>";
+      h += '<div class="cabPos" style="left:89%;top:13%">' + this._cabIconBtn("mirror_heat", "mirror", "后视镜加热") + "</div>";
     }
-    // ── 前排 / 二排 / 三排 ──
-    for (const r of ["front", "rear", "third"]) {
-      const left = this._cabSeatOf(r, "left");
-      const right = this._cabSeatOf(r, "right");
-      if (!left && !right) continue;                    // 这一排没有键 → 整行不渲染
-      h += '<div class="cabRow ' + r + '">';
-      h += left || "<span></span>";
-      if (r === "front") h += '<div class="cabConsole" title="中央扶手"></div>';
-      h += right;
-      h += "</div>";
+    h += at("seat-front-left", this._cabSeatOf("front", "left"));
+    h += at("seat-front-right", this._cabSeatOf("front", "right"));
+    h += at("seat-rear-1", this._cabSeatOf("rear", "left"));
+    h += at("seat-rear-3", this._cabSeatOf("rear", "right"));
+    if (seats === "7") {
+      h += at("seat-third-left", this._cabSeatOf("third", "left"));
+      h += at("seat-third-right", this._cabSeatOf("third", "right"));
     }
     h += "</div>";
     return h;
+  }
+
+  /** 紧凑的图标开关(无文字标签): 后视镜这类放标题行的小按钮用。 */
+  _cabIconBtn(key, icon, label) {
+    const id = this._entId(key);
+    const on = this._val(key) === "on";
+    const busy = !!this._busy["sw:" + id];
+    const driving = this._driving();
+    const tip = label + (on ? ": 已开, 点击关闭" : ": 已关, 点击打开");
+    return '<button class="cabBtn sw compact ' + (on ? "on" : "off") + '" data-act="toggle"' +
+      ' data-entity="' + esc(id) + '" data-on="' + (on ? "1" : "0") + '"' +
+      ' aria-label="' + esc(label + (on ? " 开" : " 关")) + '"' +
+      ' title="' + esc(driving ? "行驶中已禁用" : tip) + '"' + this._dis(driving || busy) + ">" +
+      '<ha-icon class="ico" icon="mdi:' + icon + '"></ha-icon></button>';
+  }
+
+  /** 是否 7 座: 有第三排座椅信号(三排左/右加热)即视为 7 座。 */
+  _is7Seat() {
+    return !!(this._entId("seat_heat_third_left") || this._entId("seat_heat_third_right"));
+  }
+
+  /** 选座舱底图 URL(按 5/7 座 + HA 主题); 加载失败由 CSS 兜底到纯色底。 */
+  _cabinImg(seats) {
+    const dark = !!(this._hass && this._hass.themes && this._hass.themes.darkMode);
+    const set = CABIN_IMG[seats] || CABIN_IMG["5"];
+    return CAR_IMG_BASE + (set[dark ? "dark" : "light"] || set.light);
   }
 
   /** 第几排某一侧的座位(没有可点的功能就返回空串) */
@@ -1703,27 +1764,35 @@ this._index = {};            // translation_key → entity_id
       if (!heat && !vent) return "";
       const driving = this._driving();
       // 加热与通风各一颗图标(都存在时并排), 颜色/图形各自表示自己的档位
+      // 不加文字标签 —— 只留图标, 用颜色区分状态(加热=红 / 通风=蓝且转动)
       let h = '<div class="cabCell"><div class="cabIco">';
       if (heat) h += this._cabSeatIcon(heat, "heat", s.label + "加热", driving);
       if (vent) h += this._cabSeatIcon(vent, "vent", s.label + "通风", driving);
-      h += "</div><span class=\"cabLbl\">" + esc(s.label + " " + this._cabLabel(heat, vent)) + "</span></div>";
+      h += "</div></div>";
       return h;
     }
     return "";
   }
 
   /**
-   * 座位上的一颗功能图标:
-   *   通风 关 = fan-off(灰), 1/2/3 档 = fan-speed-1/2/3(蓝, 档位越高亮起的扇叶越多)
-   *   加热 关 = car-seat-heater(灰), 1/2/3 档 = fan-speed-1/2/3(红/橙)
+   * 座位上的一颗功能图标(无文字, 靠颜色/动效表示状态):
+   *   加热: 关=灰(car-seat-heater); 开=**红色**同一图标
+   *   通风: 关=灰(fan-off); 开=**风扇图标 + 旋转动画**(蓝色)
    * 点一下 = 档位循环 0→1→2→3→0(number.set_value)
    */
   _cabSeatIcon(key, kind, label, driving) {
     const v = this._num(key);
     const lvl = v == null ? 0 : clampNum(Math.round(v), 0, 3);
     const busy = !!this._busy["seat:" + key];
-    const icon = lvl > 0 ? "mdi:fan-speed-" + lvl : (kind === "vent" ? "mdi:fan-off" : "mdi:car-seat-heater");
-    const cls = "cabBtn " + kind + (lvl > 0 ? " lv" + lvl : " off");
+    const on = lvl > 0;
+    let icon, cls;
+    if (kind === "vent") {
+      icon = on ? "mdi:fan" : "mdi:fan-off";
+      cls = "cabBtn vent" + (on ? " on spin" : " off");
+    } else {
+      icon = "mdi:car-seat-heater";
+      cls = "cabBtn heat" + (on ? " on" : " off");
+    }
     const tip = label + " " + lvl + " 档 · 点击循环 0→1→2→3 档";
     return '<button class="' + cls + '" data-act="seatcycle" data-key="' + esc(key) + '"' +
       ' aria-label="' + esc(label + " " + lvl + " 档") + '"' +
@@ -1742,8 +1811,7 @@ this._index = {};            // translation_key → entity_id
       ' data-entity="' + esc(id) + '" data-on="' + (on ? "1" : "0") + '"' +
       ' aria-label="' + esc(label + (on ? " 开" : " 关")) + '"' +
       ' title="' + esc(driving ? "行驶中已禁用" : tip) + '"' + this._dis(driving || busy) + ">" +
-      '<ha-icon class="ico" icon="mdi:' + icon + '"></ha-icon></button>' +
-      '<span class="cabLbl">' + esc(pos + " " + (on ? "开" : "关")) + "</span></div>";
+      '<ha-icon class="ico" icon="mdi:' + icon + '"></ha-icon></button></div>';
   }
 
   /** 座位图标下面那行小字: 「主驾 加热 2 档」/「副驾 加热1·通风2」/「副驾 关」 */
@@ -1913,6 +1981,12 @@ this._index = {};            // translation_key → entity_id
     }
     // 车模容器: 预留将来的"车模视图", 现在按了没反应
     if (act === "vehicle") return;
+    if (act === "smclose") {
+      this._collapsed.comfort = true;
+      this._saveFold();
+      this._render();
+      return;
+    }
     if (act === "fold") {
       const sec = el.dataset.sec;
       if (!sec) return;
@@ -1923,11 +1997,6 @@ this._index = {};            // translation_key → entity_id
       const peer = sec === "charging" ? "comfort" : sec === "comfort" ? "charging" : "";
       if (peer && !this._collapsed[sec]) this._collapsed[peer] = true;
       this._saveFold();
-      this._render();
-      return;
-    }
-    if (act === "acc") {
-      this._open.climate = !this._open.climate;
       this._render();
       return;
     }
@@ -2217,7 +2286,7 @@ this._index = {};            // translation_key → entity_id
         }
         /* 白卡上的小圆钮(刷新车况): 底色/阴影走上面的"可点小按钮"组, 这里只管尺寸 */
         .toolBtn {
-          width: 30px; height: 30px; border-radius: 50%; display: inline-flex;
+          width: 27px; height: 27px; border-radius: 50%; display: inline-flex;
           align-items: center; justify-content: center; padding: 0; flex: none;
           color: var(--secondary-text-color, #6b7280);
         }
@@ -2381,7 +2450,7 @@ this._index = {};            // translation_key → entity_id
           display: flex; flex-direction: column; gap: 12px;
           border-radius: 14px; padding: 12px 14px;
         }
-        .halfH { display: flex; align-items: flex-end; gap: 8px; cursor: pointer; flex-wrap: wrap; }
+        .halfH { display: flex; align-items: flex-end; gap: 8px; flex-wrap: wrap; }
         .halfId { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
         .bigTxt { font-size: 32px; font-weight: 600; line-height: 1.1; letter-spacing: -.5px; }
         .bigTxt.sm { font-size: 20px; }
@@ -2498,42 +2567,75 @@ this._index = {};            // translation_key → entity_id
         }
         .foldC { transition: transform .18s ease; opacity: .6; }
         .foldH[aria-expanded="false"] .foldC { transform: rotate(-90deg); }
-        /* ── 座舱俯视模型(方向盘/后视镜/前排/二排/三排) ── */
-        /* 宽卡片里别贴着左边, 居中更像一台"车" */
+        /* 底图配色变量 + 类(取自视觉底图; 浅色默认 / .dark 跟随 HA 主题) */
+        /* ── 座舱俯视模型(位图底图 + 绝对定位的座位控件) ── */
+        /* 底图是 5座/7座 × 浅/深 四张位图(见 CABIN_IMG); 用 aspect-ratio 锁住 720x964 比例 */
         .cabin {
-          display: flex; flex-direction: column; gap: 8px;
-          max-width: 460px; margin-left: auto; margin-right: auto;
+          position: relative; width: 100%; max-width: 340px;
+          margin-left: auto; margin-right: auto; aspect-ratio: 720 / 964;
+          border-radius: 14px; overflow: hidden;
         }
-        .cabRow { display: flex; gap: 8px; align-items: flex-start; }
-        /* 顶部一行: 左后视镜 / 中间的方向盘 / 右后视镜(两端对齐, 方向盘自然落在中线) */
-        .cabRow.top { justify-content: space-between; align-items: flex-start; }
-        .cabMid { flex: 1; display: flex; justify-content: center; }
-        /* 前排左右各占一边, 中间留出中央扶手位 */
-        .cabRow.front > .cabCell { flex: 1; max-width: 152px; }
-        .cabConsole {
-          width: 34px; flex: none; align-self: stretch; min-height: 44px; border-radius: 10px;
-          opacity: .6;
+        .cabMap { position: absolute; inset: 0; overflow: hidden;
+          background: var(--ha-card-background, var(--card-background-color, #fff)); }
+        /* 最上层: 用**卡片底色**从边缘往内渐隐(浅色主题=白), 让底图淡出到背景色而不是半透明 */
+        .cabFade {
+          position: absolute; inset: 0; z-index: 2; pointer-events: none;
+          background: radial-gradient(122% 122% at 50% 50%,
+            transparent 46%, var(--ha-card-background, var(--card-background-color, #fff)) 90%);
         }
-        /* 二排 / 三排: 左右各一个 */
-        .cabRow.rear > .cabCell, .cabRow.third > .cabCell { flex: 1; max-width: 152px; }
-        .cabRow.rear > span, .cabRow.third > span { flex: 1; }
+        /* 底层: 同一张图放大 + 模糊, 给边缘一层"虚化"过渡(模糊图与背景的边界) */
+        .cabBlur {
+          position: absolute; inset: -26%; background-size: cover; background-position: center;
+          filter: blur(54px); transform: scale(1.26);
+          -webkit-mask-image: radial-gradient(140% 140% at 50% 50%, #000 34%, transparent 100%);
+          mask-image: radial-gradient(140% 140% at 50% 50%, #000 34%, transparent 100%);
+        }
+        /* 上层: 清晰图, 用**较大**的径向渐变把四周渐隐 —— 边缘露出下面的模糊层 */
+        .cabBg { position: absolute; inset: 0; display: block; width: 100%; height: 100%;
+          object-fit: cover; object-position: center;
+          /* 较大的渐变空间: 中心清晰 → 边缘长距离渐隐, 露出下面的模糊层 */
+          /* 渐变空间大: 中心 6% 起就开始过渡, 40% 半透, 76% 起全透 —— 模糊延伸到外侧座位 */
+          -webkit-mask-image: radial-gradient(126% 126% at 50% 50%, #000 6%, rgba(0,0,0,.45) 40%, transparent 76%);
+          mask-image: radial-gradient(126% 126% at 50% 50%, #000 6%, rgba(0,0,0,.45) 40%, transparent 76%); }
+        .cabPos { position: absolute; z-index: 3; transform: translate(-50%, -50%); display: flex; justify-content: center; }
         .cabCell { display: flex; flex-direction: column; align-items: center; gap: 2px; min-width: 0; }
         .cabIco { display: flex; gap: 4px; }
         .cabBtn {
           width: 38px; height: 38px; border-radius: 14px; padding: 0; flex: none;
           display: inline-flex; align-items: center; justify-content: center;
           color: var(--secondary-text-color, #6b7280);
-          transition: transform .12s ease;
+          opacity: .8;                     /* 按钮不透明度 80% */
+          transition: transform .12s ease, opacity .15s ease;
         }
+        .cabBtn:active { opacity: 1; }
         .cabBtn:active { transform: scale(.94); }
-        /* 通风蓝 / 加热红, 关着的状态保持灰色 */
-        .cabBtn.vent.lv1, .cabBtn.vent.lv2, .cabBtn.vent.lv3 {
-          background: rgba(41,182,246,.16); color: #29b6f6; border-color: rgba(41,182,246,.35);
+        /* 状态用**颜色**表示(不再有文字): 加热类=红, 通风=蓝且图标转动 */
+        .cabBtn.heat.on, .cabBtn.sw.on { color: #e53935; }
+        .cabBtn.vent.on { color: #29b6f6; }
+        @keyframes cabspin { to { transform: rotate(360deg); } }
+        .cabBtn.spin ha-icon { animation: cabspin 1.1s linear infinite; }
+        .cabBtn.compact { width: 30px; height: 30px; border-radius: 10px; }
+        /* ── 座椅与加热弹窗(在**控车卡片内**弹出, 不覆盖其它卡片) ── */
+        .smask { position: absolute; inset: 0; z-index: 60; display: none;
+          background: rgba(0,0,0,.28); border-radius: var(--ha-card-border-radius, 12px); }
+        .smask.on { display: block; }
+        .smodal {
+          position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 61;
+          display: none; width: min(94%, 380px); max-height: 94%; overflow: auto;
+          box-sizing: border-box; padding: 12px 14px 14px; border-radius: 16px;
+          background: var(--ha-card-background, var(--card-background-color, #fff));
+          color: var(--primary-text-color, #212121);
+          box-shadow: 0 10px 34px rgba(0,0,0,.4);
         }
-        .cabBtn.heat.lv1, .cabBtn.heat.lv2, .cabBtn.heat.lv3 {
-          background: rgba(255,112,67,.16); color: #ff7043; border-color: rgba(255,112,67,.35);
+        .smodal.on { display: block; }
+        .smhead { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+        .smhead .t { font-weight: 600; font-size: 15px; }
+        .smhead .mir { flex: 1; display: flex; justify-content: flex-end; gap: 6px; }
+        .smx {
+          width: 30px; height: 30px; padding: 0; border-radius: 50%; flex: none;
+          display: inline-flex; align-items: center; justify-content: center;
         }
-        .cabBtn.sw.on { background: rgba(255,112,67,.16); color: #ff7043; border-color: rgba(255,112,67,.35); }
+        .smx ha-icon { width: 18px; height: 18px; --mdc-icon-size: 18px; }
         .cabLbl {
           font-size: 10px; line-height: 1.3; opacity: .72; max-width: 100%;
           text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -2608,11 +2710,22 @@ this._index = {};            // translation_key → entity_id
         <div class="p-fuel"></div>
         <div class="toast"></div>
         <div class="ovl"></div>
+        <div class="smask" data-act="smclose"></div>
+        <div class="smodal">
+          <div class="smhead"><span class="t">座椅与加热</span><span class="mir"></span>
+            <button class="smx" data-act="smclose" title="关闭"><ha-icon icon="mdi:close"></ha-icon></button>
+          </div>
+          <div class="smbody"></div>
+        </div>
       </div>`;
 
     this._hintEl = this.shadowRoot.querySelector(".hint");
     this._toastEl = this.shadowRoot.querySelector(".toast");
     this._photoEl = this.shadowRoot.querySelector(".ovl");
+    this._smaskEl = this.shadowRoot.querySelector(".smask");
+    this._smodalEl = this.shadowRoot.querySelector(".smodal");
+    this._smbodyEl = this.shadowRoot.querySelector(".smodal .smbody");
+    this._smMirEl = this.shadowRoot.querySelector(".smodal .mir");
     this._panels = {};
     for (const p of PANELS) this._panels[p] = this.shadowRoot.querySelector(".p-" + p);
     this._panels.seats.className = "p-seats cont";
@@ -2666,9 +2779,39 @@ this._index = {};            // translation_key → entity_id
   }
 }
 
-if (!customElements.get("leapmotor-control")) {
-  customElements.define("leapmotor-control", LeapmotorControlCard);
+/* ── 自定义元素注册守卫 ──────────────────────────────────────────────────────
+ * HA 新版前端启动时会**整个替换** window.customElements(scoped registry polyfill):
+ * 若本模块在替换前求值, 元素就注册进了被丢弃的旧注册表 —— 前端查"当前"注册表查不到,
+ * 卡片会永久显示 "Custom element does not exist"(不报错、无日志; 冷加载 / 手机 App
+ * 上更易命中, 打开 DevTools 反而掩盖)。上游: home-assistant/frontend#52960、#53890。
+ * 修法: 记住加载时的注册表对象, 一旦它被换掉, 就把尚未生效的元素补注册到"当前"注册表;
+ * HA 的错误卡会在 whenDefined 解析后自动重建, 于是自愈。未换表时轮询自然结束。 */
+const _REG = customElements;
+const _pend = new Map();
+let _pollN = 0;
+function _heal() {
+  if (customElements === _REG || _pend.size === 0) return;   // 注册表没被换 → 无需处理
+  for (const [name, ctor] of [..._pend]) {
+    try {
+      if (!customElements.get(name)) customElements.define(name, ctor);
+      _pend.delete(name);
+    } catch (e) { /* 交给下一轮重试 */ }
+  }
 }
+function _pollHeal() {
+  if (_pend.size === 0 || _pollN >= 30) return;
+  _pollN += 1;
+  setTimeout(() => { _heal(); _pollHeal(); }, 1000);
+}
+function _defineCard(name, ctor) {
+  try {
+    if (!_REG.get(name)) _REG.define(name, ctor);
+  } catch (e) { console.warn(`leapmotor: 注册 ${name} 失败`, e); return; }
+  _pend.set(name, ctor);
+  try { _REG.whenDefined("home-assistant").then(_heal).catch(() => {}); } catch (e) {}
+  _pollHeal();
+}
+_defineCard("leapmotor-control", LeapmotorControlCard);
 
 window.customCards = window.customCards || [];
 if (!window.customCards.some((c) => c.type === "leapmotor-control")) {

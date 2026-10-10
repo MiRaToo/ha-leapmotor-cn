@@ -81,6 +81,20 @@ def test_track_length_and_downsample():
     assert len(out) == 100 and out[0] == many[0] and out[-1] == many[-1]
 
 
+def test_track_length_accepts_speed_third_dim():
+    """带车速的轨迹点 [lat, lon, speed] 必须能算长度/抽稀(热力图靠它着色)。
+
+    回归: 早先 `track_length_km` 用 `(la1, lo1), (la2, lo2) = …` 解包, 遇到三元点会抛
+    ValueError —— 一旦轨迹点开始带 speed(`_add_point` 的新行为), 行程收尾就会崩。
+    """
+    pts3 = [[31.2304, 121.4737, 42.5], [31.2304, 121.4747, 61.0]]
+    km = track_length_km(pts3)
+    assert 0.05 < km < 0.15
+    out = downsample(pts3, 1)          # max_points < 3 → 原样返回
+    assert out == pts3
+    assert downsample(pts3, 100)[0] == pts3[0]      # 少量点原样保留(含 speed)
+
+
 def test_haversine_sanity():
     assert haversine_km(31.2304, 121.4737, 31.2304, 121.4737) == 0.0
     assert 1.0 < haversine_km(31.0, 121.0, 31.01, 121.0) < 1.2   # 0.01° 纬度 ≈ 1.11 km

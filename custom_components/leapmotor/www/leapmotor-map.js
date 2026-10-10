@@ -27,7 +27,7 @@
  *   # 可选
  *   zoom: 16            # 初始缩放(15~18 比较合适)
  *   height: 320         # 卡片高度 px
- *   satellite: true     # 用卫星底图(默认用路网图)
+ *   map_style: auto     # 底图: auto 随 HA 主题(浅色=路网/深色=夜色) / vector / satellite / dark
  *   follow: true        # 车动了自动跟随居中(默认 true; 手动拖动后自动关闭)
  *
  * 这张卡专注"看车的位置 + 编辑/新增地理围栏": 只画车标与 HA 的区域(围栏)圆圈,
@@ -113,7 +113,7 @@ const TILE_SOURCES = {
 /* 高德连不上时回落到 OSM(海外用户/高德故障时至少还能看图) */
 const TILE_FALLBACK = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 
-const CARD_VERSION = "1.6.1";
+const CARD_VERSION = "1.6.6";
 
 /** 经纬度 → 世界像素坐标(标准 Web 墨卡托, 与高德/OSM 一致)。 */
 function project(lat, lon, zoom) {
@@ -159,23 +159,30 @@ class LeapmotorMapCard extends HTMLElement {
     this._tiles = new Map();  // "z/x/y" → <img>
     this._marker = null;
     this._built = false;
+    this._mapStyle = "auto";    // auto 随 HA 主题 | vector | satellite | dark
   }
 
   /** 从卡片选择器添加时, 自动填好车辆位置实体(用户不用自己找)。 */
   static getStubConfig(hass) {
-    return { entity: pickTracker(hass) || "", zoom: 16, height: 320 };
+    return { entity: pickTracker(hass) || "", zoom: 16, height: 320, map_style: "auto" };
   }
 
   setConfig(config) {
     // 不抛异常 —— 没填实体时自动识别(否则 HA 只会显示一张"配置错误"卡片,
     // 用户完全不知道该怎么办)。真正找不到时才在卡片上给一句提示。
+    const raw = config || {};
     this._config = {
       zoom: 16,
       height: 320,
-      satellite: false,
+      map_style: "auto",
       follow: true,
-      ...(config || {}),
+      ...raw,
     };
+    // satellite 是 map_style 的旧别名(向后兼容)
+    if (raw.map_style == null && raw.satellite != null) {
+      this._config.map_style = raw.satellite ? "satellite" : "vector";
+    }
+    this._mapStyle = this._normMapStyle(this._config.map_style);
     // 高德瓦片 z=19 在很多区域没有数据(会返回空白图), 所以上限取 18
     this._zoom = clamp(Number(this._config.zoom) || 16, 3, 18);
     this._follow = this._config.follow !== false;
@@ -186,8 +193,63 @@ class LeapmotorMapCard extends HTMLElement {
     this._render();
   }
 
+  /** 归一化底图样式名(容忍大小写/空格; 未知值回落到路网图)。auto = 随 HA 主题。 */
+  _normMapStyle(v) {
+    const s = String(v == null ? "" : v).trim().toLowerCase();
+    if (s === "auto" || s === "自动") return "auto";
+    if (s === "satellite" || s === "sat" || s === "卫星") return "satellite";
+    if (s === "dark" || s === "深色" || s === "night" || s === "暗黑") return "dark";
+    return "vector";
+  }
+
+  /** 实际生效的底图: auto → HA 深色主题时用深色, 否则路网。 */
+  _effMapStyle() {
+    const s = this._mapStyle || "auto";
+    if (s !== "auto") return s;
+    const dark = !!(this._hass && this._hass.themes && this._hass.themes.darkMode);
+    return dark ? "dark" : "vector";
+  }
+
+  /** 底图循环切换: 自动 → 路网 → 卫星 → 深色, 点了立刻重绘并刷新按钮态。 */
+  _cycleMapStyle() {
+    const order = ["auto", "vector", "satellite", "dark"];
+    const i = order.indexOf(this._mapStyle || "auto");
+    this._mapStyle = order[(i + 1) % order.length];
+    this._tiles.forEach((img) => img.remove());   // 换底图源, 旧瓦片必须丢掉重取
+    this._tiles.clear();
+    this._applyMapStyle();
+    this._renderTiles();
+    this._syncStyleBtn();
+  }
+
+  /** 把当前底图样式落到 DOM(class, 深色靠 CSS 滤镜)。 */
+  _applyMapStyle() {
+    if (this._wrap) this._wrap.classList.toggle("dark", this._effMapStyle() === "dark");
+  }
+
+  _syncStyleBtn() {
+    if (!this._styleBtn) return;
+    const s = this._mapStyle || "auto";
+    // 一律用图标表示, 不放文字: 自动=主题图标 / 路网=地图 / 卫星=卫星 / 深色=月亮
+    const ICON = {
+      auto: "mdi:theme-light-dark", vector: "mdi:map-outline",
+      satellite: "mdi:satellite-variant", dark: "mdi:weather-night",
+    };
+    const NAME = { auto: "自动(随主题)", vector: "路网", satellite: "卫星", dark: "深色" };
+    this._styleBtn.innerHTML = '<ha-icon icon="' + (ICON[s] || ICON.vector) + '"></ha-icon>';
+    this._styleBtn.title = "底图: " + (NAME[s] || "路网") + " —— 点一下切换";
+    this._styleBtn.classList.toggle("on", s !== "vector");
+  }
+
   set hass(hass) {
     this._hass = hass;
+    // "自动"底图随 HA 主题: 主题从浅切深时重画瓦片(深色靠 CSS 滤镜)
+    const dark = !!(hass && hass.themes && hass.themes.darkMode);
+    if (this._themeDark !== undefined && this._themeDark !== dark && this._mapStyle === "auto") {
+      this._applyMapStyle();
+      if (this._center) this._renderTiles();
+    }
+    this._themeDark = dark;
     if (!this._config.entity) {
       const guess = pickTracker(hass);
       if (guess) {
@@ -255,20 +317,41 @@ class LeapmotorMapCard extends HTMLElement {
       this._zmsg.textContent = "还没有用界面建过区域 —— 点右上角「＋」建一个";
       return;
     }
-    this._zmsg.textContent = `共 ${this._zoneItems.length} 个区域(点「删」会先变成确认, 再点一次才真删)`;
+    this._zmsg.textContent = `共 ${this._zoneItems.length} 个区域(改半径后点「改」; 点「删」会先变成确认, 再点一次才真删)`;
     this._zlist.innerHTML = this._zoneItems
       .map((z) => {
         const r = Math.round(Number(z.radius) || 100);
         const nm = String(z.name || z.id || "?").replace(/[<>&]/g, "");
         return (
           '<div class="zrow" data-id="' + String(z.id) + '">' +
-          '<span class="nm">' + nm + '</span><span class="rd">' + r + 'm</span>' +
+          '<span class="nm">' + nm + '</span>' +
+          '<input class="zrad" type="number" min="20" max="5000" step="10" value="' + r +
+          '" title="半径(米)">' +
+          '<button data-zz="rad" title="保存半径">改</button>' +
           '<button data-zz="go">定位</button>' +
           '<button data-zz="del" class="danger">删</button>' +
           "</div>"
         );
       })
       .join("");
+  }
+
+  /** 改某个区域的半径(走 HA 官方 WS 接口 zone/update; 需要管理员)。 */
+  async _updateZone(id, row) {
+    const z = (this._zoneItems || []).find((x) => String(x.id) === String(id));
+    if (!z) return;
+    const input = row ? row.querySelector(".zrad") : null;
+    const radius = Math.max(20, Math.min(5000, Number(input && input.value) || 0));
+    if (!radius) { this._zmsg.textContent = "半径填写不合法(20~5000 米)"; return; }
+    if (!this._hass || !this._hass.callWS) return;
+    this._zmsg.textContent = "保存中…";
+    try {
+      // HA 的 zone/update 是**部分字段更新**: 只给 zone_id + radius, 其余(名字/坐标)保持不变。
+      await this._hass.callWS({ type: "zone/update", zone_id: id, radius: radius });
+      await this._loadZoneList();
+    } catch (err) {
+      this._zmsg.textContent = "保存失败:" + String(err && err.message ? err.message : err).slice(0, 70);
+    }
   }
 
   /** 把地图移到某个区域(定位)。 */
@@ -481,6 +564,9 @@ class LeapmotorMapCard extends HTMLElement {
           cursor: grab; touch-action: none; user-select: none;
         }
         .wrap.dragging { cursor: grabbing; }
+        /* 深色底图: 亮色路网瓦片整体反相 + 色相翻转 → 夜色地图(与官方 App 深色图观感一致) */
+        .wrap.dark { background: #111418; }
+        .wrap.dark .layer { filter: invert(100%) hue-rotate(180deg) brightness(85%) contrast(90%); }
         .layer { position: absolute; left: 0; top: 0; z-index: 0; will-change: transform; }
         .overlay { position: absolute; left: 0; top: 0; width: 100%; height: 100%;
                    z-index: 5; pointer-events: none; }
@@ -520,6 +606,9 @@ class LeapmotorMapCard extends HTMLElement {
           background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff);
           border-color: transparent;
         }
+        /* 底图切换按钮显示文字(路网/卫星/深色)或用"自动"图标, 字号小一点才放得下 */
+        .btns button.style { font-size: 11px; font-weight: 600; letter-spacing: -.5px; }
+        .btns button.style ha-icon { width: 18px; height: 18px; --mdc-icon-size: 18px; }
         .zones { position: absolute; left: 0; top: 0; width: 100%; height: 100%; z-index: 3; pointer-events: none; }
         .zone {
           position: absolute; border: 2px solid rgba(33,150,243,.85); border-radius: 50%;
@@ -530,7 +619,7 @@ class LeapmotorMapCard extends HTMLElement {
           font-size: 11px; white-space: nowrap; padding: 1px 6px; border-radius: 999px;
           background: rgba(33,150,243,.85); color: #fff;
         }
-        /* 准星: 始终显示在地图正中心, 也是"地图中心"建区域时用的位置 */
+        /* 地图中心红点(简单一点的标记, 取代原来的十字准星) */
         .crosshair {
           position: absolute; left: 50%; top: 50%; width: 20px; height: 20px;
           margin: -10px 0 0 -10px; z-index: 7; pointer-events: none;
@@ -574,7 +663,12 @@ class LeapmotorMapCard extends HTMLElement {
         .zrow { display: flex; align-items: center; gap: 6px; padding: 3px 0; }
         .zrow + .zrow { border-top: 1px solid var(--divider-color, #eee); }
         .zrow .nm { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .zrow .rd { opacity: .6; font-size: 11px; }
+        /* 可编辑半径: 小输入框 + 「改」按钮 */
+        .zrow .zrad {
+          flex: 0 0 56px; width: 56px; padding: 3px 4px; font-size: 11px;
+          border: 1px solid var(--divider-color, #ccc); border-radius: 6px;
+          background: var(--card-background-color, #fff); color: inherit;
+        }
         .zrow button { flex: 0 0 auto; padding: 3px 8px; font-size: 11px; }
         .zrow button.danger { border-color: var(--error-color, #db4437); color: var(--error-color, #db4437); }
         .zrow button.armed { background: var(--error-color, #db4437); color: #fff; border-color: var(--error-color, #db4437); }
@@ -587,17 +681,9 @@ class LeapmotorMapCard extends HTMLElement {
       <div class="wrap">
         <div class="layer"></div>
         <div class="zones"></div>
-        <div class="crosshair">
+        <div class="crosshair" title="地图中心(建区域时以它为圆心)">
           <svg viewBox="0 0 20 20" width="20" height="20">
-            <g stroke="#fff" stroke-width="3" opacity=".9" stroke-linecap="round">
-              <line x1="10" y1="1" x2="10" y2="5"/><line x1="10" y1="15" x2="10" y2="19"/>
-              <line x1="1" y1="10" x2="5" y2="10"/><line x1="15" y1="10" x2="19" y2="10"/>
-            </g>
-            <g stroke="#e53935" stroke-width="1.4" stroke-linecap="round">
-              <line x1="10" y1="1" x2="10" y2="5"/><line x1="10" y1="15" x2="10" y2="19"/>
-              <line x1="1" y1="10" x2="5" y2="10"/><line x1="15" y1="10" x2="19" y2="10"/>
-            </g>
-            <circle cx="10" cy="10" r="1.4" fill="#e53935" stroke="#fff" stroke-width="1"/>
+            <circle cx="10" cy="10" r="5" fill="#e53935" stroke="#fff" stroke-width="2"/>
           </svg>
         </div>
         <div class="overlay"></div>
@@ -605,6 +691,7 @@ class LeapmotorMapCard extends HTMLElement {
           <button data-a="in" title="放大">＋</button>
           <button data-a="out" title="缩小">－</button>
           <button data-a="follow" title="跟随车辆">◎</button>
+          <button data-a="style" class="style" title="底图: 点一下切换"><ha-icon icon="mdi:theme-light-dark"></ha-icon></button>
           <button data-a="zone" title="建一个区域(围栏)">＋</button>
           <button data-a="zones" title="管理区域(定位/删除)">☰</button>
         </div>
@@ -643,6 +730,9 @@ class LeapmotorMapCard extends HTMLElement {
     this._nameEl = this.shadowRoot.querySelector(".bar .name");
     this._subEl = this.shadowRoot.querySelector(".bar .sub");
     this._followBtn = this.shadowRoot.querySelector('button[data-a="follow"]');
+    this._styleBtn = this.shadowRoot.querySelector('button[data-a="style"]');
+    this._syncStyleBtn();
+    this._applyMapStyle();
 
     this._zlist.addEventListener("click", (ev) => {
       const b = ev.target.closest("button");
@@ -652,6 +742,7 @@ class LeapmotorMapCard extends HTMLElement {
       if (!row) return;
       if (b.dataset.zz === "go") this._gotoZone(row.dataset.id);
       else if (b.dataset.zz === "del") this._deleteZone(row.dataset.id, b);
+      else if (b.dataset.zz === "rad") this._updateZone(row.dataset.id, row);
     });
     this.shadowRoot.querySelectorAll(".panel button").forEach((b) => {
       b.addEventListener("click", (ev) => {
@@ -779,6 +870,8 @@ class LeapmotorMapCard extends HTMLElement {
         this._renderTiles();
         this._renderMarker();
       }
+    } else if (action === "style") {
+      this._cycleMapStyle();
     }
   }
 
@@ -789,7 +882,10 @@ class LeapmotorMapCard extends HTMLElement {
 
   _tileUrl(z, x, y, fallback) {
     const conf = this._config;
-    let tpl = conf.tiles || (conf.satellite ? TILE_SOURCES.satellite : TILE_SOURCES.vector);
+    // 深色底图 = 路网瓦片 + CSS 滤镜(见 .wrap.dark), 瓦片源仍是 vector
+    const style = this._effMapStyle();
+    const src = style === "satellite" ? TILE_SOURCES.satellite : TILE_SOURCES.vector;
+    let tpl = conf.tiles || src;
     if (fallback) tpl = TILE_FALLBACK;
     const s = ((x + y) % 4) + 1;
     return tpl
@@ -892,9 +988,39 @@ class LeapmotorMapCard extends HTMLElement {
   }
 }
 
-if (!customElements.get("leapmotor-map")) {
-  customElements.define("leapmotor-map", LeapmotorMapCard);
+/* ── 自定义元素注册守卫 ──────────────────────────────────────────────────────
+ * HA 新版前端启动时会**整个替换** window.customElements(scoped registry polyfill):
+ * 若本模块在替换前求值, 元素就注册进了被丢弃的旧注册表 —— 前端查"当前"注册表查不到,
+ * 卡片会永久显示 "Custom element does not exist"(不报错、无日志; 冷加载 / 手机 App
+ * 上更易命中, 打开 DevTools 反而掩盖)。上游: home-assistant/frontend#52960、#53890。
+ * 修法: 记住加载时的注册表对象, 一旦它被换掉, 就把尚未生效的元素补注册到"当前"注册表;
+ * HA 的错误卡会在 whenDefined 解析后自动重建, 于是自愈。未换表时轮询自然结束。 */
+const _REG = customElements;
+const _pend = new Map();
+let _pollN = 0;
+function _heal() {
+  if (customElements === _REG || _pend.size === 0) return;   // 注册表没被换 → 无需处理
+  for (const [name, ctor] of [..._pend]) {
+    try {
+      if (!customElements.get(name)) customElements.define(name, ctor);
+      _pend.delete(name);
+    } catch (e) { /* 交给下一轮重试 */ }
+  }
 }
+function _pollHeal() {
+  if (_pend.size === 0 || _pollN >= 30) return;
+  _pollN += 1;
+  setTimeout(() => { _heal(); _pollHeal(); }, 1000);
+}
+function _defineCard(name, ctor) {
+  try {
+    if (!_REG.get(name)) _REG.define(name, ctor);
+  } catch (e) { console.warn(`leapmotor: 注册 ${name} 失败`, e); return; }
+  _pend.set(name, ctor);
+  try { _REG.whenDefined("home-assistant").then(_heal).catch(() => {}); } catch (e) {}
+  _pollHeal();
+}
+_defineCard("leapmotor-map", LeapmotorMapCard);
 
 window.customCards = window.customCards || [];
 if (!window.customCards.some((c) => c.type === "leapmotor-map")) {

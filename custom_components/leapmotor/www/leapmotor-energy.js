@@ -26,6 +26,7 @@
  *   type: custom:leapmotor-energy
  *   title: 里程 / 耗电        # 可选, 不填就只显示摘要
  *   range: week              # 可选, week(默认) | month
+ *   chart: line              # 可选, line(折线, 默认) | bar(分组柱状图)
  *   show_mileage: true       # 可选, 默认 true
  *   show_energy: true        # 可选, 默认 true(每日耗电)
  *   show_efficiency: true    # 可选, 默认 true(百公里能耗)
@@ -34,7 +35,7 @@
  * 颜色全部走 HA 主题变量(深色主题自适应)。
  */
 
-const CARD_VERSION = "1.2.2";
+const CARD_VERSION = "1.3.1";
 
 const PENDING_RETRY_MS = 8000;   // pending>0 时自动续拉前的等待(分批取数, 不阻塞首屏)
 
@@ -109,6 +110,7 @@ class LeapmotorEnergyCard extends HTMLElement {
     this._hass = null;
     this._built = false;
     this._range = "week";                 // week | month
+    this._chart = "line";                 // line | bar
     this._showKm = true;
     this._showKwh = true;
     this._showEff = true;                 // 百公里能耗(默认开, 可关)
@@ -134,6 +136,7 @@ class LeapmotorEnergyCard extends HTMLElement {
     if (!config) return;
     this._config = config;
     if (config.range === "month" || config.range === "week") this._range = config.range;
+    if (config.chart === "line" || config.chart === "bar") this._chart = config.chart;
     if (config.show_mileage === false) this._showKm = false;
     if (config.show_energy === false) this._showKwh = false;
     if (config.show_efficiency === false) this._showEff = false;
@@ -168,6 +171,7 @@ class LeapmotorEnergyCard extends HTMLElement {
       if (!raw) return;
       const p = JSON.parse(raw);
       if (!this._config.range && (p.range === "week" || p.range === "month")) this._range = p.range;
+      if (!this._config.chart && (p.chart === "line" || p.chart === "bar")) this._chart = p.chart;
       if (this._config.show_mileage !== false && typeof p.km === "boolean") this._showKm = p.km;
       if (this._config.show_energy !== false && typeof p.kwh === "boolean") this._showKwh = p.kwh;
       if (this._config.show_efficiency !== false && typeof p.eff === "boolean") this._showEff = p.eff;
@@ -252,6 +256,13 @@ class LeapmotorEnergyCard extends HTMLElement {
         // ⚠️ 这里必须走 _load: 有缓存时它会**把 this._data 换成缓存的那一份**再重绘。
         //    原来只 _renderAll() 不换数据 → 从月切回周时画的还是 30 天数据, 看起来"切不回去"。
         this._load(false);
+      } else if (act === "chart") {
+        // 折线 / 柱状 切换: 只换画法, 不用重取数
+        this._chart = this._chart === "bar" ? "line" : "bar";
+        this._day = -1;
+        this._savePref({ chart: this._chart });
+        this._renderCtrls();
+        this._renderChart();
       }
     });
 
@@ -289,7 +300,7 @@ class LeapmotorEnergyCard extends HTMLElement {
       .head .spacer { flex: 1; }
       /* 刷新按钮: 圆形白底 + 与外框同款轻阴影; hover 淡蓝 */
       .head button.refresh {
-        width: 30px; height: 30px; padding: 0; border-radius: 50%;
+        width: 27px; height: 27px; padding: 0; border-radius: 50%;
         display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
         color: var(--secondary-text-color, #6b7280);
         background: var(--ha-card-background, var(--card-background-color, #fff));
@@ -301,7 +312,7 @@ class LeapmotorEnergyCard extends HTMLElement {
         background: rgba(var(--rgb-primary-color, 3, 169, 244), .12);
       }
       .head button.refresh.spin { opacity: .45; }
-      .head button.refresh ha-icon { width: 18px; height: 18px; --mdc-icon-size: 18px; }
+      .head button.refresh ha-icon { width: 16px; height: 16px; --mdc-icon-size: 16px; }
       ha-icon { display: inline-flex; width: 16px; height: 16px; --mdc-icon-size: 16px; }
 
       .lmsg { display: none; font-size: 12px; color: var(--secondary-text-color, #6b7280); padding: 2px 2px 0; }
@@ -357,6 +368,10 @@ class LeapmotorEnergyCard extends HTMLElement {
       .chip.kwh.on { background: ${COLOR_KWH}; color: #fff; border-color: transparent; }
       .chip.eff.on { background: ${COLOR_EFF}; color: #fff; border-color: transparent; }
       .chip.rng.on {
+        background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff);
+        border-color: transparent;
+      }
+      .chip.chart.on {
         background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff);
         border-color: transparent;
       }
@@ -555,7 +570,10 @@ class LeapmotorEnergyCard extends HTMLElement {
           "显示/隐藏百公里能耗折线(kWh/100km, 按本机自记行程计)") +
       '<span class="sp"></span>' +
       rng("range", this._range === "week", "周", "近 7 天", "week") +
-      rng("range", this._range === "month", "月", "近 30 天(官方 + 自记)", "month");
+      rng("range", this._range === "month", "月", "近 30 天(官方 + 自记)", "month") +
+      '<button class="chip chart' + (this._chart === "bar" ? " on" : "") +
+      '" data-act="chart" title="切换图表: 折线 / 柱状">' +
+      (this._chart === "bar" ? "柱状" : "折线") + "</button>";
   }
 
   // ── 图表(SVG, 零依赖) ──
@@ -637,20 +655,42 @@ class LeapmotorEnergyCard extends HTMLElement {
         '" width="' + bw.toFixed(1) + '" height="' + plotH + '" rx="3"/>';
     }
     // 折线 + 点(缺数据的日断开, 不硬连); 点自带 data-day, 直接点圆点也能选中
-    for (const x of live) {
-      const runs = runsOf(x.vals);
-      for (const run of runs) {
-        if (run.length >= 2) {
-          const pts = run.map(([i, v]) => xs[i].toFixed(1) + "," + x.y(v).toFixed(1)).join(" ");
-          svg += '<polyline class="line" stroke="' + x.color + '" points="' + pts + '"/>';
+    // —— 或柱状(每天一组, 每种可见系列一根, 各自对着自己的轴)。
+    if (this._chart === "bar") {
+      const groupW = plotW / n;
+      const pad = Math.min(6, groupW * 0.18);
+      const slotW = Math.max(1.5, (groupW - pad * 2) / Math.max(1, live.length));
+      const barW = Math.max(1, slotW - Math.min(2, slotW * 0.22));
+      for (let i = 0; i < n; i++) {
+        for (let j = 0; j < live.length; j++) {
+          const x = live[j];
+          const v = x.vals[i];
+          if (v == null) continue;
+          const h = Math.max(0, plotH * (v / x.axis.max));
+          const bx = PAD.l + i * groupW + pad + j * slotW + (slotW - barW) / 2;
+          const by = PAD.t + plotH - h;
+          const sel = i === this._day;
+          svg += '<rect class="bar" data-day="' + i + '" fill="' + x.color +
+            '" opacity="' + (sel ? 1 : 0.9) + '" x="' + bx.toFixed(1) + '" y="' + by.toFixed(1) +
+            '" width="' + barW.toFixed(1) + '" height="' + h.toFixed(1) + '" rx="1.5"/>';
         }
       }
-      for (const run of runs) {
-        for (const [i, v] of run) {
-          const sel = i === this._day;
-          svg += '<circle class="pt ' + x.key + (sel ? " sel" : "") + '" data-day="' + i +
-            '" cx="' + xs[i].toFixed(1) + '" cy="' + x.y(v).toFixed(1) +
-            '" r="' + (sel ? 4.2 : 2.6) + '"/>';
+    } else {
+      for (const x of live) {
+        const runs = runsOf(x.vals);
+        for (const run of runs) {
+          if (run.length >= 2) {
+            const pts = run.map(([i, v]) => xs[i].toFixed(1) + "," + x.y(v).toFixed(1)).join(" ");
+            svg += '<polyline class="line" stroke="' + x.color + '" points="' + pts + '"/>';
+          }
+        }
+        for (const run of runs) {
+          for (const [i, v] of run) {
+            const sel = i === this._day;
+            svg += '<circle class="pt ' + x.key + (sel ? " sel" : "") + '" data-day="' + i +
+              '" cx="' + xs[i].toFixed(1) + '" cy="' + x.y(v).toFixed(1) +
+              '" r="' + (sel ? 4.2 : 2.6) + '"/>';
+          }
         }
       }
     }
@@ -712,15 +752,45 @@ class LeapmotorEnergyCard extends HTMLElement {
   }
 }
 
-if (!customElements.get("leapmotor-energy")) {
-  customElements.define("leapmotor-energy", LeapmotorEnergyCard);
+/* ── 自定义元素注册守卫 ──────────────────────────────────────────────────────
+ * HA 新版前端启动时会**整个替换** window.customElements(scoped registry polyfill):
+ * 若本模块在替换前求值, 元素就注册进了被丢弃的旧注册表 —— 前端查"当前"注册表查不到,
+ * 卡片会永久显示 "Custom element does not exist"(不报错、无日志; 冷加载 / 手机 App
+ * 上更易命中, 打开 DevTools 反而掩盖)。上游: home-assistant/frontend#52960、#53890。
+ * 修法: 记住加载时的注册表对象, 一旦它被换掉, 就把尚未生效的元素补注册到"当前"注册表;
+ * HA 的错误卡会在 whenDefined 解析后自动重建, 于是自愈。未换表时轮询自然结束。 */
+const _REG = customElements;
+const _pend = new Map();
+let _pollN = 0;
+function _heal() {
+  if (customElements === _REG || _pend.size === 0) return;   // 注册表没被换 → 无需处理
+  for (const [name, ctor] of [..._pend]) {
+    try {
+      if (!customElements.get(name)) customElements.define(name, ctor);
+      _pend.delete(name);
+    } catch (e) { /* 交给下一轮重试 */ }
+  }
 }
+function _pollHeal() {
+  if (_pend.size === 0 || _pollN >= 30) return;
+  _pollN += 1;
+  setTimeout(() => { _heal(); _pollHeal(); }, 1000);
+}
+function _defineCard(name, ctor) {
+  try {
+    if (!_REG.get(name)) _REG.define(name, ctor);
+  } catch (e) { console.warn(`leapmotor: 注册 ${name} 失败`, e); return; }
+  _pend.set(name, ctor);
+  try { _REG.whenDefined("home-assistant").then(_heal).catch(() => {}); } catch (e) {}
+  _pollHeal();
+}
+_defineCard("leapmotor-energy", LeapmotorEnergyCard);
 window.customCards = window.customCards || [];
 if (!window.customCards.some((c) => c.type === "leapmotor-energy")) {
   window.customCards.push({
     type: "leapmotor-energy",
     name: "零跑·里程耗电",
-    description: "里程 / 耗电 / 百公里能耗逐日折线(周/月切换, 三线可叠显)",
+    description: "里程 / 耗电 / 百公里能耗逐日折线或柱状(周/月切换, 三线可叠显)",
     preview: false,
     documentationURL: "https://github.com/MiRaToo/ha-leapmotor-cn/blob/main/docs/dashboard.md",
   });

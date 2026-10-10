@@ -22,7 +22,7 @@ FILES = [
     "__init__.py", "api.py", "const.py", "coordinator.py", "entity.py",
     "config_flow.py", "lock.py", "climate.py", "switch.py", "number.py",
     "time.py", "button.py", "sensor.py", "device_tracker.py", "image.py", "text.py",
-    "trips.py", "energy_daily.py", "ws_api.py",
+    "trips.py", "energy_daily.py", "cardfiles.py", "ws_api.py",
     "manifest.json", "strings.json",
     # HA 2025.2+ 的本地品牌图(集成页显示项目图标)
     "brand/icon.png", "brand/logo.png",
@@ -39,6 +39,11 @@ FILES = [
     "www/carimg/c11.png",
     "www/carimg/c16.png",
     "www/carimg/t.png",
+    # 座舱俯视底图(5座/7座 × 浅/深; 座椅与加热卡用)
+    "www/carimg/cabin5_light.jpg",
+    "www/carimg/cabin5_dark.jpg",
+    "www/carimg/cabin7_light.jpg",
+    "www/carimg/cabin7_dark.jpg",
 ]
 TRANS = ["zh-Hans.json", "en.json"]
 

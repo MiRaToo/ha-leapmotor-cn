@@ -185,17 +185,23 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def track_length_km(points: list[list[float]]) -> float | None:
-    """轨迹点序列的总长度(km); 少于 2 点返回 None。"""
+    """轨迹点序列的总长度(km); 少于 2 点返回 None。
+
+    点可以是 [lat, lon] 或 [lat, lon, speed] —— 只用前两维, 按**下标**取而不是解包
+    (解包成两个变量会在遇到带 speed 的三元点时抛 ValueError)。
+    """
     if not points or len(points) < 2:
         return None
     total = 0.0
-    for (la1, lo1), (la2, lo2) in zip(points, points[1:]):
-        total += haversine_km(float(la1), float(lo1), float(la2), float(lo2))
+    for p1, p2 in zip(points, points[1:]):
+        total += haversine_km(float(p1[0]), float(p1[1]), float(p2[0]), float(p2[1]))
     return total or None
 
 
 def downsample(points: list, max_points: int) -> list:
-    """等距抽稀(保留首尾点)。给"展示用"的轨迹属性用, 别让实体属性撑爆 recorder。"""
+    """等距抽稀(保留首尾点)。给"展示用"的轨迹属性用, 别让实体属性撑爆 recorder。
+    支持 [lat, lon] 与 [lat, lon, speed](整点保留, 不做维度裁剪)。
+    """
     if len(points) <= max_points or max_points < 3:
         return list(points)
     step = (len(points) - 1) / (max_points - 1)
@@ -568,7 +574,10 @@ class TripRecorder:
             return                                        # 没有定位/占位 (0,0) 不写
         if self._points and self._points[-1][0] == lat and self._points[-1][1] == lon:
             return                                        # 与上一点完全相同(堵车/静止)不重复写
-        self._points.append([round(lat, 6), round(lon, 6)])
+        # 带上实时车速(km/h) → 卡片的速度热力图按它给轨迹着色。旧存储里的点是 [lat, lon]
+        # 两元组(没有 speed), 卡片会据此回落到单色, 不受影响。
+        speed = round(float(st.get("speed") or 0.0), 1)
+        self._points.append([round(lat, 6), round(lon, 6), speed])
         if len(self._points) > MAX_TRACK_POINTS:
             self._points = downsample(self._points, MAX_TRACK_POINTS)
 

@@ -12,15 +12,18 @@
  * 配置:
  *   type: custom:leapmotor-lastweek
  *   title: 上周能耗        # 可选
+ *   style: donut          # 可选, donut(圆环, 默认, 仿官方 App) | bar(堆叠条 + 明细)
  *
- * 视觉与其它四张卡同一套: 白底大卡 + 白底灰框子块 + 圆形刷新钮, 颜色走 HA 主题变量。
+ * 两种样式点右上角的小胶囊按钮切换, 选择按浏览器本地记忆。视觉与其它四张卡同一套:
+ * 白底大卡 + 白底灰框子块 + 圆形刷新钮, 颜色走 HA 主题变量。
  */
 
-const CARD_VERSION = "1.0.1";
+const CARD_VERSION = "1.1.5";
 
-const COLOR_DRIVER = "#1e88e5";   // 蓝 = 驱动耗电
-const COLOR_AC = "#26a69a";       // 青 = 空调耗电
-const COLOR_OTHER = "#90a4ae";    // 灰蓝 = 其它(低压电器等)
+/* 配色对齐官方 App 的三色: 驾驶=绿 / 空调=蓝 / 其它=橙 */
+const COLOR_DRIVER = "#43a047";   // 绿 = 行车(驱动)能耗
+const COLOR_AC = "#2196f3";       // 蓝 = 空调能耗
+const COLOR_OTHER = "#ffb300";    // 橙 = 其它能耗
 
 function esc(s) {
   return String(s == null ? "" : s)
@@ -58,27 +61,48 @@ class LeapmotorLastweekCard extends HTMLElement {
     this._err = "";
     this._hint = "";
     this._fetchedOnce = false;
+    this._style = "donut";        // donut(圆环, 仿官方 App) | bar(堆叠条)
+    this._prefLoaded = false;
   }
 
   static getStubConfig() {
-    return { type: "custom:leapmotor-lastweek" };
+    return { type: "custom:leapmotor-lastweek", style: "donut" };
   }
 
   setConfig(config) {
     this._config = config || {};
+    const s = this._config.style;
+    if (s === "bar" || s === "donut") this._style = s;
+    this._prefLoaded = false;
+  }
+
+  _prefKey() { return "leapmotor-lastweek.style"; }
+  _loadPref() {
+    if (this._prefLoaded) return;
+    this._prefLoaded = true;
+    if (this._config && (this._config.style === "bar" || this._config.style === "donut")) return;
+    try {
+      const s = window.localStorage.getItem(this._prefKey());
+      if (s === "bar" || s === "donut") this._style = s;
+    } catch (err) { /* 本地存储不可用就算了 */ }
+  }
+  _savePref() {
+    try { window.localStorage.setItem(this._prefKey(), this._style); } catch (err) { /* ignore */ }
   }
 
   set hass(hass) {
     this._hass = hass;
     if (!this._built) {
       this._built = true;
+      this._loadPref();
       this._build();
       this._renderAll();
       this._load(false);
     }
   }
 
-  getCardSize() { return 3; }
+  // 圆环排布比堆叠条高, 给足行数, 免得在分区视图里因高度不足被裁("超出卡片范围")
+  getCardSize() { return this._style === "bar" ? 3 : 5; }
 
   // ── 构建 ──
   _build() {
@@ -88,23 +112,36 @@ class LeapmotorLastweekCard extends HTMLElement {
       '<div class="card">' +
       '<div class="head"><span class="title"></span><span class="sum"></span>' +
       '<span class="spacer"></span>' +
+      '<button class="stchip" title="切换样式: 圆环 / 堆叠条"></button>' +
       '<button class="refresh" title="重新读取"><ha-icon icon="mdi:refresh"></ha-icon></button>' +
       "</div>" +
       '<div class="lmsg"></div>' +
       '<section class="sec">' +
-      '<div class="stack"></div>' +
-      '<div class="rows"></div>' +
+      '<div class="lwbody">' +
+      '<div class="donutWrap"><div class="donut"></div></div>' +
+      '<div class="lwmetrics"><div class="stack"></div><div class="rows"></div>' +
+      '<div class="lwago"></div></div>' +
+      "</div>" +
       '<div class="foot"><span class="tot"></span><span class="ago"></span></div>' +
       "</section>" +
       "</div>";
     this._titleEl = root.querySelector(".head .title");
     this._sumEl = root.querySelector(".head .sum");
     this._msgEl = root.querySelector(".lmsg");
+    this._secEl = root.querySelector(".sec");
     this._stackEl = root.querySelector(".stack");
     this._rowsEl = root.querySelector(".rows");
+    this._donutEl = root.querySelector(".donut");
     this._totEl = root.querySelector(".tot");
-    this._agoEl = root.querySelector(".ago");
+    this._agoEl = root.querySelector(".ago");                       // (旧引用, 可能为 null)
+    this._agoMetricsEl = root.querySelector(".lwago");
+    this._stBtn = root.querySelector(".head .stchip");
     this._refreshBtn = root.querySelector(".head .refresh");
+    this._stBtn.addEventListener("click", () => {
+      this._style = this._style === "donut" ? "bar" : "donut";
+      this._savePref();
+      this._renderAll();
+    });
     this._refreshBtn.addEventListener("click", () => {
       if (this._loading) return;
       this._load(true);
@@ -121,6 +158,7 @@ class LeapmotorLastweekCard extends HTMLElement {
         padding: 14px; box-sizing: border-box;
         font-size: 13px; line-height: 1.4;
         display: flex; flex-direction: column; gap: 10px;
+        align-items: stretch;
       }
       .head { display: flex; align-items: center; gap: 8px; }
       .head .title { font-weight: 600; font-size: 14px; white-space: nowrap; flex: 0 0 auto; }
@@ -131,7 +169,7 @@ class LeapmotorLastweekCard extends HTMLElement {
       .head .spacer { flex: 1; }
       /* 刷新按钮: 圆形白底 + 与外框同款轻阴影; hover 淡蓝 */
       .head button.refresh {
-        width: 30px; height: 30px; padding: 0; border-radius: 50%;
+        width: 27px; height: 27px; padding: 0; border-radius: 50%;
         display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
         color: var(--secondary-text-color, #6b7280);
         background: var(--ha-card-background, var(--card-background-color, #fff));
@@ -143,7 +181,19 @@ class LeapmotorLastweekCard extends HTMLElement {
         background: rgba(var(--rgb-primary-color, 3, 169, 244), .12);
       }
       .head button.refresh.spin { opacity: .45; }
-      .head button.refresh ha-icon { width: 18px; height: 18px; --mdc-icon-size: 18px; }
+      .head button.refresh ha-icon { width: 16px; height: 16px; --mdc-icon-size: 16px; }
+      /* 样式切换钮: 圆形, 只放一个图标(圆环/条形) */
+      .head button.stchip {
+        width: 27px; height: 27px; padding: 0; border-radius: 50%;
+        display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
+        color: var(--secondary-text-color, #6b7280);
+        background: var(--ha-card-background, var(--card-background-color, #fff));
+        border: 1px solid var(--divider-color, rgba(0, 0, 0, .09));
+        box-shadow: 0 1px 3px rgba(0, 0, 0, .13);
+        transition: background .15s ease;
+      }
+      .head button.stchip:hover { background: rgba(var(--rgb-primary-color, 3, 169, 244), .12); }
+      .head button.stchip ha-icon { width: 16px; height: 16px; --mdc-icon-size: 16px; }
       ha-icon { display: inline-flex; width: 16px; height: 16px; --mdc-icon-size: 16px; }
 
       .lmsg { display: none; font-size: 12px; color: var(--secondary-text-color, #6b7280); padding: 2px 2px 0; }
@@ -155,7 +205,8 @@ class LeapmotorLastweekCard extends HTMLElement {
         background: var(--ha-card-background, var(--card-background-color, #fff));
         border: 1px solid var(--divider-color, rgba(0, 0, 0, .09));
         box-shadow: 0 1px 3px rgba(0, 0, 0, .13);
-        border-radius: 14px; padding: 12px;
+        border-radius: 14px; padding: 12px; box-sizing: border-box;
+        width: 100%; min-width: 0;
         display: flex; flex-direction: column; gap: 10px;
       }
       /* 堆叠条: 三段按占比分宽; 空数据不画 */
@@ -178,16 +229,45 @@ class LeapmotorLastweekCard extends HTMLElement {
       .row .vl { font-weight: 600; font-size: 15px; white-space: nowrap; }
       .row .un { font-size: 11px; font-weight: 500; margin-left: 2px; color: var(--secondary-text-color, #6b7280); }
       .row .pc {
-        flex: 0 0 auto; min-width: 40px; text-align: right; font-size: 12px;
+        flex: 0 0 auto; min-width: 46px; text-align: right; font-size: 12px;
         color: var(--secondary-text-color, #6b7280);
       }
+      .sec.mode-donut .pc { display: block; }
       .foot {
-        display: flex; align-items: center; gap: 8px; padding-top: 8px;
-        border-top: 1px solid var(--divider-color, rgba(0, 0, 0, .09));
+        display: flex; align-items: center; gap: 8px;
         font-size: 12px; color: var(--secondary-text-color, #6b7280);
       }
       .foot .tot { font-weight: 600; color: var(--primary-text-color, #212121); }
-      .foot .ago { margin-left: auto; }
+      /* "更新于"紧跟在数据之后, 用一条分割线与明细分开 */
+      .lwago {
+        margin-top: 2px; padding-top: 8px; font-size: 11px; text-align: right;
+        color: var(--secondary-text-color, #6b7280);
+        border-top: 1px solid var(--divider-color, rgba(0, 0, 0, .09));
+      }
+      /* 圆环(仿官方 App) */
+      /* 圆环 + 明细: 宽度够时**左右分**(圆环在左, 数值在右), 窄了自动上下堆叠 */
+      .lwbody { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+      .donutWrap { flex: 0 0 auto; }
+      .lwmetrics { flex: 1 1 170px; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+      .donut { position: relative; flex: 0 0 auto; width: 150px; height: 150px; }
+      .donut svg { display: block; width: 100%; height: 100%; }
+      .donut .ring-bg { fill: none; stroke: var(--secondary-background-color, #e7eaed); stroke-width: 16; }
+      .donut .ring-seg { fill: none; stroke-width: 16; stroke-linecap: butt; transition: stroke-dasharray .3s ease; }
+      .donutCenter {
+        position: absolute; left: 0; top: 0; width: 100%; height: 100%;
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        pointer-events: none; gap: 2px;
+      }
+      .donutCenter .dtot { font-size: 30px; font-weight: 600; line-height: 1; letter-spacing: -.5px; }
+      .donutCenter .dlab { font-size: 11px; color: var(--secondary-text-color, #6b7280); }
+      /* 两种样式互斥显示 */
+      .sec.mode-donut .stack { display: none; }
+      .sec.mode-donut .foot { display: none; }        /* 圆环态合计在圆心, 不需要底部合计 */
+      .sec.mode-bar .donutWrap { display: none; }
+      .sec.mode-bar .row .pc { display: none; }
+      .sec.mode-bar .lwago { display: none; }         /* 条形态"更新于"仍走 .foot */
+      .sec.mode-bar .foot { padding-top: 8px; border-top: 1px solid var(--divider-color, rgba(0, 0, 0, .09)); }
+      .sec.mode-bar .foot .ago { margin-left: auto; }
     `;
   }
 
@@ -266,7 +346,7 @@ class LeapmotorLastweekCard extends HTMLElement {
     this._msgEl.className = "lmsg" + (text ? " on" : "") + (err ? " err" : "");
     // 明细
     const items = [
-      { key: "driver", name: "驱动", color: COLOR_DRIVER },
+      { key: "driver", name: "行车", color: COLOR_DRIVER },
       { key: "ac", name: "空调", color: COLOR_AC },
       { key: "other", name: "其它", color: COLOR_OTHER },
     ];
@@ -295,37 +375,110 @@ class LeapmotorLastweekCard extends HTMLElement {
       const pct = (v != null && total) ? fmtPct(v / total * 100) + "%" : "—";
       rows += '<div class="row" data-key="' + it.key + '">' +
         '<span class="dot ' + it.key + '"></span>' +
-        '<span class="lb">' + esc(it.name) + "</span>" +
+        '<span class="lb">' + esc(it.name) + "能耗</span>" +
         '<span class="vl">' + (v == null ? "—" : fmtKwh(v)) + "</span>" +
         '<span class="un">kWh</span>' +
         '<span class="pc">' + esc(pct) + "</span>" +
         "</div>";
     }
     this._rowsEl.innerHTML = rows;
+    // 圆环(仿官方 App): 环形分段 + 中心合计 + 右侧图例
+    this._renderDonut(items, vals, total);
+    // 两种样式的显隐(类挂在 section 上)
+    this._secEl.className = "sec " + (this._style === "bar" ? "mode-bar" : "mode-donut");
+    if (this._stBtn) {
+      const donut = this._style !== "bar";
+      this._stBtn.innerHTML = '<ha-icon icon="' + (donut ? "mdi:chart-donut" : "mdi:chart-bar") +
+        '"></ha-icon>';
+      this._stBtn.title = donut ? "当前: 圆环(点一下切到条形)" : "当前: 条形(点一下切到圆环)";
+    }
     // 合计 + 更新时间
     if (total != null) {
       this._totEl.textContent = "合计 " + fmtKwh(total) + " kWh";
     } else {
       this._totEl.textContent = "合计 —";
     }
-    this._agoEl.textContent = d && d.fetched_at ? "更新于 " + fmtUpdated(d.fetched_at) : "";
+    // "更新于": 条形态放 foot 右侧; 圆环态放明细下方(lwago, 带分割线, 更紧凑)
+    const agoTxt = d && d.fetched_at ? "更新于 " + fmtUpdated(d.fetched_at) : "";
+    if (this._agoEl) this._agoEl.textContent = agoTxt;
+    if (this._agoMetricsEl) {
+      this._agoMetricsEl.textContent = agoTxt;
+      this._agoMetricsEl.style.display = agoTxt ? "" : "none";
+    }
     // 合计 0(上周没用车/没数据): 明细行保留("—"), 只有一条温和提示
     if (d && total === 0 && !this._err) {
       this._msgEl.textContent = "上周没有能耗记录";
       this._msgEl.className = "lmsg on";
     }
   }
+
+  /** 圆环: 三个环形分段(按占比) + 中心合计; 明细数值沿用条形那套 .rows(名字+数值+占比)。 */
+  _renderDonut(items, vals, total) {
+    if (!this._donutEl) return;
+    const R = 64, CX = 84, CY = 84, C = 2 * Math.PI * R;
+    let segs = '<circle class="ring-bg" cx="' + CX + '" cy="' + CY + '" r="' + R + '"/>';
+    if (total != null && total > 0) {
+      let acc = 0;
+      for (const it of items) {
+        const v = vals[it.key];
+        if (v == null || v <= 0) continue;
+        const frac = v / total;
+        const len = Math.max(0, frac * C);
+        // stroke-dasharray = [本段长度, 其余]; dashoffset 把本段起点推到 acc 处(顺时针)
+        segs += '<circle class="ring-seg" cx="' + CX + '" cy="' + CY + '" r="' + R +
+          '" stroke="' + it.color + '" stroke-dasharray="' + len.toFixed(2) + " " +
+          (C - len).toFixed(2) + '" stroke-dashoffset="' + (-acc * C).toFixed(2) +
+          '" transform="rotate(-90 ' + CX + " " + CY + ')"/>';
+        acc += frac;
+      }
+    }
+    const dtot = total != null ? fmtKwh(total) : "—";
+    this._donutEl.innerHTML =
+      '<svg viewBox="0 0 168 168" preserveAspectRatio="xMidYMid meet">' + segs + "</svg>" +
+      '<div class="donutCenter"><span class="dtot">' + esc(dtot) +
+      '</span><span class="dlab">总能耗(kWh)</span></div>';
+  }
 }
 
-if (!customElements.get("leapmotor-lastweek")) {
-  customElements.define("leapmotor-lastweek", LeapmotorLastweekCard);
+/* ── 自定义元素注册守卫 ──────────────────────────────────────────────────────
+ * HA 新版前端启动时会**整个替换** window.customElements(scoped registry polyfill):
+ * 若本模块在替换前求值, 元素就注册进了被丢弃的旧注册表 —— 前端查"当前"注册表查不到,
+ * 卡片会永久显示 "Custom element does not exist"(不报错、无日志; 冷加载 / 手机 App
+ * 上更易命中, 打开 DevTools 反而掩盖)。上游: home-assistant/frontend#52960、#53890。
+ * 修法: 记住加载时的注册表对象, 一旦它被换掉, 就把尚未生效的元素补注册到"当前"注册表;
+ * HA 的错误卡会在 whenDefined 解析后自动重建, 于是自愈。未换表时轮询自然结束。 */
+const _REG = customElements;
+const _pend = new Map();
+let _pollN = 0;
+function _heal() {
+  if (customElements === _REG || _pend.size === 0) return;   // 注册表没被换 → 无需处理
+  for (const [name, ctor] of [..._pend]) {
+    try {
+      if (!customElements.get(name)) customElements.define(name, ctor);
+      _pend.delete(name);
+    } catch (e) { /* 交给下一轮重试 */ }
+  }
 }
+function _pollHeal() {
+  if (_pend.size === 0 || _pollN >= 30) return;
+  _pollN += 1;
+  setTimeout(() => { _heal(); _pollHeal(); }, 1000);
+}
+function _defineCard(name, ctor) {
+  try {
+    if (!_REG.get(name)) _REG.define(name, ctor);
+  } catch (e) { console.warn(`leapmotor: 注册 ${name} 失败`, e); return; }
+  _pend.set(name, ctor);
+  try { _REG.whenDefined("home-assistant").then(_heal).catch(() => {}); } catch (e) {}
+  _pollHeal();
+}
+_defineCard("leapmotor-lastweek", LeapmotorLastweekCard);
 window.customCards = window.customCards || [];
 if (!window.customCards.some((c) => c.type === "leapmotor-lastweek")) {
   window.customCards.push({
     type: "leapmotor-lastweek",
     name: "零跑·上周能耗",
-    description: "上周能耗拆分: 驱动 / 空调 / 其它(堆叠条 + 明细)",
+    description: "上周能耗拆分: 驱动 / 空调 / 其它(圆环 或 堆叠条 + 明细)",
     preview: false,
     documentationURL: "https://github.com/MiRaToo/ha-leapmotor-cn/blob/main/docs/dashboard.md",
   });
