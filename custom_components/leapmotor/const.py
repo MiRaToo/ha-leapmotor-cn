@@ -56,6 +56,8 @@ LASTWEEK_EC_REFRESH_SECONDS = 3600
 PHOTO_RETRY_WINDOW_SECONDS = 900   # 窗口总长(15 分钟)
 PHOTO_RETRY_STEPS = (15, 30, 60, 120, 300)   # 逐次重试的间隔(递增退避)
 PHOTO_RETRY_EVERY_SECONDS = 30     # (旧值, 兼容保留: 未配置 steps 时的兜底)
+CAR_PICTURE_REFRESH_SECONDS = 21600  # 车辆外观图元数据缓存(6 小时)
+CAR_PICTURE_RETRY_SECONDS = 300     # 元数据接口失败后的重试间隔(5 分钟)
 RATE_LIMIT_COOLDOWN_SECONDS = 900  # 命中限流/风控后的冷却时间(期间用慢档)
 LAUNCH_BOOST_MAX_SECONDS = 600     # 出发提速的最长持续时间, 防止"解锁后不开车"长期高频
 

@@ -20,7 +20,11 @@ log = logging.getLogger(__name__)
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry,
                             add: AddEntitiesCallback) -> None:
-    add([LeapmotorParkingImage(hass, hass.data[DOMAIN][entry.entry_id])])
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    add([
+        LeapmotorParkingImage(hass, coordinator),
+        LeapmotorCarPictureImage(hass, coordinator),
+    ])
 
 
 class LeapmotorParkingImage(LeapmotorEntity, ImageEntity):
@@ -53,4 +57,40 @@ class LeapmotorParkingImage(LeapmotorEntity, ImageEntity):
             return data
         except Exception as err:  # noqa: BLE001
             log.warning("下载驻车照片失败: %s", err)
+            return self._cached
+
+
+class LeapmotorCarPictureImage(LeapmotorEntity, ImageEntity):
+    """按 VIN 从云端接口获取车辆外观图。"""
+
+    _attr_name = "车辆外观图"
+
+    def __init__(self, hass: HomeAssistant, coordinator: LeapmotorCoordinator) -> None:
+        LeapmotorEntity.__init__(self, coordinator, "car_picture")
+        ImageEntity.__init__(self, hass)
+        self._cached_url = ""
+        self._cached: bytes | None = None
+        self._image_last_updated = dt_util.utcnow()
+
+    @property
+    def image_last_updated(self):
+        return self._image_last_updated
+
+    async def async_image(self) -> bytes | None:
+        url = await self.coordinator.async_get_car_picture_url()
+        if not url:
+            return None
+        if url == self._cached_url and self._cached:
+            return self._cached
+        try:
+            session = async_get_clientsession(self.hass)
+            async with session.get(url, timeout=20) as resp:
+                resp.raise_for_status()
+                data = await resp.read()
+            self._cached_url, self._cached = url, data
+            return data
+        except Exception as err:  # noqa: BLE001
+            log.warning("下载车辆外观图失败: %s", err)
+            # 地址可能是带签名的短期直链: 下载失败就清掉元数据缓存, 下次重新取地址
+            self.coordinator.invalidate_car_picture_url()
             return self._cached

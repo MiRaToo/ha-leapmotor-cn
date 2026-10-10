@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import functools
 import json
@@ -26,6 +27,7 @@ from .api import (
     is_signature_error,
     LeapmotorClient,
     parse_lastweek_ec,
+    parse_car_picture_url,
     previous_week_window_seconds,
     Session,
     StateOverrides,
@@ -33,6 +35,8 @@ from .api import (
 )
 from .const import (
     CONF_BATTERY_KWH,
+    CAR_PICTURE_REFRESH_SECONDS,
+    CAR_PICTURE_RETRY_SECONDS,
     CONF_LAUNCH_BOOST,
     CONF_SHORT_STOP_SECONDS,
     DEFAULT_BATTERY_KWH,
@@ -99,6 +103,9 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.vin: str = entry.data.get("vin") or self.session.car_vin
         self.vehicle: Vehicle | None = None
         self.parking_url: str = ""
+        self.car_picture_url: str = ""
+        self._car_picture_refresh_at = 0.0
+        self._car_picture_lock = asyncio.Lock()
         self.state: CarState | None = None      # 最近一帧车况(见 api.CarState)
         self.last_result: str = ""
         # 会话/轮询出的问题(空 = 正常)。账号 token 只有约 6 小时, 过期后需要重新认证
@@ -209,6 +216,39 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 }, 30)
         except Exception as err:  # noqa: BLE001
             log.debug("保存重数据快照失败(忽略): %s", err)
+
+    async def async_get_car_picture_url(self) -> str:
+        """按需获取车辆外观图地址, 并在内存中缓存元数据。"""
+        now = time.monotonic()
+        if now < self._car_picture_refresh_at:
+            return self.car_picture_url
+
+        async with self._car_picture_lock:
+            now = time.monotonic()
+            if now < self._car_picture_refresh_at:
+                return self.car_picture_url
+            self._car_picture_refresh_at = now + CAR_PICTURE_RETRY_SECONDS
+            try:
+                response = await self.hass.async_add_executor_job(
+                    self.client.get_car_picture, self.vin
+                )
+            except Exception as err:  # noqa: BLE001
+                log.warning("获取车辆外观图地址失败: %s", err)
+                return self.car_picture_url
+
+            url = parse_car_picture_url(response)
+            if not url:
+                code = response.get("code") if isinstance(response, dict) else None
+                log.warning("车辆外观图接口未返回 HTTPS 图片地址 (code=%s)", code)
+                return self.car_picture_url
+
+            self.car_picture_url = url
+            self._car_picture_refresh_at = now + CAR_PICTURE_REFRESH_SECONDS
+            return self.car_picture_url
+
+    def invalidate_car_picture_url(self) -> None:
+        """清掉外观图元数据缓存 —— 图片下载失败(如签名 URL 过期)时调用, 下次会重新取地址。"""
+        self._car_picture_refresh_at = 0.0
 
     # ── 数据刷新 ──
     async def _async_update_data(self) -> dict[str, Any]:
