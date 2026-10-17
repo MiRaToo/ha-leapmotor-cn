@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 安装依赖
+        # Pillow 验证上传图片，PyYAML 校验服务声明。
+        run: pip install pytest cryptography pillow pyyaml
+      - name: 跑测试
+        run: pytest -q
+      - name: 校验集成里的 api.py 与 poller/api_client.py 保持同步
+        run: python tools/sync_api.py --check
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 安装前端构建依赖
+        run: npm ci
+      - name: 类型检查 + 构建卡片
+        run: npm run build
+      - name: 校验产物与源码同步(漏跑 npm run build 会在这里失败)
+        # 构建后再 git diff: 若 www/*.js 有变化, 说明提交的产物与 src/ 不同步
+        run: git diff --exit-code -- custom_components/leapmotor/www
+      - name: 卡片、风格与车模冒烟测试
+        run: npm run smoke

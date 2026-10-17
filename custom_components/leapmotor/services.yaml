@@ -1,0 +1,52 @@
+# 本集成注册的服务说明(用于「开发者工具 → 服务」里的界面提示)。
+# 只读素材服务在稳定版中提供，不执行车辆控制指令。
+collect_assets:
+  name: 采集车型素材
+  description: >-
+    只读: 按 VIN 从云端取该车型的 3D 模型包 / 2D 分层图包 / 外观图, 落到 config/leapmotor-assets/,
+    供适配其它车型时使用。不涉及任何车控指令。
+  fields:
+    entry_id:
+      name: 配置条目
+      description: 指定要采集的车辆(多车时用; 留空则取第一辆)
+      required: false
+      example: 01HZ...
+      selector:
+        text:
+    include_h5:
+      name: 一并取查看器包
+      description: 是否连 3D 查看器包一起取(约 4 MB; 同车型只需一次)
+      required: false
+      default: false
+      selector:
+        boolean:
+
+car3d_probe:
+  name: 诊断 3D 车模素材
+  description: >-
+    只读: 把该车 3D 素材链路的云端响应形状完整记录一份(3d/key 响应、两个素材包的状态码 /
+    内容类型 / 字节数 / 头部特征、2D 外观图接口), 落到 config/leapmotor-assets/car3d-diag/,
+    便于排查"素材下载失败 / 3dkey 响应异常 / file is not a zip"这类只有个别车型出现的问题。
+    报告不含 VIN 与完整素材 key。不涉及任何车控指令。
+  fields:
+    entry_id:
+      name: 配置条目
+      description: 指定要探测的车辆(多车时用; 留空则取第一辆)
+      required: false
+      example: 01HZ...
+      selector:
+        text:
+    deep:
+      name: 深探(整包下载并校验)
+      description: 打开后会把两个素材包完整下载并列出内容(约 15 MB); 不是有效 zip 的包会另存一份
+      required: false
+      default: false
+      selector:
+        boolean:
+    variants:
+      name: 比较请求参数
+      description: 对比完整参数与只发送 VIN 的响应形状，会增加一次只读请求；风控命中即停止
+      required: false
+      default: true
+      selector:
+        boolean:

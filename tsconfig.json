@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+
+    // ★ Lit 响应式属性必须为 false: 类字段会影响 LitElement 的属性访问器初始化顺序,
+    //   置 true 会让 @property 声明的响应式失效(元素收不到变化、界面不更新)。
+    "useDefineForClassFields": false,
+    // ★ 按项目要求开启装饰器(当前卡片用无装饰器的 static properties 写法, 保留此项便于日后使用)
+    "experimentalDecorators": true,
+
+    "strict": true,
+    "noImplicitAny": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "resolveJsonModule": true
+  },
+  "include": ["src/**/*.ts"]
+}

@@ -1,0 +1,831 @@
+"""行程记录: 状态机 / 记账 / 轨迹 / 漏采补记 —— 纯逻辑离线测试。
+
+真车行为里最要紧的几条(见 custom_components/leapmotor/trips.py 的模块说明):
+挡位判行程、停车要连续确认、重复帧不算、里程优先总里程差分、短行程丢弃、
+失联后按里程跳变补记。这些都在这里钉住。
+"""
+from __future__ import annotations
+
+import asyncio
+import pathlib
+import sys
+import time
+
+import pytest
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "custom_components" / "leapmotor"))
+sys.path.insert(0, str(ROOT / "poller"))
+
+import api_client  # noqa: E402
+from trips import (  # noqa: E402
+    Trip, TripRecorder, downsample, haversine_km, month_key_of, pick_distance_km,
+    reconstruction_duration_min, track_length_km,
+)
+
+LAT, LON = 31.230416, 121.473701          # 示例坐标(GCJ-02, 与其它测试一致)
+T0 = 1_790_000_000.0                      # 固定时间基准, 便于断言
+
+
+class FakeStore:
+    """替身: 记下最后一次 dump, 便于断言"持久化了什么"。"""
+
+    def __init__(self, data=None):
+        self.data = data
+        self.saved = []
+        self.removed = False
+
+    async def async_load(self):
+        return self.data
+
+    async def async_save(self, data):
+        self.data = data
+
+    def async_delay_save(self, fn, delay):
+        self.saved.append(fn())
+        self.data = self.saved[-1]
+
+    async def async_remove(self):
+        self.removed = True
+        self.data = None
+
+
+class ShardFS:
+    """分片"文件系统"替身: month → FakeStore。
+
+    多个 recorder 共享同一个实例 = 模拟 HA 重启后新进程读同样的分片文件。
+    """
+
+    def __init__(self):
+        self.files: dict[str, FakeStore] = {}
+
+    def factory(self, month: str) -> FakeStore:
+        return self.files.setdefault(month, FakeStore())
+
+    def tracks(self, month: str) -> dict:
+        fs = self.files.get(month)
+        return (fs.data or {}).get("tracks") or {} if fs else {}
+
+
+def frame(ts: float, *, odo=1000.0, soc=80.0, gear=1, speed=30.0,
+          lat=LAT, lon=LON, sts=None, plug=0):
+    """造一帧车况(走真实解析器, 与线上同一条路径)。"""
+    return api_client.parse_car_state({
+        "code": 0,
+        "data": {
+            "vin": "TESTVIN", "collectTime": int(ts * 1000),
+            "signalMap": {
+                "sts": int(sts if sts is not None else ts * 1000),
+                "1318": odo, "100003": soc, "1010": gear, "1319": speed,
+                "2": lon, "3": lat, "1149": plug,
+            },
+        },
+    })
+
+
+def recorder(shards: ShardFS | None = None, **kw):
+    fs = shards if shards is not None else ShardFS()
+    return TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                        poll_seconds_getter=lambda: 6, store=FakeStore(),
+                        shard_store_factory=fs.factory, **kw)
+
+
+# ── 纯函数 ──
+def test_pick_distance_prefers_odometer_but_trusts_gps_on_kilometre_crossing():
+    assert pick_distance_km(1, 0.3) == 0.3          # 跨公里边界的挪车 → 信 GPS
+    assert pick_distance_km(1, 2.0) == 1.0          # Δodo=1 但 GPS 说真有 2km → 信总里程
+    assert pick_distance_km(7, 6.2) == 7.0          # Δodo >= 2 → 信总里程
+    assert pick_distance_km(None, 3.4) == 3.4       # 总里程不可用 → 信 GPS
+    assert pick_distance_km(0, 0.42) == 0.42        # 整数里程没跳, 但 GPS 有位移
+    assert pick_distance_km(None, None) is None
+
+
+def test_track_length_and_downsample():
+    pts = [[31.2304, 121.4737], [31.2304, 121.4747]]     # 经度差 0.001° ≈ 95 m
+    km = track_length_km(pts)
+    assert 0.05 < km < 0.15
+    assert track_length_km([[1, 1]]) is None
+    many = [[30 + i / 1000, 120 + i / 1000] for i in range(500)]
+    out = downsample(many, 100)
+    assert len(out) == 100 and out[0] == many[0] and out[-1] == many[-1]
+
+
+def test_track_length_accepts_speed_third_dim():
+    """带车速的轨迹点 [lat, lon, speed] 必须能算长度/抽稀(热力图靠它着色)。
+
+    回归: 早先 `track_length_km` 用 `(la1, lo1), (la2, lo2) = …` 解包, 遇到三元点会抛
+    ValueError —— 一旦轨迹点开始带 speed(`_add_point` 的新行为), 行程收尾就会崩。
+    """
+    pts3 = [[31.2304, 121.4737, 42.5], [31.2304, 121.4747, 61.0]]
+    km = track_length_km(pts3)
+    assert 0.05 < km < 0.15
+    out = downsample(pts3, 1)          # max_points < 3 → 原样返回
+    assert out == pts3
+    assert downsample(pts3, 100)[0] == pts3[0]      # 少量点原样保留(含 speed)
+
+
+def test_haversine_sanity():
+    assert haversine_km(31.2304, 121.4737, 31.2304, 121.4737) == 0.0
+    assert 1.0 < haversine_km(31.0, 121.0, 31.01, 121.0) < 1.2   # 0.01° 纬度 ≈ 1.11 km
+
+
+# ── 状态机 ──
+def test_full_trip_lifecycle():
+    rec = recorder()
+    rec.process(frame(T0, odo=1000, soc=80, gear=1, speed=30), now=T0)
+    assert rec.active is not None, "挡位 D 应开始行程"
+
+    # 行驶 10 分钟: 位置前进、里程 +3、电量 -4%
+    for i in range(1, 11):
+        rec.process(frame(T0 + i * 60, odo=1000 + i * 0.3, soc=80 - i * 0.4,
+                          lat=LAT + i * 0.002, lon=LON + i * 0.002),
+                    now=T0 + i * 60)
+
+    # 停车: 挡位回 P, 连续 60 秒没动才收尾
+    t_end = T0 + 600
+    for i in range(1, 12):
+        rec.process(frame(t_end + i * 6, odo=1003, soc=76, gear=0, speed=0),
+                    now=t_end + i * 6)
+        if i <= 9:
+            assert rec.active is not None, "停车确认窗口内不该收尾(红灯/临时停车)"
+    assert rec.active is None, "停车满 60 秒应收尾"
+
+    trip = rec.trips[-1]
+    assert trip.distance_km == pytest.approx(3.0)                   # Δodo 为主
+    assert trip.energy_kwh == pytest.approx(0.04 * 70, abs=0.01)    # 4% × 70 kWh
+    assert trip.efficiency == pytest.approx(2.8 / 3.0 * 100, abs=0.5)
+    assert trip.duration_min == pytest.approx(10.0, abs=0.3)
+    assert len(trip.points) >= 5
+    assert trip.start_lat and trip.end_lat
+    assert trip.summary()["point_count"] == len(trip.points)
+
+
+def test_short_trip_is_dropped():
+    rec = recorder()
+    rec.process(frame(T0, odo=1000, soc=80, gear=1), now=T0)
+    for i in range(1, 6):                       # 只挪了 0.1 km
+        rec.process(frame(T0 + i * 6, odo=1000.1, soc=80, gear=1,
+                          lat=LAT + i * 0.00005), now=T0 + i * 6)
+    for i in range(1, 12):
+        rec.process(frame(T0 + 40 + i * 6, odo=1000.1, soc=80, gear=0, speed=0),
+                    now=T0 + 40 + i * 6)
+    assert rec.trips == [], "0.1 km 的挪车不该记成行程"
+
+
+def test_stale_frames_do_not_add_points_but_still_end_trip():
+    """车端休眠时云端反复回同一帧(sts 不变): 不写轨迹点, 但仍要能收尾。"""
+    rec = recorder()
+    rec.process(frame(T0, odo=1000, soc=80, gear=1), now=T0)
+    for i in range(1, 6):
+        rec.process(frame(T0 + i * 6, odo=1000.5, soc=79, gear=1,
+                          lat=LAT + 0.001, lon=LON + 0.001, sts=T0 * 1000),
+                    now=T0 + i * 6)             # 帧时间戳一直是 T0
+    assert len(rec._points) <= 1, "重复帧不该写轨迹点"
+    for i in range(1, 12):
+        rec.process(frame(T0 + 60 + i * 6, odo=1000.5, soc=79, gear=0, speed=0,
+                          sts=T0 * 1000), now=T0 + 60 + i * 6)
+    assert rec.active is None, "重复帧仍要喂状态机 → 能收尾"
+
+
+def test_frozen_watchdog_ends_trip_and_rewinds_end_time():
+    rec = recorder()
+    rec.process(frame(T0, odo=2000, soc=60, gear=1, speed=40), now=T0)
+    rec.process(frame(T0 + 60, odo=2001, soc=59, gear=1, speed=40,
+                      lat=LAT + 0.01), now=T0 + 60)
+    # 之后车端再没上报新帧(时间戳停在 T0+60), 但轮询还在跑
+    for i in range(1, 20):
+        rec.process(frame(T0 + 60 + i * 120, odo=2001, soc=59, gear=1, speed=40,
+                          sts=(T0 + 60) * 1000), now=T0 + 60 + i * 120)
+    trip = rec.trips[-1]
+    assert trip.frozen is True
+    assert trip.ended_at == pytest.approx(T0 + 60, abs=1), "结束时刻应回拨到最后一次真实帧"
+    assert trip.duration_min == pytest.approx(1.0, abs=0.1)
+
+
+def test_reconstruct_when_odometer_jumps_while_parked():
+    rec = recorder()
+    rec.process(frame(T0, odo=3000, soc=50, gear=0, speed=0), now=T0)          # 基线
+    rec.process(frame(T0 + 60, odo=3004.0, soc=46, gear=0, speed=0), now=T0 + 60)
+    assert rec.trips, "里程跳变应补记一条行程"
+    trip = rec.trips[-1]
+    assert trip.reconstructed is True and trip.points == []
+    assert trip.distance_km == pytest.approx(4.0)
+    assert trip.energy_kwh == pytest.approx(0.04 * 70, abs=0.01)
+
+
+def test_odometer_jump_with_soc_rise_goes_to_gaps_not_trip():
+    rec = recorder()
+    rec.process(frame(T0, odo=4000, soc=40, gear=0, speed=0), now=T0)
+    rec.process(frame(T0 + 60, odo=4003, soc=45, gear=0, speed=0), now=T0 + 60)
+    assert rec.trips == [], "期间电量上升 → 不该当成行程"
+    assert len(rec.gaps) == 1 and rec.gaps[0]["distance_km"] == pytest.approx(3.0)
+
+
+def test_plugging_in_ends_trip_immediately():
+    rec = recorder()
+    rec.process(frame(T0, odo=2500, soc=30, gear=1, speed=20), now=T0)
+    rec.process(frame(T0 + 120, odo=2501, soc=29, gear=0, speed=0, plug=2), now=T0 + 120)
+    assert rec.active is None, "插枪应立即结束行程(不用等 60 秒确认)"
+
+
+def test_code_5_is_not_plugged_and_does_not_cut_the_trip():
+    """1149=5 是**非连接**(真机: 没插枪时 0↔5 交替)—— 不能当成"插枪"。
+
+    旧写法 `bool(st.get("charge_connection"))` 会在驻车等红灯、车端报 5 的那一帧
+    立刻收尾行程(把一段行程切成两段)。插枪判据必须走 `charge_plugged` 的白名单。
+    """
+    rec = recorder()
+    rec.process(frame(T0, odo=2500, soc=30, gear=1, speed=20), now=T0)
+    # 车停住(挡位 D, 没插枪), 车端报 1149=5
+    rec.process(frame(T0 + 20, odo=2500.3, soc=30, gear=1, speed=0, plug=5), now=T0 + 20)
+    assert rec.active is not None, "1149=5 不是插枪, 不该提前收尾"
+    # 再往前开一点, 行程应继续
+    rec.process(frame(T0 + 60, odo=2501, soc=29, gear=1, speed=25,
+                      lat=LAT + 0.01), now=T0 + 60)
+    assert rec.active is not None and len(rec._points) >= 2, "行程应正常继续并记轨迹"
+
+
+# ── 持久化与查询 ──
+def test_persistence_and_resume_after_restart():
+    store = FakeStore()
+    rec = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                       poll_seconds_getter=lambda: 6, store=store)
+    rec.process(frame(T0, odo=5000, soc=70, gear=1, speed=25), now=T0)
+    rec.process(frame(T0 + 60, odo=5001, soc=69, gear=1, speed=25,
+                      lat=LAT + 0.01), now=T0 + 60)
+    dumped = rec._dump()
+    assert dumped["active"] is not None and dumped["active"]["points"], "进行中的行程要落盘"
+
+    rec2 = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                        poll_seconds_getter=lambda: 6, store=FakeStore(dumped))
+    asyncio.run(rec2.async_load())
+    assert rec2.active is not None, "重启后应接续未完成的行程"
+    assert rec2.active.id == rec.active.id
+    # 进行中的轨迹点存在记录器的 _points 里(dump 时一并落盘), 恢复后应完整回来
+    assert rec2.active.points == rec._points and len(rec2.active.points) >= 2
+
+
+# ── 坐标空间迁移(公式修复的配套) ──
+def _legacy_inv(g_lat, g_lon):
+    """复刻**旧版(错误)** gcj02_to_wgs84 的输出: 数值逼近 legacy_fwd(x) = GCJ 的解。"""
+    from trips import _legacy_buggy_wgs_to_gcj
+    lat, lon = g_lat, g_lon
+    for _ in range(4):
+        f_lat, f_lon = _legacy_buggy_wgs_to_gcj(lat, lon)
+        lat -= f_lat - g_lat
+        lon -= f_lon - g_lon
+    return lat, lon
+
+
+def test_legacy_trip_coords_are_migrated_on_load_and_idempotent():
+    """旧存储(坐标空间 v1, 偏东数百米)→ 加载时自动校正为正确的 WGS-84; 且不重复迁移。"""
+    old_lat, old_lon = _legacy_inv(LAT, LON)        # 旧版对外发布的"WGS"(错误空间)
+    exp_lat, exp_lon = api_client.gcj02_to_wgs84(LAT, LON)   # 修复后的正确值
+    # 先证明构造出来的旧值确实偏了(≈几百米), 免得测了个假场景
+    assert abs(old_lon - exp_lon) > 0.004           # > 400 m
+    shards = ShardFS()
+    store = FakeStore({
+        "trips": [{
+            "id": "legacy1", "started_at": T0 - 600, "ended_at": T0, "distance_km": 5.0,
+            "start_lat": old_lat, "start_lon": old_lon,
+            "end_lat": old_lat, "end_lon": old_lon,
+            "points": [[old_lat, old_lon], [old_lat + 0.001, old_lon + 0.001]],
+        }],
+        # 旧存储里没有 coords_version 键(缺失 = v1)
+    })
+    rec = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                       poll_seconds_getter=lambda: 6, store=store,
+                       shard_store_factory=shards.factory)
+    asyncio.run(rec.async_load())
+    t = rec.trips[0]
+    assert t.start_lat == pytest.approx(exp_lat, abs=1e-6)
+    assert t.start_lon == pytest.approx(exp_lon, abs=1e-6)
+    assert t.end_lon == pytest.approx(exp_lon, abs=1e-6)
+    # 轨迹点也迁移了(首点=同一坐标); 迁移后点住在分片里, 内存镜像应已挂回
+    assert t.points[0][0] == pytest.approx(exp_lat, abs=1e-6)
+    assert t.points[0][1] == pytest.approx(exp_lon, abs=1e-6)
+    assert t.point_count == 2
+    # 迁移后落盘带版本标记, 且索引里不再有 points
+    dumped = rec._dump()
+    assert dumped["coords_version"] == 2
+    assert dumped["shard_version"] == 1
+    assert "points" not in dumped["trips"][0]
+    assert len(shards.tracks(month_key_of(T0 - 600))["legacy1"]) == 2
+    # 幂等: 再加载一次(带版本标记)坐标不再变化
+    rec2 = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                        poll_seconds_getter=lambda: 6, store=FakeStore(dumped),
+                        shard_store_factory=shards.factory)
+    asyncio.run(rec2.async_load())
+    assert rec2.trips[0].start_lon == pytest.approx(exp_lon, abs=1e-9)
+    assert rec2.trips[0].points[0][1] == pytest.approx(exp_lon, abs=1e-9)
+
+
+def test_active_trip_coords_migrate_with_points_consistency():
+    """进行中的行程(active)也要迁移, 且 _points 与 active.points 保持一致。"""
+    old_lat, old_lon = _legacy_inv(LAT, LON)
+    exp_lat, exp_lon = api_client.gcj02_to_wgs84(LAT, LON)
+    pts = [[old_lat, old_lon], [old_lat + 0.0005, old_lon + 0.0005]]
+    store = FakeStore({"active": {
+        "id": "live1", "started_at": T0 - 300, "start_lat": old_lat, "start_lon": old_lon,
+        "points": pts,
+    }})
+    rec = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                       poll_seconds_getter=lambda: 6, store=store)
+    asyncio.run(rec.async_load())
+    assert rec.active is not None
+    assert rec.active.start_lon == pytest.approx(exp_lon, abs=1e-6)
+    assert rec._points[0][1] == pytest.approx(exp_lon, abs=1e-6), "_points 与 active 同步"
+    assert rec._points is not rec.active.points, "仍是各自独立的列表(避免共享引用)"
+
+
+def test_stats_buckets():
+    rec = recorder()
+    day = 86400.0
+    for k, (offset, km, kwh) in enumerate(((0, 10, 1.5), (day, 20, 3.0), (5 * day, 30, 4.5))):
+        rec.trips.append(Trip(id=f"t{k}", started_at=T0 - offset - 1800,
+                              ended_at=T0 - offset, distance_km=km, energy_kwh=kwh))
+    st = rec.stats(now=T0)
+    assert st["today"]["count"] == 1 and st["today"]["km"] == 10
+    assert st["days7"]["count"] == 3 and st["days7"]["km"] == 60      # 含今天
+    assert st["days30"]["count"] == 3
+    assert st["today"]["kwh_per_100km"] == pytest.approx(15.0)
+
+
+def test_recent_list_and_delete():
+    rec = recorder()
+    rec.trips.append(Trip(id="abc", started_at=T0, ended_at=T0 + 600, distance_km=5.0))
+    rec.trips.append(Trip(id="def", started_at=T0 + 700, ended_at=T0 + 1300, distance_km=2.0))
+    recent = rec.recent(10)
+    assert recent[0]["id"] == "def" and "points" not in recent[0]
+    assert rec.last_trip is not None and rec.last_trip.id == "def"
+    assert asyncio.run(rec.delete("abc")) is True
+    assert asyncio.run(rec.delete("abc")) is False
+    assert rec.get("def") is not None
+
+
+def test_summaries_are_kept_forever_and_shard_roundtrip_after_restart():
+    """摘要永久保留(不再按条数裁剪); 轨迹按月分片, 重启后按需读回。"""
+    shards = ShardFS()
+    rec = recorder(shards)
+    rec.trips.append(Trip(id="old", started_at=T0 - 400 * 86400, ended_at=T0 - 400 * 86400 + 600,
+                          distance_km=5.0, point_count=2))
+    rec._put_tracks(month_key_of(T0 - 400 * 86400), "old", [[LAT, LON, 30.0, T0 - 400 * 86400]])
+    rec.trips.append(Trip(id="new", started_at=T0, ended_at=T0 + 600, distance_km=5.0,
+                          point_count=2))
+    rec._put_tracks(month_key_of(T0), "new", [[LAT, LON, 30.0, T0], [LAT + .01, LON + .01, 40.0, T0 + 60]])
+    dumped = rec._dump()
+    # 索引里没有轨迹点(只有摘要); 分片文件里才有
+    assert all("points" not in d for d in dumped["trips"])
+    assert dumped["shard_version"] == 1
+    assert len(shards.tracks(month_key_of(T0 - 400 * 86400))["old"]) == 1
+
+    rec2 = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                        poll_seconds_getter=lambda: 6, store=FakeStore(dumped),
+                        shard_store_factory=shards.factory)
+    asyncio.run(rec2.async_load())
+    assert len(rec2.trips) == 2, "摘要不再按条数裁剪"
+    assert rec2.get("new").point_count == 2
+    # 重启后: 最新行程(常驻月)的点已挂回内存; 老月份按需读分片
+    assert rec2.get("new").points[0][2] == 30.0
+    pts = asyncio.run(rec2.track("old"))
+    assert len(pts) == 1 and pts[0][0] == pytest.approx(LAT)
+
+
+def test_migration_splits_index_points_into_month_shards():
+    """旧布局(轨迹点在索引里) → 加载时自动拆进按月分片, 索引去点, 且幂等。"""
+    shards = ShardFS()
+    month = month_key_of(T0)
+    idx = FakeStore({
+        "trips": [
+            {"id": "a", "started_at": T0, "ended_at": T0 + 600, "distance_km": 5.0,
+             "points": [[LAT, LON], [LAT + .01, LON + .01]]},
+            {"id": "b", "started_at": T0 + 700, "ended_at": T0 + 1300, "distance_km": 2.0,
+             "points": [[LAT, LON]]},
+        ],
+        "coords_version": 2,
+    })
+    rec = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                       poll_seconds_getter=lambda: 6, store=idx, shard_store_factory=shards.factory)
+    asyncio.run(rec.async_load())
+    assert sorted(shards.tracks(month)) == ["a", "b"]
+    assert rec.get("a").point_count == 2 and rec.get("b").point_count == 1
+    dumped = rec._dump()          # 迁移后索引不再写点
+    assert all("points" not in d for d in dumped["trips"])
+    assert dumped["shard_version"] == 1
+    # 幂等: 再加载一次不会重复计数/丢点
+    rec2 = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                        poll_seconds_getter=lambda: 6, store=FakeStore(dumped),
+                        shard_store_factory=shards.factory)
+    asyncio.run(rec2.async_load())
+    assert sorted(shards.tracks(month)) == ["a", "b"]
+    assert len(asyncio.run(rec2.track("a"))) == 2
+
+
+def test_store_limit_drops_oldest_month_tracks_not_summaries():
+    """轨迹存储上限: 从最老的月份整月清理轨迹; 摘要保留并标注 track_dropped。"""
+    shards = ShardFS()
+    now_ts = time.time()
+    now_month = month_key_of(now_ts)                 # 当月(保护对象)
+    old_ts = now_ts - 90 * 86400
+    old_month = month_key_of(old_ts)
+    rec = recorder(shards, store_limit_mb=0.001)     # 1 KB 上限 → 只留得下当月的轨迹
+    big = [[LAT, LON, 30.0, now_ts]] * 200           # ≈ 8 KB
+    rec.trips.append(Trip(id="old", started_at=old_ts, ended_at=old_ts + 600,
+                          distance_km=5.0, point_count=200))
+    rec._put_tracks(old_month, "old", big)
+    rec.trips.append(Trip(id="new", started_at=now_ts - 600, ended_at=now_ts,
+                          distance_km=5.0, point_count=200))
+    rec._put_tracks(now_month, "new", big)
+    dropped = asyncio.run(rec.async_enforce_store_limit())
+    assert dropped == [old_month], "从最老的月份开始清理"
+    assert shards.files[old_month].removed is True, "分片文件被删除"
+    old = rec.get("old")
+    assert old.point_count == 0 and old.track_dropped is True and old.points == []
+    assert rec.get("old").distance_km == 5.0, "摘要(里程/时间)必须保留"
+    assert rec.get("new").point_count == 200, "当月不动"
+    assert asyncio.run(rec.track("old")) == []
+    assert len(asyncio.run(rec.track("new"))) == 200
+
+
+def test_store_limit_never_drops_current_month_and_usage_stats():
+    """上限小于当月体积时保留当月(只记日志); 占用统计把轨迹/摘要分开报。"""
+    shards = ShardFS()
+    now_ts = time.time()
+    now_month = month_key_of(now_ts)
+    rec = recorder(shards, store_limit_mb=0.001)
+    rec.trips.append(Trip(id="cur", started_at=now_ts - 600, ended_at=now_ts,
+                          distance_km=5.0, point_count=500))
+    rec._put_tracks(now_month, "cur", [[LAT, LON, 30.0, now_ts]] * 500)
+    assert asyncio.run(rec.async_enforce_store_limit()) == []
+    assert rec.get("cur").point_count == 500
+
+    rec.store_limit_mb = 0.0                          # 0 = 不限制
+    asyncio.run(rec.async_enforce_store_limit())
+    usage = asyncio.run(rec.async_store_usage())
+    assert usage["limit_mb"] == 0 and usage["over"] is False
+    assert usage["months"] == 1 and usage["trips"] == 1
+    assert usage["tracks_bytes"] > 0 and usage["index_bytes"] > 0
+    assert usage["tracks_mb"] > 0
+    assert rec.store_usage_snapshot() is not None     # 传感器读的快照
+
+
+def test_list_trips_by_window_and_month_index():
+    """列表接口: 滚动窗口(days+end)跨月取数; month 取整月; months_index 给月份跳转摘要。"""
+    rec = recorder()
+    # 以"现在"为锚造三段(按时间顺序 append, 与运行期一致): 90 天前 / 40 天前 / 今天
+    now = time.time()
+    for tid, offset, km in (("d90", 90 * 86400, 30.0), ("d40", 40 * 86400, 20.0), ("today", 3600, 10.0)):
+        rec.trips.append(Trip(id=tid, started_at=now - offset, ended_at=now - offset + 1800,
+                              distance_km=km))
+    win30 = rec.list_trips(100, days=30, end=now)
+    assert [t["id"] for t in win30] == ["today"]
+    win90 = rec.list_trips(100, days=90, end=now)
+    assert [t["id"] for t in win90] == ["today", "d40"]        # 90 天窗口含 40 天前, 不含 90 天前
+    month_old = month_key_of(now - 90 * 86400)
+    got = rec.list_trips(100, month=month_old)
+    assert [t["id"] for t in got] == ["d90"]
+    months = rec.months_index()
+    assert months[0]["month"] == month_key_of(now) and months[0]["count"] >= 1
+    assert all("km" in m and "count" in m for m in months)
+
+
+def test_tracks_batch_before_anchor_crosses_months():
+    """批量轨迹(叠加用): 截至锚点取最近 N 段有轨迹的行程, 跨月也能取到。"""
+    rec = recorder()
+    import time as _time
+    now = _time.time()
+    for tid, offset in (("a", 40 * 86400), ("b", 3600)):       # a=上月, b=本月
+        rec.trips.append(Trip(id=tid, started_at=now - offset, ended_at=now - offset + 600,
+                              distance_km=3.0, point_count=3))
+        rec._put_tracks(month_key_of(now - offset), tid,
+                        [[LAT, LON, 30.0, now - offset], [LAT, LON, 31.0, now - offset + 60],
+                         [LAT, LON, 32.0, now - offset + 120]])
+    out = asyncio.run(rec.tracks_for(before=now, limit=10, max_points=0))
+    assert [x["trip"]["id"] for x in out] == ["b", "a"], "新→旧, 且跨月都在"
+    assert out[1]["points"][0][0] == pytest.approx(LAT)
+    # 抽稀: 3 点抽到 3 点不变; 锚点更早时只取更早那段
+    out2 = asyncio.run(rec.tracks_for(before=now - 100000, limit=10, max_points=0))
+    assert [x["trip"]["id"] for x in out2] == ["a"]
+    assert all("point_count" in x["trip"] for x in out)
+
+
+def test_delete_removes_track_from_shard():
+    """删行程: 摘要在索引里删掉, 点在分片里删掉, 分片文件保留(同月还有别的段)。"""
+    shards = ShardFS()
+    rec = recorder(shards)
+    month = month_key_of(T0)
+    for tid in ("keep", "drop"):
+        rec.trips.append(Trip(id=tid, started_at=T0, ended_at=T0 + 600, distance_km=2.0,
+                              point_count=2))
+        rec._put_tracks(month, tid, [[LAT, LON], [LAT + .01, LON + .01]])
+    assert asyncio.run(rec.delete("drop")) is True
+    assert rec.get("drop") is None
+    assert "drop" not in shards.tracks(month) and "keep" in shards.tracks(month)
+    assert len(asyncio.run(rec.track("keep"))) == 2
+
+
+# ── 真实文件系统路径(HA 运行时: 旧文件备份 / 按文件大小判上限) ──
+import json     # noqa: E402
+import os       # noqa: E402
+
+
+class _FileStore:
+    """把 dump 写进真实文件的替身 —— 让占用统计/上限判断走"读文件大小"的真实分支。"""
+
+    def __init__(self, path):
+        self.path = str(path)
+        self.data = None
+
+    async def async_load(self):
+        if os.path.exists(self.path):
+            with open(self.path, encoding="utf-8") as fh:
+                return json.load(fh)
+        return None
+
+    async def async_save(self, data):
+        self.data = data
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+
+    def async_delay_save(self, fn, delay):          # noqa: ARG002
+        self.data = fn()
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(self.data, fh, ensure_ascii=False)
+
+    async def async_remove(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+        self.data = None
+
+
+class _FakeHass:
+    """只提供记录器用到的那几样: config.path / async_add_executor_job / async_create_task。"""
+
+    class _Config:
+        def __init__(self, root): self._root = root
+        def path(self, *parts): return os.path.join(self._root, *parts)
+
+    def __init__(self, root):
+        self.config = self._Config(root)
+        self.tasks = []
+
+    async def async_add_executor_job(self, fn, *args):
+        return fn(*args)
+
+    def async_create_task(self, coro):
+        task = asyncio.ensure_future(coro)
+        self.tasks.append(task)
+        return task
+
+
+def test_real_fs_migration_backs_up_and_enforces_by_file_size(tmp_path):
+    """HA 运行时路径: 迁移前备份旧索引; 上限判断按**真实文件大小**, 清理时删掉分片文件。"""
+    storage = tmp_path / ".storage"
+    storage.mkdir()
+    index_path = storage / "leapmotor_TESTVIN_trips"
+    old = {
+        "trips": [{"id": "legacy", "started_at": time.time() - 400 * 86400,
+                   "ended_at": time.time() - 400 * 86400 + 600, "distance_km": 5.0,
+                   "points": [[LAT, LON], [LAT + .01, LON + .01]]}],
+        "coords_version": 2,
+    }
+    index_path.write_text(json.dumps(old), encoding="utf-8")
+    hass = _FakeHass(str(tmp_path))
+
+    def factory(month):
+        return _FileStore(storage / f"leapmotor_TESTVIN_tracks_{month}")
+
+    rec = TripRecorder(hass=hass, vin="TESTVIN", capacity_kwh=70.0,
+                       poll_seconds_getter=lambda: 6, store=FakeStore(old),
+                       shard_store_factory=factory)
+    asyncio.run(rec.async_load())
+    # 旧索引被备份(只此一次), 分片以真实文件落盘
+    bak = storage / "leapmotor_TESTVIN_trips.pre-shard.bak"
+    assert bak.exists() and json.loads(bak.read_text(encoding="utf-8"))["trips"][0]["points"]
+    month = month_key_of(time.time() - 400 * 86400)
+    shard_file = storage / f"leapmotor_TESTVIN_tracks_{month}"
+    assert shard_file.exists() and len(json.loads(shard_file.read_text(encoding="utf-8"))["tracks"]["legacy"]) == 2
+    assert rec.get("legacy").point_count == 2
+
+    # 占用统计: 轨迹体积 = 真实文件大小
+    usage = asyncio.run(rec.async_store_usage(force=True))
+    assert usage["tracks_bytes"] == os.path.getsize(shard_file)
+    assert usage["months"] == 1
+
+    # 上限压到 1 字节 → 该月轨迹被清、文件被删, 摘要与它上面的里程还在
+    rec.store_limit_mb = 0.000001
+    dropped = asyncio.run(rec.async_enforce_store_limit())
+    assert dropped == [month]
+    assert not shard_file.exists()
+    assert rec.get("legacy").point_count == 0 and rec.get("legacy").track_dropped is True
+    assert rec.get("legacy").distance_km == 5.0
+    assert bak.exists(), "备份不受清理影响"
+
+
+# ── 补记行程的时间戳(真机暴露的问题) ──
+def test_reconstructed_trip_time_is_observation_window_not_backwards():
+    """补记的时间只能是"两次观测之间", 不能出现"结束早于开始"。
+
+    真机上曾出现 09-30 15:15 → 15:14(起止颠倒), 因为当时拿"当前帧时间"当起点;
+    车端时钟比墙钟快时就会出现倒流。现在起点用**上一帧**的时间, 并标 approx_time。
+    """
+    rec = recorder()
+    # 第一次看到: 停车, odo=9648
+    rec.process(frame(T0, odo=9648, soc=80.2, gear=0, speed=0), now=T0)
+    # 100 秒后回来, 里程涨了 4 km(中间车动过, 但我们只看到旧帧)
+    rec.process(frame(T0 + 100, odo=9652, soc=79.1, gear=0, speed=0), now=T0 + 100)
+    trip = rec.trips[-1]
+    assert trip.reconstructed is True
+    assert trip.approx_time is True, "补记的时间是观测区间, 要标出来"
+    assert trip.ended_at >= trip.started_at, "不能出现结束早于开始"
+    assert trip.started_at == pytest.approx(T0, abs=1), "起点应为上一帧时间"
+    assert trip.ended_at == pytest.approx(T0 + 100, abs=1)
+    assert trip.gap_seconds == pytest.approx(100, abs=1)
+    assert trip.start_lat and trip.end_lat, "有定位时要记下起终点坐标"
+
+
+def test_pretrip_gap_is_accounted_before_the_trip_starts():
+    """起飞时如果里程已经跳过(云端在开车期间给旧帧), 那段漏采要先记账, 不能吞掉。"""
+    rec = recorder()
+    rec.process(frame(T0, odo=9706, soc=66.1, gear=0, speed=0), now=T0)      # 上次看到: 9706
+    # 20 分钟后车已经在开了, 而且里程已经涨到 9723(中间那段我们没看见)
+    rec.process(frame(T0 + 1200, odo=9723, soc=62.0, gear=1, speed=40), now=T0 + 1200)
+    assert len(rec.trips) == 1, "起飞前那段漏采应先补记一条"
+    gap_trip = rec.trips[0]
+    assert gap_trip.reconstructed is True and gap_trip.distance_km == pytest.approx(17.0)
+    assert rec.active is not None, "同时正常行程应该已经开始"
+    assert rec.active.start_odo == pytest.approx(9723.0)
+
+
+def test_stats_counts_reconstructed():
+    rec = recorder()
+    rec.process(frame(T0, odo=100, soc=50, gear=0, speed=0), now=T0)
+    rec.process(frame(T0 + 60, odo=105, soc=45, gear=0, speed=0), now=T0 + 60)
+    st = rec.stats(now=T0 + 60)
+    assert st["reconstructed"] == 1
+
+
+def test_old_store_data_with_reversed_reconstructed_time_is_normalized():
+    """旧版本写下的补记行程(时间倒流、没有 approx_time)在载入时应被规整。
+
+    真机证据: 存储里那段 09-30 15:15:12 → 15:14:32 的补记, 就是修复前写的。
+    """
+    old = {
+        "trips": [{"id": "old1", "started_at": T0 + 40, "ended_at": T0,
+                   "distance_km": 15.0, "reconstructed": True, "points": []}],
+        "gaps": [], "last_odo": 1.0, "last_soc": 50.0, "active": None,
+    }
+    rec = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                       poll_seconds_getter=lambda: 6, store=FakeStore(old))
+    asyncio.run(rec.async_load())
+    t = rec.trips[0]
+    assert t.started_at <= t.ended_at, "载入时应把倒流的时间摆正"
+    assert t.approx_time is True, "老的补记行程应补上'时间近似'标记"
+
+
+def test_distance_source_is_recorded():
+    """里程口径要写清楚: 总里程差分(整数) 还是 GPS 轨迹。"""
+    from trips import pick_distance_with_source
+    assert pick_distance_with_source(17.0, 16.63) == (17.0, "odo")   # 绝大多数行程: 信总里程
+    assert pick_distance_with_source(1.0, 0.3) == (0.3, "gps")       # 跨公里边界的挪车: 信 GPS
+    assert pick_distance_with_source(None, 4.15) == (4.15, "gps")
+    assert pick_distance_with_source(0, 0.42) == (0.42, "gps")
+    assert pick_distance_with_source(None, None) == (None, "")
+
+
+def test_reconstruction_after_stale_period_uses_last_fresh_boundaries():
+    """真机场景(云端反复给旧帧时的偏差): 补记要能给出观测区间与起点坐标。
+
+    起点取"最后一次**非重复帧**的墙钟", 位置取最后已知坐标 —— 重复帧的数据是旧的,
+    不能拿来当观测边界; 但它的坐标仍然是"最后已知位置", 可以用来标起点。
+    """
+    rec = recorder()
+    f0 = frame(T0, odo=9738, soc=57.8, gear=0, speed=0, lat=LAT, lon=LON)
+    rec.process(f0, now=T0)          # 记录的是 WGS-84, 拿它自己比
+    # 之后 9 分钟, 云端一直回同一帧(sts 不变 → 重复帧)
+    for i in range(1, 10):
+        rec.process(frame(T0 + i * 60, odo=9738, soc=57.8, gear=0, speed=0,
+                          lat=LAT, lon=LON, sts=T0 * 1000),
+                    now=T0 + i * 60)
+    # 车端终于上报: 车已经在开, 里程涨了 7 km
+    rec.process(frame(T0 + 600, odo=9745, soc=56.0, gear=1, speed=40,
+                      lat=LAT + 0.05, lon=LON), now=T0 + 600)
+    gap = rec.trips[0]
+    assert gap.reconstructed is True and gap.distance_km == pytest.approx(7.0)
+    assert gap.started_at == pytest.approx(T0, abs=1), "起点应是最后一次非重复帧(T0)"
+    assert gap.gap_seconds == pytest.approx(600, abs=2), "未观测区间 = 从那次观测到现在"
+    assert gap.start_lat == pytest.approx(f0.latitude_wgs, abs=1e-5), "起点坐标取最后已知位置"
+    assert gap.end_lat > f0.latitude_wgs, "终点应更北(车往北开了)"
+    assert rec.active is not None, "同时正常行程应已开始"
+
+
+# ── 补记护栏(对照 mate 的 _RECONSTRUCT_MAX_TRIP_KM) ──
+def test_odometer_glitch_frame_is_ignored_without_rebasing():
+    """单帧总里程毛刺(信号异常/串帧)按"缺失"处理: 不记账, 也不能改基线。
+
+    若照单全收, 下一帧"跳回来"就会被补记逻辑记成一条横跨十几万公里的假行程。
+    """
+    rec = recorder()
+    rec.process(frame(T0, odo=1000, soc=80, gear=0, speed=0), now=T0)
+    rec.process(frame(T0 + 60, odo=158_000, soc=80, gear=0, speed=0), now=T0 + 60)   # 坏帧
+    assert rec.trips == [], "单帧里程毛刺不该补记成行程"
+    assert rec._last_odo == pytest.approx(1000.0), "坏帧不能改基线"
+    # 下一帧恢复正常: 只补记真实的 3 km(而不是 157000)
+    rec.process(frame(T0 + 120, odo=1003, soc=79, gear=0, speed=0), now=T0 + 120)
+    assert len(rec.trips) == 1
+    assert rec.trips[-1].distance_km == pytest.approx(3.0)
+
+
+def test_reconstruction_jump_over_1500_km_is_discarded_as_dirty_data():
+    """二级护栏: 基线本身被污染过时差值仍可能巨大 —— 超过 ±1500 km 直接不记账。"""
+    rec = recorder()
+    rec.process(frame(T0, odo=1000, soc=80, gear=0, speed=0), now=T0)
+    rec._add_gap_or_reconstruct(1000, 1000 + 1600, 80, 70, T0, T0 + 3600, frame(T0))
+    assert rec.trips == [] and rec.gaps == [], "上千公里的'补记'只能是脏数据"
+
+
+def test_reconstruction_duration_guard_blank_vs_keep():
+    """补记时长要过"隐含均速"护栏: 不合理宁可留空, 也不写骗人的数字。"""
+    assert reconstruction_duration_min(10.0, 900) == pytest.approx(15.0)   # 40 km/h → 留
+    assert reconstruction_duration_min(4.0, 60) is None                    # 240 km/h → 空
+    assert reconstruction_duration_min(1.0, 3600) is None                  # 1 km/h(区间里全是停车) → 空
+    assert reconstruction_duration_min(10.0, None) is None
+
+
+def test_reconstructed_trip_keeps_mileage_but_blanks_absurd_duration():
+    """4 km / 60 秒(隐含 240 km/h)在现实中不可能 —— 里程/耗电照记, 时长留空。"""
+    rec = recorder()
+    rec.process(frame(T0, odo=3000, soc=50, gear=0, speed=0), now=T0)
+    rec.process(frame(T0 + 60, odo=3004, soc=46, gear=0, speed=0), now=T0 + 60)
+    trip = rec.trips[-1]
+    assert trip.distance_km == pytest.approx(4.0) and trip.energy_kwh
+    assert trip.duration_min is None, "不可信的时长不该写进行程"
+    assert trip.approx_time is True and trip.reconstructed is True
+
+
+def test_restart_recognizes_reserved_frame_as_stale_via_persisted_baseline():
+    """HA 重启后云端常把**同一帧**再回一遍 —— 帧基准要落盘, 才认得出这是旧观测。
+
+    真机现象: 不持久化时, 重启后第一帧(旧的)会被当成新观测, 补记的起点被推到重启时刻,
+    观测区间凭空缩水, 甚至把早已发生的里程跳变记到错误的窗口里。
+    """
+    store = FakeStore()
+    rec = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                       poll_seconds_getter=lambda: 6, store=store)
+    rec.process(frame(T0, odo=1000, soc=80, gear=0, speed=0), now=T0)
+    dumped = rec._dump()
+    assert dumped["last_frame_ts"] == int(T0 * 1000), "帧基准要落盘"
+    assert dumped["last_fresh_wall"] == pytest.approx(T0)
+
+    # 模拟重启: 4 分钟后云端先把同一帧再回一遍
+    rec2 = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                        poll_seconds_getter=lambda: 6, store=FakeStore(dumped))
+    asyncio.run(rec2.async_load())
+    assert rec2._last_frame_ts == int(T0 * 1000)
+    rec2.process(frame(T0 + 240, odo=1000, soc=80, gear=0, speed=0, sts=T0 * 1000),
+                 now=T0 + 240)
+    assert rec2.trips == [], "重启后重发的旧帧不该被当成新观测"
+    assert rec2._last_fresh_wall == pytest.approx(T0), "重复帧不该把观测边界推到重启时刻"
+
+    # 云端终于给出新帧(车出去跑了一圈, 里程 +9): 补记区间应是 T0 → 现在(5 分钟)
+    rec2.process(frame(T0 + 300, odo=1009, soc=72, gear=0, speed=0), now=T0 + 300)
+    trip = rec2.trips[-1]
+    assert trip.reconstructed is True and trip.distance_km == pytest.approx(9.0)
+    assert trip.gap_seconds == pytest.approx(300, abs=2), "起点要回到重启前最后一次真实观测"
+
+
+def test_frozen_finish_after_restart_rewinds_to_persisted_moving_time():
+    """重启后又遇"车端不再上报": 结束时刻要回拨到重启前最后一次确实在动的帧, 不算进失联时间。"""
+    store = FakeStore()
+    rec = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                       poll_seconds_getter=lambda: 6, store=store)
+    rec.process(frame(T0, odo=2000, soc=60, gear=1, speed=40), now=T0)
+    rec.process(frame(T0 + 120, odo=2002, soc=59, gear=1, speed=40,
+                      lat=LAT + 0.01), now=T0 + 120)
+    dumped = rec._dump()
+    assert dumped["last_moving_ts"] == pytest.approx(T0 + 120), "最后在动的帧时刻要落盘"
+
+    rec2 = TripRecorder(hass=None, vin="TESTVIN", capacity_kwh=70.0,
+                        poll_seconds_getter=lambda: 6, store=FakeStore(dumped))
+    asyncio.run(rec2.async_load())
+    # 重启后云端一直回同一帧(时间戳停在 T0+120), 轮询转了一小时
+    for i in range(1, 11):
+        rec2.process(frame(T0 + 120 + i * 360, odo=2002, soc=59, gear=1, speed=40,
+                           sts=(T0 + 120) * 1000), now=T0 + 120 + i * 360)
+    trip = rec2.trips[-1]
+    assert trip.frozen is True
+    assert trip.ended_at == pytest.approx(T0 + 120, abs=1), "结束时刻应回拨, 不算进失联的一小时"
+    assert trip.duration_min == pytest.approx(2.0, abs=0.1)
+
+
+def test_track_points_carry_timestamp():
+    """轨迹点带采样时刻(第 4 维) —— 卡片点选轨迹点时要显示"这个点是什么时候采的"。"""
+    rec = recorder()
+    st = frame(1_700_000_000.0)
+    rec.process(st, now=1_700_000_000.0)
+    pts = rec._points
+    assert len(pts) == 1
+    assert len(pts[0]) == 5, "轨迹点应为 [lat, lon, speed, ts, soc]"
+    assert pts[0][4] == st.soc
+    assert pts[0][2] == 30.0           # 车速
+    assert pts[0][3] == pytest.approx(1_700_000_000.0)   # 采样时刻

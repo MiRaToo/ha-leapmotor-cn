@@ -1,0 +1,25 @@
+{
+  "name": "ha-leapmotor-cn-cards",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Lit + TypeScript sources for the leapmotor Lovelace cards (bundled to custom_components/leapmotor/www/)",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && rollup -c",
+    "watch": "rollup -c -w",
+    "smoke": "node tools/card-smoke.mjs && node tools/car3d-smoke.mjs && node tools/car-wrap-smoke.mjs"
+  },
+  "devDependencies": {
+    "@rollup/plugin-node-resolve": "^15.3.0",
+    "@rollup/plugin-terser": "^0.4.4",
+    "@rollup/plugin-typescript": "^12.1.1",
+    "jsdom": "^25.0.0",
+    "rollup": "^4.24.0",
+    "tslib": "^2.7.0",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "lit": "^3.3.0"
+  }
+}

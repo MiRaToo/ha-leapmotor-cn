@@ -1,0 +1,18 @@
+# 统一 LF: 卡片会把 CSS(多行文本)原样嵌进 bundle —— 源码的换行符会**原封不动**进产物,
+# 于是同一份源码在 Windows(autocrlf 检出成 CRLF)与 Linux(CI)上构建出的字节不同,
+# CI 的"产物与源码同步"校验就会失败。这里钉死: 入库与检出都用 LF。
+* text=auto eol=lf
+
+# 二进制别当文本处理
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.zip binary
+*.gz binary
+*.db binary

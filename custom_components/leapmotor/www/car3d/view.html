@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="zh-CN" class="pending"><head><meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>3D 车模</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:transparent!important;touch-action:pan-y}
+html.pending,html.pending body{background:var(--boot-bg,#f3f6fb)!important}
+@media(prefers-color-scheme:dark){html.pending,html.pending body{background:var(--boot-bg,#101a2b)!important}}
+canvas{opacity:1;transition:opacity .24s ease}html.pending canvas{opacity:0;pointer-events:none}
+@media(prefers-reduced-motion:reduce){canvas{transition:none}}
+</style></head><body><script type="module" src="./view.js?v=12"></script></body></html>

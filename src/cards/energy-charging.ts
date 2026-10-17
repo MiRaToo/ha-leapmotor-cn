@@ -1,0 +1,135 @@
+import { html, svg, type TemplateResult, nothing } from "lit";
+import {niceAxis,fmtTick} from "../lib/format";
+import { live } from "lit/directives/live.js";
+
+export interface Tariff {
+  peak_price: number | null;
+  valley_price: number | null;
+  ac_peak_price?:number|null; ac_valley_price?:number|null;
+  dc_periods?:{start:string;end:string;price:number}[]|null;
+  valley_start: string;
+  valley_end: string;
+  efficiency: number; ac_efficiency?:number|null; dc_efficiency?:number|null;
+}
+export interface ChargeDay {
+  day: string; kwh: number; grid_kwh: number; peak_kwh: number; valley_kwh: number;
+  cost: number | null; consumed_kwh?: number | null;
+}
+export interface ChargeSession {
+  id: string; started_at: number; ended_at?: number; last_at: number;
+  soc_start?: number | null; soc_end?: number | null;
+  kwh: number | null; grid_kwh: number | null; cost: number | null;
+  active: boolean; partial: boolean; sources: string[]; reason?: string;
+  charge_type?: "ac"|"dc"|"unknown"|"mixed"; peak_kw?:number|null; average_kw?:number|null;
+  power_samples?:[number,number|null][];
+  price_override?:{mode:'unit'|'total';value:number}|null;
+}
+export interface ChargeData {
+  vin?: string; days: ChargeDay[]; sessions: ChargeSession[]; tariff: Tariff;
+  active: boolean; revision: number; timezone: string;
+  summary: { kwh: number; grid_kwh: number; cost: number | null; count: number };
+}
+export const decimal = (n: number | null | undefined, digits = 1) => n == null || !Number.isFinite(n) ? "—" : n.toLocaleString("zh-CN", {minimumFractionDigits:digits,maximumFractionDigits:digits});
+const clock = (ts: number, zone: string, date = true) => new Intl.DateTimeFormat("zh-CN", {
+  timeZone: zone, ...(date ? {month:"numeric",day:"numeric"} as const : {}),hour:"2-digit",minute:"2-digit",hour12:false,
+}).format(new Date(ts*1000));
+
+const chargeType=(type?:string)=>type==="dc"?"直流 · 快充":type==="ac"?"交流 · 慢充":type==="mixed"?"充电类型变化":"充电类型未知";
+function powerChart(s:ChargeSession):TemplateResult|typeof nothing {
+  const samples=s.power_samples||[];
+  if(!samples.some(p=>p[1]!=null))return nothing;
+  const max=Math.max(1,...samples.map(p=>p[1]||0)),start=samples[0][0],end=samples[samples.length-1][0];
+  let d="",previous:number|null=null;
+  for(const [at,kw] of samples){if(kw==null){previous=null;continue;}const x=12+(at-start)/Math.max(1,end-start)*270,y=83-kw/max*65;d+=(previous==null||at-previous>900?"M":"L")+x.toFixed(1)+" "+y.toFixed(1)+" ";previous=at;}
+  return html`<div class="powerPlot"><span>功率变化 · kW</span><svg viewBox="0 0 300 100" role="img" aria-label="本次充电功率变化"><path d=${d} fill="none" stroke="#40b49d" stroke-width="2"/><text x="12" y="98" class="axisTxt">开始</text><text x="282" y="98" text-anchor="end" class="axisTxt">结束</text></svg></div>`;
+}
+
+export function chargePanel(data: ChargeData | null, error: string, selected: number, choose: (i: number) => void, priceEditor:(s:ChargeSession)=>TemplateResult|typeof nothing=()=>nothing, rangeTools:TemplateResult|typeof nothing=nothing, recordTools:TemplateResult|typeof nothing=nothing, plot:{width?:number;series:string[];chart:string;toggle:(key:string)=>void;switchChart:()=>void}={series:["charge","used"],chart:"line",toggle:()=>{},switchChart:()=>{}}): TemplateResult {
+  if (error) return html`<p class="billNote error">${error}</p>`;
+  if (!data) return html`<p class="billNote">正在读取充电记录…</p>`;
+  const days = data.days, count = days.length;
+  const axis=niceAxis(Math.max(0,...days.flatMap(d=>[d.kwh,d.consumed_kwh||0])),4),costAxis=niceAxis(Math.max(0,...days.map(d=>d.cost||0)),4);
+  const width=Math.max(220,plot.width||350),height=122,bottom=150,step=(width-50)/Math.max(1,count),x=(i:number)=>32+(i+.5)*step;
+  const series=[{key:'charge',label:'充电',unit:'kWh',color:'#40b49d',values:days.map(d=>d.kwh),axis},
+    {key:'used',label:'行驶耗电',unit:'kWh',color:'#e6a15a',values:days.map(d=>d.consumed_kwh??null),axis},
+    {key:'cost',label:'电费',unit:'元',color:'#6c86e8',values:days.map(d=>d.cost),axis:costAxis}].filter(v=>plot.series.includes(v.key));
+  const y=(v:number,axis:{max:number})=>bottom-v/axis.max*height;
+  const pick=days[selected];
+  const tip=pick?html`<div class="chargeTip on" style=${`--tip-x:${x(selected)/width*100}%`} aria-live="polite"><b>${pick.day}</b>${series.map(v=>html`<span><i style=${'background:'+v.color}></i>${v.label} ${decimal(v.values[selected],2)} ${v.unit}</span>`)}</div>`:nothing;
+  const graph=html`<div class="chargeChart"><svg viewBox=${`0 0 ${width} 176`} preserveAspectRatio="none" class="chargeSvg" role="img" aria-label="逐日充电与行驶耗电趋势图">
+    ${(series.some(s=>s.key!=='cost')?axis:costAxis).ticks.map(t=>svg`<line x1="32" x2=${width-18} y1=${y(t,series.some(s=>s.key!=='cost')?axis:costAxis)} y2=${y(t,series.some(s=>s.key!=='cost')?axis:costAxis)} class="gridline"/><text x="26" y=${y(t,series.some(s=>s.key!=='cost')?axis:costAxis)+3} text-anchor="end" class="axisTxt">${fmtTick(t)}</text>`)}
+    ${series.some(s=>s.key==='cost')&&series.length>1?costAxis.ticks.map(t=>svg`<text x=${width-14} y=${y(t,costAxis)+3} class="axisTxt" fill="#6c86e8">${fmtTick(t)}</text>`):nothing}
+    ${pick?svg`<rect class="chartHit selected" x=${32+selected*step} y="28" width=${step} height=${height} rx="3"/>`:nothing}
+    ${series.map((v,j)=>{let path='';let gap=true;v.values.forEach((value,i)=>{if(value==null){gap=true;return;}path+=(gap?'M':'L')+x(i)+' '+y(value,v.axis)+' ';gap=false;});return plot.chart==='bar'?v.values.map((value,i)=>value==null?nothing:svg`<rect x=${32+i*step+step*.15+j*step*.7/series.length} y=${y(value,v.axis)} width=${step*.7/series.length-1} height=${bottom-y(value,v.axis)} fill=${v.color} rx="1.5"/>`):svg`<path d=${path} fill="none" stroke=${v.color} stroke-width="2.5"/>${v.values.map((value,i)=>value==null?nothing:svg`<circle cx=${x(i)} cy=${y(value,v.axis)} r=${i===selected?4.2:2.6} fill=${v.color}/>`)} `;})}
+    ${days.map((d,i)=>svg`<g role="button" tabindex="0" aria-pressed=${selected===i} aria-label=${d.day+' 查看详情'} @click=${(e:MouseEvent)=>{if(e.detail===0)choose(i)}} @keydown=${(e:KeyboardEvent)=>{if(['Enter',' ','ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();choose(Math.max(0,Math.min(count-1,i+(e.key==='ArrowLeft'?-1:e.key==='ArrowRight'?1:0))))}}}><rect class="chartHit" x=${32+i*step} y="28" width=${step} height=${height}/>${(count-1-i)%Math.max(1,Math.ceil(count/Math.max(2,Math.floor((width-50)/34))))===0?svg`<text x=${x(i)} y="170" text-anchor="middle" class="axisTxt">${d.day.slice(5).replace('-','/')}</text>`:nothing}</g>`)}
+    </svg>${tip}</div>`;
+  return html`<section class="chargePlot"><div class="plotHeading"><b>充电与行驶耗电</b><span>${[series.some(s=>s.key!=='cost')?'kWh':'',series.some(s=>s.key==='cost')?'元':''].filter(Boolean).join(' · ')} / 日</span></div>${graph}<div class="chargeCtrls"><div class="chargeSeries">${[['charge','充电','#40b49d'],['used','行驶耗电','#e6a15a'],['cost','电费','#6c86e8']].map(([key,label,color])=>html`<button aria-pressed=${plot.series.includes(key)} class=${plot.series.includes(key)?'on':''} @click=${()=>plot.toggle(key)}><i style=${'background:'+color}></i>${label}</button>`)}</div><div class="chargeRange">${rangeTools}<button class="chartSwitch" @click=${()=>plot.switchChart()}>${plot.chart==='bar'?'柱状':'折线'}</button></div></div></section><section class="chargeRecords"><div class="plotHeading"><b>充电记录</b><span>${data.summary.count} 次${data.active?" · 正在充电":""}</span>${recordTools}</div>${data.sessions.length?data.sessions.map(s=>html`<details class="chargeRecord"><summary><span class="chargeWhen"><b>${clock(s.started_at,data.timezone)}</b><small>${s.active?"正在充电":clock(s.ended_at||s.last_at,data.timezone,false)}${s.partial?" · 部分记录":""} · ${chargeType(s.charge_type)}</small></span><span class="chargeAmount"><b>${decimal(s.kwh,2)}<small> kWh</small></b><small>${s.cost==null?"未设电价":(s.price_override?.mode==="total"?"实付 ¥":"约 ¥")+decimal(s.cost,2)}</small></span></summary><div class="chargeDetail"><span>电量 ${decimal(s.soc_start,0)}% → ${decimal(s.soc_end,0)}%</span><span>观测时长 ${decimal(Math.max(0,(s.last_at-s.started_at)/60),0)} 分钟</span><span>估算取电 ${decimal(s.grid_kwh,2)} kWh</span><span>平均功率 ${decimal(s.average_kw)} kW · 峰值 ${decimal(s.peak_kw)} kW</span>${powerChart(s)}<span>${s.sources.includes("soc")?"含 SOC 与电池容量折算":s.sources.length?"按充电功率采样估算":"暂无可用电量样本"}</span>${s.partial?html`<span>有中断或缺失样本，记录可能不完整</span>`:nothing}${s.price_override?html`<span>本次${s.price_override.mode==="total"?"实际费用":"独立电价"} · ${s.price_override.value}${s.price_override.mode==="unit"?" 元/kWh":" 元"}</span>`:nothing}${priceEditor(s)}</div></details>`):html`<p class="billNote">还没有驻车充电记录。记录从安装此版本后开始。</p>`}</section><p class="billNote">仅记录驻车且明确充电的采样区间；费用按当前或本次指定电价估算，已录入的实付金额单独计入。</p>`;
+}
+
+export function tariffForm(draft: Record<string,string>, saving: boolean, error: string, timezone: string,
+                           edit: (key: string,value: string)=>void, save: ()=>void, close: ()=>void,
+                           periods:{start:string;end:string;price:string}[], editPeriod:(i:number,key:'start'|'end'|'price',value:string)=>void,addPeriod:()=>void,removePeriod:(i:number)=>void): TemplateResult {
+  const input=(key:string,label:string,type="number",min="0",max="100")=>html`<label>${label}<input type=${type} min=${min} max=${max} step=${type==="time"?60:.01} .value=${live(draft[key]||"")} @input=${(e:Event)=>edit(key,(e.target as HTMLInputElement).value)} ?disabled=${saving}></label>`;
+  return html`<div class="tariffBackdrop" @click=${(e:Event)=>{if(e.target===e.currentTarget&&!saving)close()}} @keydown=${(e:KeyboardEvent)=>{if(e.key==='Escape'&&!saving){e.stopPropagation();close()}if(e.key==='Tab'){const nodes=Array.from((e.currentTarget as HTMLElement).querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled)')).filter(n=>n.offsetParent!==null),first=nodes[0],last=nodes[nodes.length-1],active=first?.getRootNode() as ShadowRoot;if(e.shiftKey&&active?.activeElement===first){e.preventDefault();last?.focus()}else if(!e.shiftKey&&active?.activeElement===last){e.preventDefault();first?.focus()}}}}><section class="tariffForm" role="dialog" aria-modal="true" aria-label="电价设置" tabindex="-1"><header class="tariffHead"><div><b>电价设置</b><small>${timezone}</small></div><button aria-label="关闭电价设置" @click=${close} ?disabled=${saving}>×</button></header><div class="tariffScroll"><section class="tariffSection"><b>交流慢充 · 家用峰谷价</b><div class="tariffGrid">${input("ac_peak_price","峰电价 · 元/kWh")}${input("ac_valley_price","谷电价 · 元/kWh")}${input("ac_efficiency","交流效率 · %","number","50","100")}${input("valley_start","谷电开始","time")}${input("valley_end","谷电结束","time")}</div><p class="billNote">支持跨午夜，谷电时段之外使用峰电价。</p></section><section class="tariffSection"><b>直流快充 · 公共分时价</b><p class="billNote">填写含服务费的单价，时段须无重叠并覆盖 24 小时。开始与结束相同表示全天；价格全部留空可暂不设置分时价。</p><div class="periodRows">${periods.map((p,i)=>html`<div class="periodRow"><label>开始<input type="time" aria-label=${'时段'+(i+1)+'开始'} .value=${live(p.start)} @input=${(e:Event)=>editPeriod(i,'start',(e.target as HTMLInputElement).value)} ?disabled=${saving}></label><label>结束<input type="time" aria-label=${'时段'+(i+1)+'结束'} .value=${live(p.end)} @input=${(e:Event)=>editPeriod(i,'end',(e.target as HTMLInputElement).value)} ?disabled=${saving}></label><label>元/kWh<input type="number" min="0" max="100" step="0.01" aria-label=${'时段'+(i+1)+'电价'} .value=${live(p.price)} @input=${(e:Event)=>editPeriod(i,'price',(e.target as HTMLInputElement).value)} ?disabled=${saving}></label><button aria-label=${'删除时段'+(i+1)} @click=${()=>removePeriod(i)} ?disabled=${saving||periods.length===1}>×</button></div>`)}</div><button class="addPeriod" @click=${addPeriod} ?disabled=${saving||periods.length>=24}>添加电价时段</button></section><section class="tariffSection"><div class="tariffGrid">${input("dc_efficiency","直流效率 · %","number","50","100")}</div><p class="billNote">交流和直流按各自效率折算取电量；未知枪型保留旧默认效率。费用按对应枪型计价，未单独修正的历史费用按当前设置重算。</p></section>${error?html`<p class="billNote error" role="alert">${error}</p>`:nothing}</div><div class="tariffActions"><button @click=${close} ?disabled=${saving}>取消</button><button class="savePrice" @click=${save} ?disabled=${saving}>${saving?"保存中…":"保存电价"}</button></div></section></div>`;
+}
+
+export const energyPanelStyles = `
+  .card { container-type:inline-size; gap:14px; }
+  .energyTop{display:flex;align-items:center;gap:10px;}.energyTop .energyModes{flex:1;min-width:0;}.energyTop .refresh{flex:none;width:32px;height:32px;display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:50%;background:var(--lm-surface-control, var(--card-background-color,#fff));color:inherit;box-shadow:var(--lm-shadow-control, 0 1px 4px #0002);cursor:pointer;}
+  .head { border-bottom:0; padding-bottom:0; }
+  .head .title { font-size:16px; letter-spacing:-.02em; }
+  .head .sum { font-size:11px; color:var(--secondary-text-color,#6b7280); }
+  .energyModes { position:relative;display:flex; gap:4px; padding:4px; border-radius:var(--lm-radius-control, 12px); background:var(--lm-surface-inset, var(--secondary-background-color,#eef1f5)); }
+  .energyModes button { flex:1; border:0; padding:8px; border-radius:var(--lm-radius-control, 9px); background:transparent; color:var(--secondary-text-color,#6b7280); font:inherit; cursor:pointer; }
+  .energyModes .modeIndicator { position:absolute;left:4px;top:4px;bottom:4px;width:calc((100% - 8px)/2);border-radius:var(--lm-radius-control, 9px);background:var(--lm-surface-control, var(--card-background-color,#fff));box-shadow:var(--lm-shadow-control, 0 1px 4px #0002);transition:transform 180ms ease;pointer-events:none; }.energyModes.charge .modeIndicator{transform:translateX(100%);}.energyModes button{position:relative;z-index:1;padding:10px 4px;font-size:12px;}.energyModes button.on { color:var(--primary-text-color,#222);font-weight:650; }
+  .energySummary { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
+  .energyStat { display:flex; flex-direction:column; gap:4px; padding:10px 9px; min-width:0; border-radius:var(--lm-radius-control, 12px); background:color-mix(in srgb,var(--primary-color,#03a9f4) 5%,var(--lm-surface-control, var(--card-background-color,#fff))); }
+  .energyStat span,.energyStat small { font-size:10px; color:var(--secondary-text-color,#6b7280); }
+  .energyStat b { font-size:23px; font-weight:650; letter-spacing:-.04em; white-space:nowrap; }
+  .energyStat small { font-weight:400;letter-spacing:0; }
+  .energyStat.cost b { color:#15956e; }
+  .energyTools { display:flex;align-items:center;justify-content:flex-end;gap:5px;margin-top:8px; }
+  .energyTools button { font:inherit; border:0; padding:5px 8px; font-size:10px; border-radius:var(--lm-radius-control, 8px); cursor:pointer; color:inherit; background:var(--lm-surface-control, var(--card-background-color,#fff));box-shadow:var(--lm-shadow-control, 0 1px 4px #0002); }
+  .energyTools button.on { color:var(--primary-color,#03a9f4); }
+  .plotHeading .priceBtn { margin-left:auto;font-size:10px;border:0;padding:6px 8px;border-radius:var(--lm-radius-control, 8px);background:var(--lm-surface-control, var(--card-background-color,#fff));color:inherit;box-shadow:var(--lm-shadow-control, 0 1px 4px #0002);cursor:pointer; }.plotHeading .priceBtn:disabled{opacity:.45;cursor:default;}.chargeRecords .plotHeading{justify-content:flex-start;}
+  .billNote { color:var(--secondary-text-color,#6b7280); font-size:11px; line-height:1.6; margin:4px 0; }
+  .billNote.error { color:var(--error-color,#db4437); }
+  .plotHeading { display:flex; align-items:center; justify-content:space-between;gap:8px;font-size:12px; }
+  .plotHeading span { font-size:10px;color:var(--secondary-text-color,#6b7280); }
+  .chargePlot { padding:12px 10px; border-radius:var(--lm-radius-section, 14px); background:var(--lm-surface-control, var(--card-background-color,#fff));box-shadow:var(--lm-shadow-control, 0 1px 4px #0002); }
+  .chargeLegend { display:flex;flex-wrap:wrap;gap:12px;margin-top:10px;font-size:10px;color:var(--secondary-text-color,#6b7280); }
+  .chargeLegend span { display:flex;align-items:center;gap:4px; }
+  .chargeLegend i { width:6px;height:6px;border-radius:2px; }
+  .valley { fill:#40b49d; background:#40b49d; } .peak { fill:#6c86e8;background:#6c86e8; } .used { fill:#e6a15a;background:#e6a15a; }
+  .chargeSvg { height:176px;user-select:none;-webkit-user-select:none;width:100%;display:block;margin-top:6px;overflow:visible;touch-action:pan-y; }
+  .chartHit { fill:transparent;cursor:ew-resize; }.chartHit.selected{fill:var(--primary-color,#03a9f4);fill-opacity:.09;} .chargeSvg g:focus { outline:0; } .chargeSvg g:focus .chartHit { stroke:var(--primary-color,#03a9f4); }
+  .chargeChart{position:relative;}.chargeTip{position:absolute;z-index:2;top:12px;left:clamp(min(106px,50%),var(--tip-x,50%),max(50%,calc(100% - 106px)));transform:translateX(-50%);display:none;pointer-events:none;flex-direction:column;gap:4px;width:200px;max-width:calc(100% - 12px);padding:8px 10px;border-radius:var(--lm-radius-control, 10px);font-size:10px;line-height:1.5;background:var(--lm-surface-control, var(--card-background-color,#fff));box-shadow:var(--lm-shadow-floating, 0 1px 4px #0003);box-sizing:border-box;}.chargeTip.on{display:flex;}.chargeTip span{overflow-wrap:anywhere;}
+
+  .chargeCtrls,.chargeSeries,.chargeRange{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}.chargeCtrls{margin-top:10px;}.chargeRange{margin-left:auto;}.chargeRange .energyTools{margin:0;}.chargeCtrls button{border:0;border-radius:var(--lm-radius-control, 8px);padding:5px 8px;font:inherit;font-size:10px;color:inherit;background:var(--lm-surface-control, var(--card-background-color,#fff));box-shadow:var(--lm-shadow-control, 0 1px 4px #0002);cursor:pointer;}.chargeSeries button{display:flex;align-items:center;gap:4px;opacity:.5;}.chargeSeries button.on{opacity:1;}.chargeSeries i,.chargeTip i{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px;}
+  .chargeRecords { display:flex; flex-direction:column; gap:8px; margin-top:16px; }
+  .chargeRecord { border-bottom:1px solid var(--divider-color,#0001); }
+  .chargeRecord summary { display:flex;justify-content:space-between;gap:10px;cursor:pointer;padding:9px 0;list-style:none; }
+  .chargeRecord summary::-webkit-details-marker { display:none; }
+  .chargeWhen,.chargeAmount { display:flex;flex-direction:column;gap:4px;min-width:0; }
+  .chargeWhen b,.chargeAmount b { font-size:13px; }.chargeWhen small,.chargeAmount small { font-size:10px;color:var(--secondary-text-color,#6b7280); }
+  .chargeAmount { text-align:right; }
+  .chargeDetail { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;padding:0 0 12px;font-size:10px;color:var(--secondary-text-color,#6b7280); }
+  .tariffBackdrop{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:16px;background:var(--lm-mask, #0006);box-sizing:border-box;}.tariffForm { display:flex;flex-direction:column;width:min(460px,100%);max-height:85dvh;overflow:hidden;padding:0;border-radius:var(--lm-radius-overlay, 18px);background:var(--lm-surface-control, var(--card-background-color,#fff));color:var(--primary-text-color,#222);box-shadow:var(--lm-shadow-dialog, 0 8px 30px #0003);box-sizing:border-box; }.tariffHead{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px;flex:none;}.tariffHead div{display:grid;gap:4px;}.tariffHead small{font-size:10px;color:var(--secondary-text-color,#6b7280);}.tariffHead button,.periodRow button,.addPeriod{border:0;border-radius:var(--lm-radius-control, 9px);padding:7px 10px;background:var(--lm-surface-control, var(--card-background-color,#fff));color:inherit;box-shadow:var(--lm-shadow-control, 0 1px 4px #0002);font:inherit;cursor:pointer;}.tariffHead button{font-size:20px;line-height:1;}.tariffScroll{overflow-y:auto;overscroll-behavior:contain;padding:0 16px;}.tariffSection{padding:12px 0;border-top:1px solid var(--divider-color,#0001);}.tariffSection>b{font-size:12px;}.periodRows{display:grid;gap:8px;margin:12px 0;}.periodRow{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,.85fr) 28px;gap:6px;align-items:end;}.periodRow label{display:grid;gap:5px;font-size:10px;color:var(--secondary-text-color,#6b7280);}.periodRow input{box-sizing:border-box;min-width:0;width:100%;border:0;border-radius:var(--lm-radius-control, 8px);padding:8px 3px;background:var(--lm-surface-inset, var(--secondary-background-color,#eef1f5));color:inherit;font:inherit;}.periodRow button{padding:8px 0;}.tariffForm .tariffActions{padding:12px 16px;flex:none;border-top:1px solid var(--divider-color,#0001);}.tariffForm button:disabled{opacity:.45;cursor:default;}
+  .tariffGrid { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:12px 0; }
+  .tariffGrid label { display:flex;flex-direction:column;gap:5px;font-size:11px;color:var(--secondary-text-color,#6b7280); }
+  .tariffGrid input { min-width:0; width:100%;box-sizing:border-box;border:0;border-radius:var(--lm-radius-control, 8px);padding:8px;background:var(--lm-surface-inset, var(--secondary-background-color,#eef1f5));color:var(--primary-text-color,#212121);font:inherit; }
+  .tariffActions { display:flex;justify-content:flex-end;gap:8px; }
+  .tariffActions button { box-shadow:var(--lm-shadow-control, 0 1px 4px #0002);border:0;border-radius:var(--lm-radius-control, 8px);padding:8px 12px;font:inherit;cursor:pointer;background:var(--lm-surface-control, var(--card-background-color,#fff));color:inherit; }
+  .tariffActions .savePrice { background:var(--primary-color,#03a9f4);color:white; }
+  .sessionPrice{grid-column:1/-1;}.sessionPrice button{border:0;padding:6px 10px;border-radius:var(--lm-radius-control, 8px);font:inherit;background:var(--lm-surface-control, var(--card-background-color,#fff));color:inherit;box-shadow:var(--lm-shadow-control, 0 1px 4px #0002);cursor:pointer;}.sessionPrice input,.sessionPrice select{width:100%;min-width:0;padding:7px;border:0;border-radius:var(--lm-radius-control, 8px);font:inherit;color:inherit;background:var(--lm-surface-inset, var(--secondary-background-color,#eef1f5));}.sessionPrice label{display:grid;gap:6px;margin:8px 0;}
+  .chartSec { box-shadow:var(--lm-shadow-section, 0 1px 4px rgba(0,0,0,.16));padding:12px 8px;border-radius:var(--lm-radius-section, 14px);background:var(--lm-surface-control, var(--card-background-color,#fff)); }
+  .energyStat { background:var(--lm-surface-control, var(--card-background-color,#fff));box-shadow:var(--lm-shadow-section, 0 1px 4px rgba(0,0,0,.16)); }.energyModes{background:var(--lm-surface-inset, var(--secondary-background-color,#eef1f5));box-shadow:inset 0 1px 3px #0001;}
+  .ctrls .chip { box-shadow:var(--lm-shadow-section, 0 1px 4px rgba(0,0,0,.16)); }
+  .energySummary.reev { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .powerPlot { grid-column:1/-1;padding:8px;border-radius:var(--lm-radius-control, 10px);background:var(--lm-surface-control, var(--card-background-color,#fff));font-size:10px; }.powerPlot svg{display:block;width:100%;}
+  .ctrls { gap:5px; }
+  .ctrls .chip { box-shadow:var(--lm-shadow-section, 0 1px 4px rgba(0,0,0,.16)); padding:5px 8px; font-size:10px; border-radius:var(--lm-radius-control, 8px); }
+  .gridline { stroke-dasharray:3 5;opacity:.7; }.line { stroke-width:2.5; }
+  .tip { white-space:normal;max-width:calc(100% - 16px);box-sizing:border-box; }
+  @container(max-width:300px) { .energyStat { padding:8px 6px; }.energyStat b { font-size:19px; }.head .sum { display:none; } }
+`;
