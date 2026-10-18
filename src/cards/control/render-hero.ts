@@ -121,6 +121,7 @@ export function isFastCharging(ctx: ControlCtx): boolean {
 /** 车模区此刻画 3D 吗: 素材就绪 + 没被自定义外观图顶掉。
  *  自定义图**验证失败**时退回 3D(见 _carImgBad) —— 否则那张图一直在探针里打转, 车模区是空的。 */
 export function car3dView(ctx: ControlCtx): boolean {
+  if (ctx._car3dPrefs.modelView === "2d") return false;
   const info = ctx._car3d;
   if (!info || info.ready !== true) return false;
   const custom = customCarImg(ctx);
@@ -269,6 +270,7 @@ export function car3dBgLabel(ctx: ControlCtx): string {
 
 export function sumCar3d(ctx: ControlCtx): string {
   if (ctx._car3dErr) return "素材下载失败";
+  if (ctx._car3dPrefs.modelView === "2d") return "固定使用 2D 车模";
   const info = ctx._car3d;
   if (!info) return "";
   if (String(info.state) === "downloading" || ctx._car3dBusy) return "正在下载素材…";

@@ -26,6 +26,10 @@ HA 的 recorder 数据库(每次变化存一份), 得不偿失。所以:
   * `leapmotor/car3d/info`   → {ready, viewer, model, base_url, model_param, colors, options…}
     3D 车模的现状(读磁盘, 不联网): 素材是否已装配、车型参数、该车型的车漆色表、
     以及集成选项里的颜色/背景/自定义外观图。卡片进卡片时先问这个。
+  * `leapmotor/car3d/market-pictures` → {pictures: [{color, url}], actual_color, year, edition}
+    用户切换到 2D 时按指定商城车型配置读取颜色渲染图; 未指定时尝试本车配置。
+  * `leapmotor/car3d/market-catalog` / `market-variants`
+    按需读取商城车型目录及所选车型的年款、能源类型和版本。
   * `leapmotor/car3d/ensure` → {state, started, info}
     确保 3D 素材就绪: 没装过就起后台装配任务(最多 3 个只读 GET, 每个 VIN 一次),
     立即返回; 卡片随后轮询 info 直到 state 变成 ready/error。
@@ -35,12 +39,14 @@ from __future__ import annotations
 
 import logging
 import time
+import functools
 from typing import Any
 
 import voluptuous as vol
 
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
 
 from . import car3d
 from .const import DOMAIN
@@ -64,6 +70,9 @@ def async_register(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_energy_daily)
     websocket_api.async_register_command(hass, ws_energy_lastweek)
     websocket_api.async_register_command(hass, ws_car3d_info)
+    websocket_api.async_register_command(hass, ws_car3d_market_catalog)
+    websocket_api.async_register_command(hass, ws_car3d_market_variants)
+    websocket_api.async_register_command(hass, ws_car3d_market_pictures)
     websocket_api.async_register_command(hass, ws_car3d_ensure)
     websocket_api.async_register_command(hass, ws_charging_history)
     websocket_api.async_register_command(hass, ws_charging_tariff)
@@ -93,6 +102,26 @@ def _coordinator(hass: HomeAssistant, msg: dict):
         if getattr(coord, "trips", None) is None:
             continue
         if msg.get("vin") and getattr(coord, "vin", None) != msg["vin"]:
+            continue
+        return coord
+    return None
+
+
+def _coordinator_for_device(hass: HomeAssistant, msg: dict):
+    """按卡片解析出的设备 ID 找车辆协调器, 避免多车时错用第一辆车。"""
+    device_id = msg.get("device_id")
+    if not device_id:
+        return _coordinator(hass, msg)
+    device = dr.async_get(hass).async_get(device_id)
+    if device is None:
+        return None
+    entries = hass.data.get(DOMAIN) or {}
+    vins = {str(identifier) for domain, identifier in device.identifiers if domain == DOMAIN}
+    for entry_id in device.config_entries:
+        coord = entries.get(entry_id)
+        if coord is None or getattr(coord, "trips", None) is None:
+            continue
+        if vins and str(getattr(coord, "vin", "")) not in vins:
             continue
         return coord
     return None
@@ -336,6 +365,129 @@ async def ws_car3d_info(hass: HomeAssistant, connection, msg: dict) -> None:
         connection.send_error(msg["id"], "not_found", "没有可用的车辆会话")
         return
     connection.send_result(msg["id"], await car3d.async_info(hass, coord))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "leapmotor/car3d/market-catalog",
+})
+@websocket_api.async_response
+async def ws_car3d_market_catalog(hass: HomeAssistant, connection, msg: dict) -> None:
+    """读取官方商城车型目录; 只返回安全目录中配置页对应的车型名称。"""
+    try:
+        from .market_picture import fetch_market_catalog
+        result = await hass.async_add_executor_job(fetch_market_catalog)
+        connection.send_result(msg["id"], result)
+    except Exception as err:  # noqa: BLE001 商城目录不可用不影响控车
+        log.debug("读取官方商城车型目录失败: %s", type(err).__name__)
+        connection.send_result(msg["id"], {"models": [], "reason": "商城车型暂时无法读取"})
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "leapmotor/car3d/market-variants",
+    vol.Required("model"): str,
+    vol.Optional("year"): str,
+})
+@websocket_api.async_response
+async def ws_car3d_market_variants(hass: HomeAssistant, connection, msg: dict) -> None:
+    """按车型读取已知版本; 按需核验某一年款的历史官网接口。"""
+    try:
+        from .market_picture import fetch_market_variants
+        result = await hass.async_add_executor_job(
+            functools.partial(fetch_market_variants, msg["model"], year=msg.get("year")))
+        connection.send_result(msg["id"], result)
+    except Exception as err:  # noqa: BLE001 商城配置不可用不影响控车
+        log.debug("读取官方商城车型配置失败: %s", type(err).__name__)
+        connection.send_result(msg["id"], {"variants": [], "reason": "车型配置暂时无法读取"})
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "leapmotor/car3d/market-pictures",
+    vol.Optional("device_id"): str,
+    vol.Optional("vin"): str,
+    vol.Optional("model"): str,
+    vol.Optional("year"): str,
+    vol.Optional("energy"): str,
+    vol.Optional("edition"): str,
+    vol.Optional("model_id"): str,
+})
+@websocket_api.async_response
+async def ws_car3d_market_pictures(hass: HomeAssistant, connection, msg: dict) -> None:
+    """按用户选择的商城配置读取颜色渲染图; 未指定配置时尝试本车配置。"""
+    if msg.get("model"):
+        if not all(msg.get(key) for key in ("year", "energy", "edition", "model_id")):
+            connection.send_result(msg["id"], {"pictures": [], "error": "请选择完整车型配置"})
+            return
+        if msg["energy"] not in ("纯电", "增程"):
+            connection.send_result(msg["id"], {"pictures": [], "error": "商城能源类型不受支持"})
+            return
+        try:
+            from .market_picture import fetch_market_pictures
+            result = await hass.async_add_executor_job(functools.partial(
+                fetch_market_pictures, msg["model"], msg["year"],
+                reev=msg["energy"] == "增程", edition=msg["edition"], model_id=msg["model_id"]))
+            connection.send_result(msg["id"], {
+                **result, "model": msg["model"], "year": result.get("year", msg["year"]),
+                "energy": msg["energy"], "edition": result.get("edition", msg["edition"]),
+                "model_id": msg["model_id"],
+            })
+        except Exception as err:  # noqa: BLE001 商城图片不应影响车控卡其余功能
+            log.debug("读取所选官方商城图片失败: %s", type(err).__name__)
+            connection.send_result(msg["id"], {
+                "pictures": [], "error": "商城颜色图片暂时无法读取",
+            })
+        return
+
+    coord = _coordinator_for_device(hass, msg)
+    if coord is None:
+        connection.send_result(msg["id"], {"pictures": [], "error": "没有匹配的车辆会话"})
+        return
+    try:
+        info = await car3d.async_info(hass, coord)
+        param = info.get("model_param") or {}
+        # 2D-only 车型可能没有本地 3D manifest。用户手动选择 2D 时只读一次车型参数,
+        # 不下载查看器或模型素材, 后续商城检索严格限定同年款和版本。
+        if not param:
+            params = car3d.asset_params(coord.client, coord.vin)
+            response = await hass.async_add_executor_job(functools.partial(
+                coord.client.car_call, "v3/api/carpicture/3d/key", params, method="GET"))
+            param = car3d._model_param(car3d._data(response))
+        model = str(param.get("carType") or "").strip()
+        year = param.get("year")
+        edition = str(param.get("carTypeCode") or "").strip()
+        if not model or not year or not edition:
+            connection.send_result(msg["id"], {
+                "pictures": [],
+                "model": model,
+                "year": str(year or ""),
+                "energy": "增程" if bool(getattr(coord, "reev", False)) else "纯电",
+                "edition": edition,
+                "error": "车端未提供精确年款和版本，暂不能安全匹配商城图片",
+            })
+            return
+        from .market_picture import fetch_market_pictures
+        result = await hass.async_add_executor_job(functools.partial(
+            fetch_market_pictures, model, year, reev=bool(getattr(coord, "reev", False)),
+            edition=edition))
+        pictures = result.get("pictures") or []
+        actual_color = ""
+        color_code = param.get("colorCode")
+        if color_code not in (None, ""):
+            actual_color = next((str(item.get("name") or "") for item in info.get("colors", [])
+                                 if str(item.get("tsp")) == str(color_code)), "")
+        connection.send_result(msg["id"], {
+            "pictures": pictures,
+            "actual_color": actual_color,
+            "model": model,
+            "year": result.get("year", year),
+            "energy": "增程" if bool(getattr(coord, "reev", False)) else "纯电",
+            "edition": result.get("edition", edition),
+            "error": result.get("reason", ""),
+        })
+    except Exception as err:  # noqa: BLE001 商城图片不应影响车控卡其余功能
+        log.debug("读取官方商城整车图片失败: %s", type(err).__name__)
+        connection.send_result(msg["id"], {
+            "pictures": [], "error": "商城颜色图片暂时无法读取，请稍后重试",
+        })
 
 
 @websocket_api.websocket_command({

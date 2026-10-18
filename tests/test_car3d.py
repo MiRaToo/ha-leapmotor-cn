@@ -103,6 +103,57 @@ def test_first_assemble_downloads_everything(base, wrapper_src):
     assert VIN not in json.dumps(man)
 
 
+@pytest.mark.parametrize("trim,asset,tsp", [
+    ("605Max", "Lafa5", 11),
+    ("600Ultra", "Lafa5Ultra", 33),
+    ("500ULTRA", "Lafa5Ultra", 33),
+])
+def test_b05_uses_variant_assets_and_reuses_cache(base, wrapper_src, trim, asset, tsp):
+    """同包普通版/Ultra 必须按版型选中；重启后的缓存检查和色表读取也用该映射。"""
+    files = {}
+    for variant, color in (("Lafa5", 11), ("Lafa5Ultra", 33)):
+        prefix = f"{variant}_2026/{variant}_2026"
+        files[f"{prefix}_full_car.fbx"] = "fbx"
+        files[f"{prefix}_CarPaintConfig.csv"] = (
+            f"id,Desc,id_TSP,ColorValue\n0,{variant},{color},#123456\n")
+
+    class B05(FakeClient):
+        def car_call(self, *args, **kwargs):
+            resp = super().car_call(*args, **kwargs)
+            resp["data"]["modelParam"].update(
+                carType="B05", year=2026, carTypeCode=trim, colorCode=tsp)
+            return resp
+
+    client = B05(model=_zip(files))
+    st = car3d.assemble_sync(client, VIN, base, wrapper_src, sleeper=lambda _: None)
+    assert st["ready"] and st["car_type"] == "B05"
+    assert st["model_param"]["carType"] == "B05"  # 查看器仍接收原始车型/版型
+    assert st["colors"] == [{"tsp": tsp, "name": asset, "hex": "#123456"}]
+    assert not (base / "B05_2026").exists()       # 不重命名官方资源
+    assert car3d.colors_of(base, "B05", 2026, trim) == st["colors"]
+
+    man = car3d.read_manifest(base)
+    man["colors"] = []                          # 旧清单缺色表时从正确目录补回
+    car3d.write_manifest(base, man)
+    assert car3d.ready(base)
+    client.calls.clear()
+    client.zips.clear()
+    cached = car3d.assemble_sync(client, VIN, base, wrapper_src, sleeper=lambda _: None)
+    assert cached["ready"] and cached["colors"] == st["colors"]
+    assert client.calls == [] and client.zips == []
+
+
+@pytest.mark.parametrize("trim,other", [("600Ultra", "Lafa5"), ("605Max", "Lafa5Ultra")])
+def test_b05_other_variant_does_not_satisfy_readiness(base, trim, other):
+    """不能把同包的另一版型当作当前车已下载完成。"""
+    car3d.safe_extract(_zip({f"{other}_2026/{other}_2026_full_car.fbx": "fbx"}), base)
+    car3d.write_manifest(base, {"model": {"car_type": "B05", "year": 2026,
+                                          "param": {"carTypeCode": trim}}})
+    assert not car3d.model_ready(base, "B05", 2026, trim)
+    assert not car3d.status(base)["model"]
+    assert car3d.colors_of(base, "B05", 2026, trim) == []
+
+
 def test_probe_stops_on_bare_variant_risk(base):
     class Risk(FakeClient):
         def car_call(self, path, params=None, method="GET"):

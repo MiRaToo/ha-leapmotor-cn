@@ -415,11 +415,14 @@ function fuelMeterT(ctx: ControlCtx): TemplateResult | typeof nothing {
  *  (迁移前的字符串版 carImg() 已随 C 档收尾删除 —— 这里是唯一实现。)
  *  ⚠️ 这段有副作用(会起 Image 探针并在结果回来时 _scheduleRender), 所以只在 hero 真画的时候调。 */
 function carImgT(ctx: ControlCtx): TemplateResult | typeof nothing {
-  const officialSrc = customCarImg(ctx) || ctx._attr("car_picture", "entity_picture") || "";
-  const fallbackSrc = "";
-  const apiFailed = officialSrc && ctx._carImgApiFailedSrc === officialSrc &&
+  const customSrc = customCarImg(ctx);
+  const marketSrc = ctx._car3dPrefs.modelView === "2d" ? ctx._car3dPrefs.market2dUrl || "" : "";
+  const vehicleSrc = ctx._attr("car_picture", "entity_picture") || "";
+  const preferredSrc = customSrc || marketSrc || vehicleSrc;
+  const fallbackSrc = !customSrc && marketSrc ? vehicleSrc : "";
+  const apiFailed = preferredSrc && ctx._carImgApiFailedSrc === preferredSrc &&
     Date.now() < ctx._carImgRetryAt;
-  const src = officialSrc && !apiFailed ? officialSrc : fallbackSrc;
+  const src = preferredSrc && !apiFailed ? preferredSrc : fallbackSrc;
   if (!src) {
     ctx._carImgSrc = "";
     ctx._carImgOk = "";
@@ -443,7 +446,7 @@ function carImgT(ctx: ControlCtx): TemplateResult | typeof nothing {
     probe.onload = function () {
       if (self._carImgSrc !== src) return;
       self._carImgOk = "ok";
-      if (src === officialSrc) {
+      if (src === preferredSrc) {
         self._carImgApiFailedSrc = "";
         self._carImgRetryAt = 0;
       }
@@ -451,7 +454,7 @@ function carImgT(ctx: ControlCtx): TemplateResult | typeof nothing {
     };
     probe.onerror = function () {
       if (self._carImgSrc !== src) return;
-      if (src === officialSrc) {
+      if (src === preferredSrc) {
         self._carImgApiFailedSrc = src;
         self._carImgRetryAt = Date.now() + CAR_IMG_RETRY_MS;
         self._carImgSrc = "";
@@ -556,7 +559,10 @@ export function carDocksPanel(ctx: ControlCtx): TemplateResult {
  *  (迁移前的字符串版 carModel() 已随 C 档收尾删除 —— 这里是唯一实现。) */
 function carModelT(ctx: ControlCtx): TemplateResult {
   const image = carImgT(ctx);
-  return html`<div class="carModel${ctx._carImgOk === "ok" ? "" : " noModel"}">${image}${carDocksPanel(ctx)}</div>`;
+  const model2d = ctx._car3dPrefs.modelView === "2d" ? " model2d" : "";
+  const savedScale = Number(ctx._car3dPrefs.market2dScale);
+  const imageScale = Number.isFinite(savedScale) && savedScale >= 1 && savedScale <= 2.5 ? savedScale : 1.5;
+  return html`<div class="carModel${model2d}${ctx._carImgOk === "ok" ? "" : " noModel"}" style=${model2d ? `--lm-car-2d-image-scale:${imageScale}` : ""}>${image}${carDocksPanel(ctx)}</div>`;
 }
 
 /** hero 本体: 车名(双击可改) + 状态更新 + 刷新钮 + 超大续航 + 电量条 + 右栏胶囊与锁 + 车模示意图。
@@ -909,7 +915,7 @@ export function car3dPanel(ctx: ControlCtx): TemplateResult {
   if (!car3dVisible(ctx)) return html``;
   return html`<section class="sec"><button class="foldH" data-act="car3dmenu" aria-expanded="${ctx._open.car3d
     ? "true"
-    : "false"}" title="设置(卡片配色 / 车模颜色 / 车模背景 / 高德 Key / 外观图 / 3D 素材)"><span class="foldT">设置</span><span class="foldS">${sumCar3d(
+    : "false"}" title="设置(界面风格 / 车模显示 / 车模颜色 / 背景 / 外观图)"><span class="foldT">设置</span><span class="foldS">${sumCar3d(
     ctx,
   )}</span><ha-icon class="foldC ico" icon="mdi:chevron-down"></ha-icon></button></section>`;
 }
@@ -929,8 +935,13 @@ export function car3dBodyPanel(ctx: ControlCtx): TemplateResult {
   body.push(paletteRowT(ctx));
   // 界面风格紧随主题色一行(两者都是"六张卡统一"的本机外观设置, 维度互相独立)
   body.push(styleRowT(ctx));
+  const hideCardFrame = readAppearance().hideCardFrame;
+  body.push(html`<div class="cRow"><ha-icon class="cIC" icon="mdi:border-none-variant"></ha-icon><span class="cL">隐藏卡片外框</span><span class="cC"><button role="switch" aria-label="隐藏全部卡片最外层的边框和阴影" aria-checked=${hideCardFrame} class="togchip${hideCardFrame ? " on" : ""}" data-act="hidecardframe" title="去掉最外层边框和阴影，保留内部子卡片效果；本机全部零跑自定义卡片统一生效"><span class="thumb"></span></button></span></div>`);
+  const fixed2d = ctx._car3dPrefs.modelView === "2d";
+  body.push(html`<div class="cRow"><ha-icon class="cIC" icon="mdi:car"></ha-icon><span class="cL">车模显示</span><span class="cC"><button class="chip${fixed2d ? "" : " on"}" data-act="car3dviewmode" data-val="auto" aria-pressed=${!fixed2d} title="自动使用可用的 3D 车模">自动 / 3D</button><button class="chip${fixed2d ? " on" : ""}" data-act="car3dviewmode" data-val="2d" aria-pressed=${fixed2d} title="固定显示车辆外观图">仅 2D</button></span></div>`);
+  if (fixed2d) body.push(car2dMarketColorRowT(ctx));
   if (info?.ready === true) {
-    body.push(car3dColorRowsT(ctx), html`<div class="cRow"><ha-icon class="cIC" icon="mdi:palette-outline"></ha-icon><span class="cL">车衣</span><span class="cC"><button class="chip" data-act="wrapopen" ?disabled=${!car3dView(ctx)}>上传与预览</button></span></div>`, car3dBgRowT(ctx));
+    if (!fixed2d) body.push(car3dColorRowsT(ctx), html`<div class="cRow"><ha-icon class="cIC" icon="mdi:palette-outline"></ha-icon><span class="cL">车衣</span><span class="cC"><button class="chip" data-act="wrapopen" ?disabled=${!car3dView(ctx)}>上传与预览</button></span></div>`, car3dBgRowT(ctx));
   }
   body.push(car3dImageRowT(ctx));
   body.push(html`<div class="cRow"><ha-icon class="cIC" icon="mdi:map-outline"></ha-icon><span class="cL">驻车背景</span><span class="cC">${([['map', '地图位置'], ['photo', '驻车照片']] as const).map(([key, label]) => html`<button class="chip${locationMode(ctx) === key ? ' on' : ''}" data-act="locationmode" data-val=${key} aria-pressed=${locationMode(ctx) === key}>${label}</button>`)}</span></div>`);
@@ -973,6 +984,49 @@ function car3dColorRowsT(ctx: ControlCtx): TemplateResult {
   return html`<div class="cRow palRC"><ha-icon class="cIC" icon="mdi:palette"></ha-icon><span class="cL">车模颜色</span><span class="cC">${dots}${rainbowDotT(
     "hex",
   )}<button class="chip txt" data-act="car3dauto" title="清掉车漆覆盖, 回到实车色">回到实车色</button></span></div>`;
+}
+
+/** 2D 车色来自公开商城对应年款/版本的整车渲染图, 与车端颜色名精确对应。 */
+function car2dMarketColorRowT(ctx: ControlCtx): TemplateResult {
+  const custom = customCarImg(ctx);
+  const pictures = ctx._marketPictures || [];
+  const models = ctx._marketModels || [];
+  const variants = ctx._marketVariants || [];
+  const selectedVariant = variants.find((item) => item.id === ctx._marketSelectedVariant);
+  const latestYear = Math.max(new Date().getFullYear(), 2020, ...variants.map((item) => Number(item.year) || 0));
+  const years = Array.from({ length: latestYear - 2020 + 1 }, (_, index) => String(latestYear - index));
+  const selectedYear = ctx._marketSelectedYear || selectedVariant?.year || "";
+  const savedScale = Number(ctx._car3dPrefs.market2dScale);
+  const imageScale = Number.isFinite(savedScale) && savedScale >= 1 && savedScale <= 2.5 ? savedScale : 1.5;
+  const yearVariants = selectedYear ? variants.filter((item) => item.year === selectedYear) : [];
+  const unavailable = ctx._marketPicturesError;
+  const unavailableYear = unavailable === "该年款暂无商城配置" && !!selectedYear && !yearVariants.length;
+  const colors = pictures.length
+    ? pictures.map((item) => html`<button class="chip${ctx._car3dPrefs.market2dColor === item.color ? " on" : ""}" data-act="car2dcolor" data-val=${item.color} aria-pressed=${ctx._car3dPrefs.market2dColor === item.color} ?disabled=${!!custom}>${item.color}</button>`)
+    : nothing;
+  const modelSummary = [ctx._car3dPrefs.market2dModel || ctx._marketSelectedModel, selectedYear && `${selectedYear} 款`, ctx._car3dPrefs.market2dColor].filter(Boolean).join(" · ") || "选择车型与颜色";
+  return html`<div class="market2dSettings">
+    <button class="market2dHeader" data-act="car2dmenu" aria-expanded=${ctx._open.car2dSettings}>
+      <ha-icon icon="mdi:palette-outline"></ha-icon><span>2D 外观</span><span class="market2dSummary">${modelSummary}</span>
+      <ha-icon class="market2dChevron" icon="mdi:chevron-down"></ha-icon>
+    </button>
+    ${ctx._open.car2dSettings ? html`<div class="market2dBody">
+    <label class="market2dScale"><span class="market2dScaleLabel"><span>车图大小</span><output>${imageScale.toFixed(2)}×</output></span>
+      <input type="range" data-act="car2dscale" min="1" max="2.5" step="0.05" aria-label="2D 车图大小" .value=${live(String(imageScale))}>
+    </label>
+    <div class="market2dPicker">
+    ${ctx._marketCatalogLoading ? html`<span class="subline">正在读取商城车型目录…</span>` : models.length ? html`<div class="market2dSelects">
+      <label class="market2dField"><span>车型</span><select class="tinput" data-act="car2dmodel" .value=${live(ctx._marketSelectedModel)} ?disabled=${!!custom}><option value="">选择车型</option>${models.map((item) => html`<option value=${item.name}>${item.name}</option>`)}</select></label>
+      <label class="market2dField"><span>年款</span><select class="tinput" data-act="car2dyear" .value=${live(selectedYear)} ?disabled=${!!custom || ctx._marketVariantsLoading}><option value="">${ctx._marketVariantsLoading ? "正在读取年款…" : "选择年款"}</option>${years.map((year) => html`<option value=${year}>${year} 款</option>`)}</select></label>
+      <label class="market2dField"><span>能源 · 配置</span><select class="tinput" data-act="car2dvariant" .value=${live(ctx._marketSelectedVariant)} ?disabled=${!!custom || ctx._marketVariantsLoading || !yearVariants.length}><option value="">${ctx._marketVariantsLoading ? "正在读取配置…" : unavailableYear ? "该年款暂无可选配置" : "选择能源与配置"}</option>${yearVariants.map((item) => html`<option value=${item.id}>${item.energy} · ${item.edition}</option>`)}</select></label>
+    </div>` : nothing}
+    ${ctx._marketPicturesLoading && !ctx._marketVariantsLoading ? html`<span class="subline">正在读取该配置的颜色…</span>` : nothing}
+    ${unavailable && !ctx._marketPicturesLoading ? html`<div class="market2dError"><span class="subline">${unavailable}</span>${unavailableYear ? nothing : html`<button class="chip" data-act="car2dpictures">重新读取</button>`}</div>` : nothing}
+    ${pictures.length ? html`<div class="market2dColors" role="group" aria-label="商城车身颜色">${colors}</div>` : nothing}
+    ${models.length ? html`<span class="market2dNote">图片来自商城所选车型配置；选择其他车型时仅改变展示外观。</span>` : nothing}
+    ${custom ? html`<span class="subline">清除自定义外观图后，才能显示商城车辆图片</span>` : nothing}
+    </div>` : nothing}
+  </div>`;
 }
 
 /** 背景: 跟随主题 / 白天 / 夜晚(chip 一点立即发 daynight, 不等重绘)。 */

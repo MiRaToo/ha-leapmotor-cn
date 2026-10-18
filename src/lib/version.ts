@@ -4,10 +4,10 @@
 // 历史上有漂移。这里集中成一个常量表; 迁移时保持与原值一致, 改版只改这一处。
 // 注意: __init__.py 的 CARD_VERSION 等仍用于 `?v=` 缓存刷新, 两边需一致(S3 会加校验测试)。
 export const CARD_VERSIONS = {
-  map: "1.6.18",
-  trips: "1.6.23",
-  control: "1.9.61",
-  energy: "1.4.10",
-  lastweek: "1.1.19",
-  metrics: "1.0.6",
+  map: "1.6.20",
+  trips: "1.6.26",
+  control: "1.9.73",
+  energy: "1.4.13",
+  lastweek: "1.1.21",
+  metrics: "1.0.8",
 } as const;

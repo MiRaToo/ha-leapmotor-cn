@@ -38,9 +38,11 @@ const VERSION = 1;
 
 export interface Appearance {
   style: StyleId;
+  /** 隐藏全部自定义卡片的最外层边框及阴影，默认关闭。 */
+  hideCardFrame: boolean;
 }
 
-interface PageState {
+interface PageState extends Appearance {
   /** 已持久化的风格(可能因为存储不可写而只存在于内存)。 */
   style: StyleId;
   /** 正在预览的风格; null = 没有预览。 */
@@ -50,32 +52,33 @@ interface PageState {
 /** 挂 window 的共享状态键(五个 bundle 共用一份)。 */
 const PAGE_KEY = "__leapmotorAppearanceV1";
 
-function readStored(): StyleId {
+function readStored(): Appearance {
+  const defaults: Appearance = { style: DEFAULT_STYLE, hideCardFrame: false };
   let raw = "";
   try {
     raw = window.localStorage.getItem(APPEARANCE_KEY) || "";
   } catch (err) {
-    return DEFAULT_STYLE; // 本地存储不可用
+    return defaults; // 本地存储不可用
   }
-  if (!raw) return DEFAULT_STYLE;
+  if (!raw) return defaults;
   try {
     const o = JSON.parse(raw) as Record<string, unknown> | null;
-    if (!o || typeof o !== "object") return DEFAULT_STYLE;
+    if (!o || typeof o !== "object") return defaults;
     // 版本不认识就回默认(未来版本可以在这里做迁移)
-    if (o.version != null && Number(o.version) !== VERSION) return DEFAULT_STYLE;
-    return isStyleId(o.style) ? o.style : DEFAULT_STYLE;
+    if (o.version != null && Number(o.version) !== VERSION) return defaults;
+    return { style: isStyleId(o.style) ? o.style : DEFAULT_STYLE, hideCardFrame: o.hideCardFrame === true };
   } catch (err) {
-    return DEFAULT_STYLE; // 内容坏了当没存过
+    return defaults; // 内容坏了当没存过
   }
 }
 
-function persist(style: StyleId): void {
+function persist({ style, hideCardFrame }: Appearance): void {
   try {
-    if (style === DEFAULT_STYLE) window.localStorage.removeItem(APPEARANCE_KEY);
+    if (style === DEFAULT_STYLE && !hideCardFrame) window.localStorage.removeItem(APPEARANCE_KEY);
     else
       window.localStorage.setItem(
         APPEARANCE_KEY,
-        JSON.stringify({ version: VERSION, style: style })
+        JSON.stringify({ version: VERSION, style, hideCardFrame })
       );
   } catch (err) {
     /* 存不了也照样在本页生效(见文件头说明) */
@@ -86,13 +89,15 @@ function state(): PageState {
   const w = window as unknown as Record<string, unknown>;
   let s = w[PAGE_KEY] as PageState | undefined;
   if (!s) {
-    s = { style: readStored(), preview: null };
+    s = { ...readStored(), preview: null };
     try {
       w[PAGE_KEY] = s;
     } catch (err) {
       /* 挂不上就每次重建 —— 退化成"只有本卡立即生效" */
     }
   }
+  // 同页还有旧版 bundle 时，共享快照可能尚无这个字段。
+  if (typeof s.hideCardFrame !== "boolean") s.hideCardFrame = false;
   return s;
 }
 
@@ -106,7 +111,8 @@ function emit(): void {
 
 /** 已持久化的风格(不含未提交的预览)。 */
 export function readAppearance(): Appearance {
-  return { style: state().style };
+  const s = state();
+  return { style: s.style, hideCardFrame: s.hideCardFrame };
 }
 
 /** 本页**实际生效**的风格(预览优先)。 */
@@ -142,7 +148,7 @@ export function commitPreview(): void {
   if (!s.preview) return;
   s.style = s.preview;
   s.preview = null;
-  persist(s.style);
+  persist(s);
   emit();
 }
 
@@ -160,7 +166,17 @@ export function setStyle(id: StyleId): void {
   const next: StyleId = isStyleId(id) ? id : DEFAULT_STYLE;
   s.style = next;
   s.preview = null;
-  persist(next);
+  persist(s);
+  emit();
+}
+
+/** 隐藏外框独立于风格预览，立即同步到本机全部卡片。 */
+export function setHideCardFrame(enabled: boolean): void {
+  const s = state();
+  const next = enabled === true;
+  if (s.hideCardFrame === next) return;
+  s.hideCardFrame = next;
+  persist(s);
   emit();
 }
 
@@ -175,7 +191,7 @@ export function watchAppearance(cb: () => void): () => void {
     if (!ev || ev.key == null || ev.key === APPEARANCE_KEY) {
       // 别的标签页改了风格 → 重新读存储进本页快照(预览作废)
       const s = state();
-      s.style = readStored();
+      Object.assign(s, readStored());
       s.preview = null;
       cb();
       return;
@@ -201,7 +217,12 @@ export function watchAppearance(cb: () => void): () => void {
  */
 export function applyAppearance(el: HTMLElement, dark: boolean): void {
   const id = effectiveStyle();
-  applyTokens(el, resolveTokens(id, { dark: !!dark }));
+  const tokens = resolveTokens(id, { dark: !!dark });
+  if (state().hideCardFrame) {
+    tokens["--lm-card-border"] = "0";
+    tokens["--lm-shadow-card"] = "none";
+  }
+  applyTokens(el, tokens);
   try {
     el.setAttribute(STYLE_ATTR, id);
   } catch (err) {

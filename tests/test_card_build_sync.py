@@ -33,6 +33,7 @@ CARDS = {
     "control": ("CONTROL_CARD_VERSION", "leapmotor-control.js"),
     "energy": ("ENERGY_CARD_VERSION", "leapmotor-energy.js"),
     "lastweek": ("LASTWEEK_CARD_VERSION", "leapmotor-lastweek.js"),
+    "metrics": ("METRICS_CARD_VERSION", "leapmotor-metrics.js"),
 }
 
 

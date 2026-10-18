@@ -111,8 +111,14 @@ def wrapper_src() -> Path:
     return Path(__file__).parent / "www" / "car3d"
 
 
-def model_prefix(car_type: str, year: Any) -> str:
-    """模型包的目录名与文件前缀: `{车型}_{年份}`。"""
+def model_prefix(car_type: str, year: Any, car_type_code: str = "") -> str:
+    """模型包的实际目录与前缀；保留接口车型名，由版型解析资源别名。
+
+    B05 包同时带 Lafa5 与 Lafa5Ultra，官方查看器按版型里的 Ultra 分支选择。
+    后端检查和色表读取必须使用同一规则，不能取包里的第一个模型目录。
+    """
+    if car_type == "B05":
+        car_type = "Lafa5Ultra" if "ultra" in str(car_type_code or "").lower() else "Lafa5"
     return f"{car_type}_{year}"
 
 
@@ -120,11 +126,11 @@ def viewer_ready(base: Path) -> bool:
     return (base / VIEWER_MARK).is_file()
 
 
-def model_ready(base: Path, car_type: str, year: Any) -> bool:
+def model_ready(base: Path, car_type: str, year: Any, car_type_code: str = "") -> bool:
     """模型包是否已落盘(只要目录里有 `*_car.fbx` 就算完整 —— 低模/整车模任一即可)。"""
     if not car_type:
         return False
-    sub = base / model_prefix(car_type, year)
+    sub = base / model_prefix(car_type, year, car_type_code)
     try:
         return any(sub.glob("*_car.fbx"))
     except OSError:
@@ -165,13 +171,14 @@ def status(base: Path) -> dict:
     man = read_manifest(base)
     model = man.get("model") or {}
     car_type, year = model.get("car_type") or "", model.get("year")
+    param = model.get("param") or {}
     return {
         "dir": str(base),
         "viewer": viewer_ready(base),
-        "model": model_ready(base, car_type, year),
+        "model": model_ready(base, car_type, year, param.get("carTypeCode") or ""),
         "car_type": car_type,
         "year": year,
-        "model_param": model.get("param") or {},
+        "model_param": param,
         "unsupported": man.get("unsupported") or None,
         "asset_version": int(man.get("asset_version") or 0),
         "fetched_at": man.get("fetched_at"),
@@ -217,11 +224,11 @@ def parse_paint_colors(csv_text: str) -> list[dict]:
     return out
 
 
-def colors_of(base: Path, car_type: str, year: Any) -> list[dict]:
+def colors_of(base: Path, car_type: str, year: Any, car_type_code: str = "") -> list[dict]:
     """从模型包里读该车型的车漆色表(读不到就返回空表 —— 卡片此时只显示"自动")。"""
     if not car_type:
         return []
-    sub = base / model_prefix(car_type, year)
+    sub = base / model_prefix(car_type, year, car_type_code)
     try:
         for path in sorted(sub.glob("*CarPaintConfig.csv")):
             return parse_paint_colors(path.read_text(encoding="utf-8-sig", errors="replace"))
@@ -656,7 +663,8 @@ def assemble_sync(client: Any, vin: str, base: Path,
     st = status(base)
     if not force and st["viewer"] and st["model"]:
         st["changed"] = bool(installed)
-        st["colors"] = st["colors"] or colors_of(base, st["car_type"], st["year"])
+        st["colors"] = st["colors"] or colors_of(
+            base, st["car_type"], st["year"], param.get("carTypeCode") or "")
         st["ready"] = True
         return st
 
@@ -687,8 +695,9 @@ def assemble_sync(client: Any, vin: str, base: Path,
         raise AssetError("云端没有返回这辆车的 3D 车型参数，请导出诊断以确认原因",
                          detail=f"3d/key: {detail}")
     car_type, year = model_param.get("carType"), model_param.get("year")
+    car_type_code = model_param.get("carTypeCode") or ""
     need_viewer = force or not viewer_ready(base)
-    need_model = force or not model_ready(base, car_type, year)
+    need_model = force or not model_ready(base, car_type, year, car_type_code)
 
     fetched = 0
     if need_viewer:
@@ -704,10 +713,10 @@ def assemble_sync(client: Any, vin: str, base: Path,
         fetched += 1
 
     install_wrapper(base, wrapper or wrapper_src())
-    if not viewer_ready(base) or not model_ready(base, car_type, year):
+    if not viewer_ready(base) or not model_ready(base, car_type, year, car_type_code):
         raise AssetError("素材包内缺少查看器或对应车型模型，请运行深度诊断",
-                         detail=f"期望 index.js 与 {model_prefix(car_type, year)}/*_car.fbx")
-    colors = colors_of(base, car_type, year)
+                         detail=f"期望 index.js 与 {model_prefix(car_type, year, car_type_code)}/*_car.fbx")
+    colors = colors_of(base, car_type, year, car_type_code)
     write_manifest(base, {
         "asset_version": ASSET_VERSION,
         "key3d_params": param_note,
@@ -716,7 +725,7 @@ def assemble_sync(client: Any, vin: str, base: Path,
                   "param": model_param},
         "colors": colors,
         "files": {"viewer": viewer_ready(base),
-                  "model": model_ready(base, car_type, year)},
+                  "model": model_ready(base, car_type, year, car_type_code)},
     })
     st = status(base)
     st["changed"] = True
@@ -742,7 +751,8 @@ async def async_info(hass: HomeAssistant, coord: Any = None) -> dict:
     st = await hass.async_add_executor_job(status, base)
     if st["model"] and not st["colors"]:
         st["colors"] = await hass.async_add_executor_job(
-            colors_of, base, st["car_type"], st["year"])
+            colors_of, base, st["car_type"], st["year"],
+            st["model_param"].get("carTypeCode") or "")
     st["ready"] = bool(st["viewer"] and st["model"])
     opts = dict(getattr(getattr(coord, "entry", None), "options", {}) or {})
     st["options"] = {k: opts.get(k) for k in ("car3d_color", "car3d_bg", "car3d_image")}

@@ -2815,7 +2815,8 @@ class LeapmotorTripsCard extends LitElement {
         /* 当天叠加缩略图: 比单段缩略图稍大 */
         .dthumb {
           position: relative; flex: 0 0 auto; width: ${DAY_THUMB_W}px; height: ${DAY_THUMB_H}px;
-          border-radius: 10px; overflow: hidden; background: #111418;
+          border-radius: 10px; overflow: hidden;
+          background: var(--lm-surface-section, var(--ha-card-background, var(--card-background-color, #fff)));
           box-shadow: inset 0 0 0 1px var(--divider-color, rgba(255, 255, 255, .08));
         }
         .dthumb .tiles { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
@@ -2824,7 +2825,7 @@ class LeapmotorTripsCard extends LitElement {
         .dthumb svg { position: absolute; left: 0; top: 0; }
         .dthumb .ph {
           position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%);
-          text-align: center; font-size: 10px; color: #cfd6dc;
+          text-align: center; font-size: 10px; color: var(--secondary-text-color, #6b7280);
         }
         /* 展开后的一天: 紧凑列表, 行与行之间**通栏细线**分隔(不再是一堆子卡片) */
         .dayrows { padding: 0 10px; }
@@ -2841,7 +2842,7 @@ class LeapmotorTripsCard extends LitElement {
         .thumb {
           position: relative; flex: 0 0 auto; width: ${THUMB_W}px; height: ${THUMB_H}px;
           border-radius: 10px; overflow: hidden;
-          background: var(--secondary-background-color, #e7eaed);
+          background: var(--lm-surface-section, var(--ha-card-background, var(--card-background-color, #fff)));
           box-shadow: inset 0 0 0 1px var(--divider-color, rgba(0, 0, 0, .08));
         }
         .thumb .tiles { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
@@ -3006,12 +3007,12 @@ class LeapmotorTripsCard extends LitElement {
         .map {
           position: relative; height: ${h}px;
           /* 必须用 clip 而不是 hidden: hidden 仍是可滚动容器, 会让绝对定位的瓦片整体偏移 */
-          overflow: clip; border-radius: var(--lm-radius-control, 12px); background: #dfe6ea;
+          overflow: clip; border-radius: var(--lm-radius-control, 12px);
+          background: var(--lm-surface-section, var(--ha-card-background, var(--card-background-color, #fff)));
           cursor: grab; touch-action: none; user-select: none;
         }
         .map.dragging { cursor: grabbing; }
         /* 深色底图: 亮色路网瓦片整体反相 + 色相翻转 → 夜色地图(与官方 App 深色图观感一致) */
-        .map.dark { background: #111418; }
         .map.dark .tiles { filter: invert(100%) hue-rotate(180deg) brightness(85%) contrast(90%); }
         .tiles { position: absolute; left: 0; top: 0; z-index: 0; }
         .tiles img { position: absolute; width: ${TILE}px; height: ${TILE}px; -webkit-user-drag: none; }

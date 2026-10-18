@@ -212,6 +212,39 @@ for (const name of CARDS) {
   }
   ok(`shadow DOM 已渲染(${sr.innerHTML.length} 字符)`);
 
+  // 隐藏外框默认关闭；只清除最外层边框和阴影，内部表面保持当前风格。
+  {
+    const border = () => el.style.getPropertyValue("--lm-card-border").trim();
+    const shadow = () => el.style.getPropertyValue("--lm-shadow-card").trim();
+    const inner = () => ["--lm-section-border", "--lm-shadow-section", "--lm-shadow-control", "--lm-shadow-floating", "--lm-shadow-dialog"].map(key => el.style.getPropertyValue(key)).join("|");
+    const syncAppearance = (value) => {
+      if (value) window.localStorage.setItem("leapmotor.appearance", JSON.stringify(value));
+      else window.localStorage.removeItem("leapmotor.appearance");
+      window.dispatchEvent(new window.StorageEvent("storage", { key: "leapmotor.appearance" }));
+    };
+    if (border() === "0" || shadow() === "none") fail("隐藏外框: 默认关闭时应保留玻璃风格的外框和阴影");
+    for (const style of ["glass", "soft", "brutalist", "minimal", "memphis"]) {
+      syncAppearance({ version: 1, style, hideCardFrame: false });
+      const original = { border: border(), shadow: shadow(), inner: inner() };
+      syncAppearance({ version: 1, style, hideCardFrame: true });
+      if (border() !== "0" || shadow() !== "none" || inner() !== original.inner) {
+        fail(`隐藏外框: ${style} 未同时清除外边框和阴影，或改变了内部效果`);
+      }
+      syncAppearance({ version: 1, style, hideCardFrame: false });
+      if (border() !== original.border || shadow() !== original.shadow || inner() !== original.inner) {
+        fail(`隐藏外框: ${style} 关闭后未恢复原风格`);
+      }
+    }
+    syncAppearance({ version: 1, style: "minimal" });
+    if (border() === "0" || el.getAttribute("data-lm-style") !== "minimal") fail("隐藏外框: 旧偏好未保留风格原有外框");
+    for (const legacy of [{ cardBorder: false }, { cardBorder: true }, { hideCardFrame: "true" }]) {
+      syncAppearance({ version: 1, style: "glass", ...legacy });
+      if (border() === "0" || shadow() === "none") fail("隐藏外框: 旧字段或无效值不应自动隐藏外框");
+    }
+    syncAppearance(null);
+    ok("隐藏外框: 五种风格均去掉外层边框及阴影，保留内部效果，关闭后恢复原风格");
+  }
+
   if (name === "control") {
     const darkHass = fakeHass();
     darkHass.themes.darkMode = true;
@@ -410,6 +443,11 @@ for (const name of CARDS) {
     if(!rroot.querySelector('.compactDay.collapsed')||rroot.querySelector('.dthumb'))fail('trips: 紧凑模式仍创建每日缩略图');else ok('trips: 紧凑收起不创建缩略图');
     route._toggleAllDays();if(rroot.querySelector('.daycard.collapsed'))fail('trips: 第三态没有全部展开');
     route._toggleAllDays();if(!rroot.querySelector('.daycard.collapsed .dthumb'))fail('trips: 三态循环未回到缩略图概览');else ok('trips: 紧凑、展开、缩略图概览按顺序切换');
+    const dayThumbRule=(code.match(/\.dthumb\s*\{\\n\s*position:[\s\S]*?background:\s*var\(--lm-surface-section[^;]*;/)||[""])[0]||"";
+    const mapRule=(code.match(/\.map\s*\{\\n\s*position:[\s\S]*?background:\s*var\(--lm-surface-section[^;]*;/)||[""])[0]||"";
+    if(!/background:\s*var\(--lm-surface-section/.test(dayThumbRule)||/background:\s*#[0-9a-f]/i.test(dayThumbRule))fail('trips: 每日地图缩略图底色没有跟随卡片背景');
+    else if(!/background:\s*var\(--lm-surface-section/.test(mapRule)||/background:\s*#[0-9a-f]/i.test(mapRule))fail('trips: 详情地图等待瓦片时没有使用卡片背景色');
+    else ok('trips: 行程地图与每日缩略图加载底色跟随卡片背景');
     map.getBoundingClientRect=()=>({left:100,top:100,width:400,height:340,right:500,bottom:440});map.setPointerCapture=()=>{};
     await route._openDetail("scrub");
     const profile=rroot.querySelector(".tripPlot");profile.dispatchEvent(new window.KeyboardEvent("keydown",{key:"ArrowRight",bubbles:true}));
@@ -580,6 +618,9 @@ for (const name of CARDS) {
     clickText("充电与电费");await tick();
     if(!root.querySelector(".chargeSvg")||!root.querySelector(".energyStat.cost").textContent.includes("请设置电价"))fail("energy: 未设电价应显示待设置，且有充电图表");
     else ok("energy: 未设电价不伪造零元账单，充电图表可用");
+    const chargeRanges=[...root.querySelectorAll('.chargePlot .chargeRange .energyTools button')];
+    if(chargeRanges.length!==2||chargeRanges[0].textContent.trim()!=='周'||chargeRanges[1].textContent.trim()!=='月'||chargeRanges[0].getAttribute('aria-label')!=='近 7 天'||chargeRanges[1].getAttribute('aria-label')!=='近 30 天')fail('energy: 充电图表周期按钮文案或辅助标签不正确');
+    else ok('energy: 充电图表周期按钮显示「周 / 月」并保留完整辅助标签');
     root.querySelector('.chargeSvg g[role="button"]').dispatchEvent(new window.KeyboardEvent("keydown",{key:"Enter",bubbles:true}));await tick();
     if(!root.querySelector(".chargeTip")?.textContent.includes("行驶耗电 4.00"))fail("energy: 充电图表键盘详情未显示消耗");
     else ok("energy: 键盘可查看每日充电与耗电详情");
@@ -603,6 +644,8 @@ for (const name of CARDS) {
     if(!root.querySelector('.chargeTip').textContent.includes('2026-10-14'))fail('energy: 鼠标悬停未更新日期');else ok('energy: 鼠标移动即可连续查看不同日期');
     clickText("电价设置");await tick();
     if(!root.querySelector('.tariffForm[role="dialog"][aria-modal="true"]')||!root.querySelector('[aria-label="关闭电价设置"]'))fail('energy: 电价未放入可关闭弹窗');else ok('energy: 电价使用独立弹窗，关闭入口保留在卡内');
+    if(root.querySelectorAll('.tariffTimeRange input').length!==2||root.querySelectorAll('.periodTimes input').length!==2||root.querySelectorAll('.tariffEfficiency').length!==2||!(/@container\s*\(max-width:\s*360px\)/.test(root.querySelector('style')?.textContent||'')))fail('energy: 电价设置时段、效率或窄屏排布缺少分组');
+    else ok('energy: 电价设置将慢充时段、直流分时和效率分组，并适配窄屏');
     const input=(i,value)=>{const n=root.querySelectorAll(".tariffGrid input")[i];n.value=value;n.dispatchEvent(new window.Event("input",{bubbles:true}));};
     input(0,"-1");clickText("保存电价");await tick();
     if(calls.some(c=>c.type==="leapmotor/charging/tariff")||!root.querySelector(".tariffForm .error"))fail("energy: 非法电价发送给后端");
@@ -621,7 +664,7 @@ for (const name of CARDS) {
     if(!root.querySelector(".priceBtn").disabled)fail("energy: 非管理员仍可设置电价");
     else ok("energy: 非管理员电价设置不可用");
     bill._chargeCache={};delayedWeek=true;bill._loadCharge(true);await tick();
-    clickText("近 30 天");await tick();
+    clickText("月");await tick();
     delayedWeek(history(7));delayedWeek=null;await tick();
     if(!root.querySelector(".energySummary").textContent.includes("30.0"))fail("energy: 旧范围迟到响应覆盖新范围");
     else ok("energy: 迟到的充电历史不会覆盖新范围");
@@ -1751,6 +1794,9 @@ for (const name of CARDS) {
     //    素材未装配 → 只有下载入口, 且**不自动联网**(ensure 必须由用户点按钮触发)。
     localStorage.clear();
     const wsLog = [];
+    const marketDeviceIds = [];
+    const marketSelections = [];
+    const marketVariantRequests = [];
     const car3dHass = (ready, optImg, st, err) => {
       const h = fakeHass();
       h.callWS = async (msg) => {
@@ -1771,6 +1817,33 @@ for (const name of CARDS) {
             base_url: "/leapmotor-card/car3d/view.html",
             state: st || (ready ? "ready" : "idle"), error: err || "",
           };
+        }
+        if (msg.type === "leapmotor/car3d/market-pictures") {
+          marketDeviceIds.push(msg.device_id);
+          if (msg.model) marketSelections.push({ model: msg.model, year: msg.year, energy: msg.energy, edition: msg.edition, model_id: msg.model_id });
+          if (msg.model === "C16") return {
+            pictures: [{ color: "松霜绿", url: "https://lpmall-dop-prod.oss-cn-hangzhou.aliyuncs.com/c16-green.png" }],
+          };
+          return {
+            actual_color: "实车银",
+            model: "C10",
+            year: "2026",
+            energy: "纯电",
+            edition: "660版",
+            model_id: "catalog-silver",
+            pictures: [
+              { color: "实车银", url: "https://lpmall-dop-prod.oss-cn-hangzhou.aliyuncs.com/silver.png" },
+              { color: "示例蓝", url: "https://ueapp-oss-static.leapmotor.com/blue.png" },
+            ],
+          };
+        }
+        if (msg.type === "leapmotor/car3d/market-catalog") return { models: [{ name: "C10" }, { name: "C16" }] };
+        if (msg.type === "leapmotor/car3d/market-variants") {
+          marketVariantRequests.push({ model: msg.model, year: msg.year || "" });
+          if (msg.model === "C16") return { variants: msg.year === "2024"
+            ? [{ id: "catalog-c16-2024", year: "2024", energy: "增程", edition: "300版" }]
+            : msg.year ? [] : [{ id: "catalog-c16", year: "2025", energy: "纯电", edition: "580版" }] };
+          return { variants: [{ id: "catalog-silver", year: "2026", energy: "纯电", edition: "660版" }] };
         }
         if (msg.type === "leapmotor/car3d/ensure") {
           return { state: "downloading", started: true, info: null };
@@ -1815,6 +1888,8 @@ for (const name of CARDS) {
       fail(`control: info 应每辆车只问一次, 实际 ${cnt("leapmotor/car3d/info")} 次`);
     } else if (cnt("leapmotor/car3d/ensure")) {
       fail(`control: 打开卡片就调了 ensure(联网必须由用户点按钮触发)`);
+    } else if (cnt("leapmotor/car3d/market-pictures")) {
+      fail(`control: 未切换 2D 就提前查询了商城颜色`);
     } else ok(`control: 状态推送不重建 iframe(同一节点), info 只问一次, 无自动 ensure`);
 
     // 实际点击预设色与恢复，监测 src 属性写入，节点相同也不能重新导航。
@@ -1964,6 +2039,7 @@ for (const name of CARDS) {
       else if (!smBody6?.querySelector('input[data-act="car3dimg"]')) fail(`control: 设置弹窗里没有自定义外观图输入框`);
       else if (palInModal) fail(`control: 取色器面板不该在没点彩虹圆时就画出来`);
       else if (!smBody6.querySelector('[data-act="palopen"][data-key="accent"]')) fail(`control: 弹窗里没有「卡片配色」那行的彩虹圆`);
+      else if (!smBody6.querySelector('[data-act="car3dviewmode"][data-val="2d"]')) fail(`control: 设置弹窗里没有手动切换 2D 车模的选项`);
       else ok(`control: 设置 → 弹窗(标题=设置) 里有 车模颜色大圆 + 彩虹圆(取色器) + 回到实车色 + 背景 + 外观图`);
       const modalCard=sr6.querySelector('.card'),oldRect=modalCard.getBoundingClientRect;
       modalCard.getBoundingClientRect=()=>({top:-250,height:800});
@@ -1971,6 +2047,77 @@ for (const name of CARDS) {
       if(sr6.querySelector('.smodal').style.top||smBody6.contains(sr6.querySelector('.smx'))||sr6.querySelector('.card').contains(sr6.querySelector('.smodal'))||sr6.querySelector('.smodal').getAttribute('aria-modal')!=='true') fail('control: 全页弹窗仍受卡片定位限制或关闭按钮进入滚动正文');
       else ok('control: 全页弹窗独立于卡片，关闭按钮固定在正文外');
       modalCard.getBoundingClientRect=oldRect;
+      sr6.querySelector('.smodal .smbody [data-act="car3dviewmode"][data-val="2d"]')?.click();
+      await new Promise(r=>setTimeout(r,40));
+      const savedMode=JSON.parse(localStorage.getItem(el6._car3dPrefsStoreKey())||'{}');
+      if(el6._car3dPrefs.modelView!=='2d'||savedMode.modelView!=='2d')fail('control: 选择 2D 后没有保存本机车模模式');
+      else if(sr6.querySelector('.p-carview iframe')||sr6.querySelector('.heroStage')?.classList.contains('stage3d'))fail('control: 固定 2D 后仍保留 3D 车模舞台');
+      else if(cnt('leapmotor/car3d/market-pictures')!==2||marketDeviceIds.at(-1)!=='dev1')fail('control: 切换 2D 后没有先匹配当前车辆再按所选商城配置查询颜色');
+      else if(el6._car3dPrefs.market2dColor!=='实车银'||el6._car3dPrefs.market2dUrl!=='https://lpmall-dop-prod.oss-cn-hangzhou.aliyuncs.com/silver.png')fail('control: 2D 模式没有默认选中实车颜色对应的商城整车图');
+      else if(el6._carImgSrc!=='https://lpmall-dop-prod.oss-cn-hangzhou.aliyuncs.com/silver.png')fail('control: 2D 车模没有切换为商城真车渲染图');
+      else if(!sr6.querySelector('.p-hero .carModel'))fail('control: 固定 2D 后没有切回外观图车模区域');
+      else ok('control: 固定 2D → 按当前车辆读取商城颜色并使用实车颜色图片，偏好持久保存');
+      const scaleSlider=sr6.querySelector('.smodal .smbody [data-act="car2dscale"]');
+      const scaleHeader=sr6.querySelector('.smodal .smbody [data-act="car2dmenu"]');
+      const model2d=sr6.querySelector('.p-hero .carModel.model2d');
+      if(!scaleSlider||!scaleHeader)fail('control: 2D 外观设置缺少可收起入口或车图大小滑条');
+      else if(scaleSlider.value!=='1.5'||model2d?.style.getPropertyValue('--lm-car-2d-image-scale')!=='1.5')fail('control: 2D 车图默认大小不是 1.5 倍');
+      else {
+        scaleHeader.click();
+        if(sr6.querySelector('.smodal .smbody [data-act="car2dscale"]'))fail('control: 2D 外观设置无法收起');
+        else {
+          sr6.querySelector('.smodal .smbody [data-act="car2dmenu"]')?.click();
+          const reopenedScale=sr6.querySelector('.smodal .smbody [data-act="car2dscale"]');
+          if(!reopenedScale)fail('control: 收起后的 2D 外观设置无法重新展开');
+          else {
+            reopenedScale.value='1.85';
+            reopenedScale.dispatchEvent(new window.Event('input',{bubbles:true,composed:true}));
+            await new Promise(r=>setTimeout(r,40));
+            const savedScale=JSON.parse(localStorage.getItem(el6._car3dPrefsStoreKey())||'{}').market2dScale;
+            if(Number(savedScale)!==1.85||sr6.querySelector('.p-hero .carModel.model2d')?.style.getPropertyValue('--lm-car-2d-image-scale')!=='1.85')fail('control: 调整 2D 车图大小后没有即时应用并保存');
+            else ok('control: 2D 外观设置可收起/展开，车图大小默认 1.5 倍并支持即时调整和保存');
+          }
+        }
+      }
+      const blue2d=sr6.querySelector('.smodal .smbody [data-act="car2dcolor"][data-val="示例蓝"]');
+      blue2d?.dispatchEvent(new window.MouseEvent('click',{bubbles:true,composed:true}));
+      await new Promise(r=>setTimeout(r,35));
+      if(!blue2d)fail('control: 商城颜色选项没有显示可选车色');
+      else if(el6._car3dPrefs.market2dColor!=='示例蓝'||el6._carImgSrc!=='https://ueapp-oss-static.leapmotor.com/blue.png')fail('control: 手动选择商城颜色后没有更新 2D 真车图片');
+      else ok('control: 手动选择指定商城颜色后即时更新 2D 真车图片');
+      const modelSelect=sr6.querySelector('.smodal .smbody [data-act="car2dmodel"]');
+      if(modelSelect){modelSelect.value='C16';modelSelect.dispatchEvent(new window.Event('change',{bubbles:true,composed:true}));}
+      await new Promise(r=>setTimeout(r,70));
+      if(!modelSelect)fail('control: 商城车型目录选择框没有显示');
+      else if(el6._car3dPrefs.market2dModel!=='C16'||el6._car3dPrefs.market2dYear!=='2025'||el6._car3dPrefs.market2dEdition!=='580版')fail('control: 更换商城车型后没有读取并保存对应年款配置');
+      else if(el6._carImgSrc!=='https://lpmall-dop-prod.oss-cn-hangzhou.aliyuncs.com/c16-green.png'||marketSelections.at(-1)?.model_id!=='catalog-c16')fail('control: 新车型配置没有切换到其商城整车颜色图');
+      else ok('control: 可改选其他商城车型，并按该车型年款配置加载其颜色图片');
+      const yearSelect=sr6.querySelector('.smodal .smbody [data-act="car2dyear"]');
+      if(yearSelect){
+        const yearOptions=Array.from(yearSelect.options).map(option=>option.value);
+        if(!yearOptions.includes('2020'))fail('control: 年款选项没有从 2020 年开始');
+        else ok('control: 年款选择器提供从 2020 年起的连续年份');
+        yearSelect.value='2020';yearSelect.dispatchEvent(new window.Event('change',{bubbles:true,composed:true}));
+      }
+      await new Promise(r=>setTimeout(r,30));
+      if(!yearSelect)fail('control: 独立的年款选择框没有显示');
+      else if(el6._marketSelectedYear!=='2020'||el6._marketSelectedVariant!==''||el6._marketPictures.length!==0||el6._marketPicturesError!=='该年款暂无商城配置')fail('control: 无商城配置年份没有保留选择并清除旧配置图片');
+      else if(!marketVariantRequests.some((item)=>item.model==='C16'&&item.year==='2020'))fail('control: 目录缺少年款时没有按选中年份探测历史接口');
+      else if(!sr6.querySelector('.smodal .smbody [data-act="car2dvariant"]')?.disabled)fail('control: 无商城配置年份的配置选择器仍可用');
+      else ok('control: 无商城配置年份显示明确状态，不沿用其他年份图片');
+      const currentYearSelect=sr6.querySelector('.smodal .smbody [data-act="car2dyear"]');
+      if(currentYearSelect){currentYearSelect.value='2024';currentYearSelect.dispatchEvent(new window.Event('change',{bubbles:true,composed:true}));}
+      await new Promise(r=>setTimeout(r,60));
+      if(!yearSelect)fail('control: 独立的年款选择框没有显示');
+      else if(el6._car3dPrefs.market2dYear!=='2024'||el6._car3dPrefs.market2dModelId!=='catalog-c16-2024')fail('control: 切换年款后没有选择该年款配置并刷新图片');
+      else if(!marketVariantRequests.some((item)=>item.model==='C16'&&item.year==='2024'))fail('control: 2024 款没有按年款请求官网接口');
+      else ok('control: 年款可独立切换，配置选择与商城图片随年款同步更新');
+      sr6.querySelector('.smodal .smbody [data-act="car3dviewmode"][data-val="auto"]')?.click();
+      await new Promise(r=>setTimeout(r,50));
+      const restoredMode=JSON.parse(localStorage.getItem(el6._car3dPrefsStoreKey())||'{}');
+      if(el6._car3dPrefs.modelView||restoredMode.modelView)fail('control: 恢复自动模式后仍保留 2D 覆盖');
+      else if(!sr6.querySelector('.p-carview iframe')||!sr6.querySelector('.heroStage')?.classList.contains('stage3d'))fail('control: 恢复自动模式后没有回到可用的 3D 车模');
+      else ok('control: 恢复自动模式 → 可用时回到 3D');
       // 关掉弹窗, 免得影响后面的用例
       sr6.querySelector('[data-act="smclose"]')?.dispatchEvent(new window.MouseEvent("click", { bubbles: true, composed: true }));
       await new Promise((r) => setTimeout(r, 40));
@@ -2101,10 +2248,10 @@ for (const name of CARDS) {
       const dot = () => srPal.querySelector('[data-act="pal"][data-key="accent"][data-val="#9c27b0"]');
       const autoBtn = () => srPal.querySelector('[data-act="pal"][data-key="accent"][data-val=""]');
       const hint = srPal.querySelector(".smodal .smbody .subline")?.textContent || "";
-      // 设置弹窗顶部前三行: 卡片配色 · 主题色 → 界面风格 → 车模颜色
+      // 设置弹窗: 主题色 → 界面风格 → 隐藏卡片外框 → 车模显示 → 车模颜色
       // (界面风格与主题色是两个独立维度: 前者决定控件长相, 后者决定强调色)
-      if (rows[0] !== "卡片配色 · 主题色" || rows[1] !== "界面风格" || rows[2] !== "车模颜色") {
-        fail(`control: 设置弹窗最上面不是「卡片配色 · 主题色」+「界面风格」+「车模颜色」(实际 ${JSON.stringify(rows.slice(0, 4))})`);
+      if (rows[0] !== "卡片配色 · 主题色" || rows[1] !== "界面风格" || rows[2] !== "隐藏卡片外框" || rows[3] !== "车模显示" || rows[4] !== "车模颜色") {
+        fail(`control: 设置弹窗顶部次序不正确(实际 ${JSON.stringify(rows.slice(0, 5))})`);
       } else if (rows.indexOf("卡片配色 · 电量/状态色") >= 0) {
         fail(`control: 「卡片配色 · 电量/状态色」整行还留着(--success-color 不该再被覆盖)`);
       } else if (!dot() || !dot().querySelector(".pcSw")) {
@@ -2147,6 +2294,29 @@ for (const name of CARDS) {
           else if (autoBtn().classList.contains("on") !== true) fail(`control: 点「跟随主题」后它没有点亮`);
           else ok(`control: 卡片配色 = 点色圆立即生效(本机+变量+广播), 「跟随主题」移除变量回到主题`);
         }
+      }
+
+      // 边框开关立即持久化，不能顺带提交或取消正在预览的风格。
+      {
+        const click = (selector) => srPal.querySelector(selector)?.dispatchEvent(new window.MouseEvent("click", { bubbles: true, composed: true }));
+        const tick = () => new Promise(r => setTimeout(r, 40));
+        const toggle = () => srPal.querySelector('[data-act="hidecardframe"]');
+        if (toggle()?.getAttribute("aria-checked") !== "false") fail("control: 隐藏外框开关应默认关闭");
+        click('[data-act="style"][data-val="brutalist"]'); await tick();
+        click('[data-act="hidecardframe"]'); await tick();
+        const pending = JSON.parse(window.localStorage.getItem("leapmotor.appearance") || "{}");
+        if (toggle()?.getAttribute("aria-checked") !== "true" || pending.hideCardFrame !== true || pending.style === "brutalist" || elPal.getAttribute("data-lm-style") !== "brutalist" || elPal.style.getPropertyValue("--lm-shadow-card") !== "none") fail("control: 隐藏外框未保存、未去除阴影，或错误提交了风格预览");
+        click('[data-act="styleapply"]'); await tick();
+        const saved = JSON.parse(window.localStorage.getItem("leapmotor.appearance") || "{}");
+        if (saved.style !== "brutalist" || saved.hideCardFrame !== true) fail("control: 应用风格时丢失隐藏外框偏好");
+        click('[data-act="style"][data-val="memphis"]'); await tick();
+        click('[data-act="hidecardframe"]'); await tick();
+        click('[data-act="stylecancel"]'); await tick();
+        if (elPal.getAttribute("data-lm-style") !== "brutalist" || elPal.style.getPropertyValue("--lm-card-border") === "0" || elPal.style.getPropertyValue("--lm-shadow-card") === "none") fail("control: 取消风格预览时未保留已恢复的原有外框及阴影");
+        window.localStorage.removeItem("leapmotor.appearance");
+        window.dispatchEvent(new window.StorageEvent("storage", { key: "leapmotor.appearance" }));
+        await tick();
+        ok("control: 隐藏外框开关立即保存，独立于风格预览、应用和取消");
       }
 
       // 取色器: 彩虹圆 → 面板; 拖 SV / hex 回车 / 方向键都即时生效; 非法 hex 还原; 吸管按支持度出现;

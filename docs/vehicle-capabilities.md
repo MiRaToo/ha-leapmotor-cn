@@ -20,10 +20,11 @@
 
 - [App 车型目录](https://ueapp.oss-cn-hangzhou.aliyuncs.com/nativeApp/loveCar/love_car_default_header.txt) 的 `actionButtons.jumpUrl` 指向公开购车配置页。
 - [C10 在售配置页](https://www-app.leapmotor.cn/configuration-v4.html?carCode=2027C10) 使用 `carod-center.leapmotor.cn` 的公开配置接口。
-- 顺序为 `mallResourceConfig/getByCode` → 返回的 `carType` → `getVehicleModelSeatListV4` → 该列表返回的 `carModel` → `getVehicleProductConfigV4`。
+- 当前配置按 `mallResourceConfig/getByCode` → 返回的 `carType` → `getVehicleModelSeatListV4` → 该列表返回的 `carModel` → `getVehicleProductConfigV4` 读取。
+- 首页目录不是完整的历史图库。仍保留在公开接口中的旧配置可通过车型别名查询，再从 `getVehicleModelSeatList` 与 `getVehicleProductConfig` 读取；因此会合并当前 V4 与可查询的历史配置，不以首页是否展示作为车型是否有图的判断。
 - 整车素材是 `outColor[].appearanceCarImgs`；目录 `carBackImageURL` 是竖幅场景图，`carTypeImgs` 是配置横幅，都不用于替代整车图。
 
-已经收集验证的是 2027 C10 纯电某配置的 1500×1120 透明 PNG，不能据此给 2026 C10 自动换图。商城当前在售配置不是历史全车型图库；未知年款或颜色/版本不匹配时留空。
+已通过公开接口读取 2026 C10 的纯电与增程配置，并取得对应外观颜色图；仅 C10 就同时有 2026 与 2027 年款。其他已核查车型也能从当前或历史接口读取配置。仍需精确匹配年款、能源和版本；未知或不匹配时留空，不用新款图片冒充旧款。
 
 可手动收集供审核：
 

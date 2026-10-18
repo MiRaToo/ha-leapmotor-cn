@@ -200,6 +200,10 @@ export const CAR_IMG_RETRY_MS = 5 * 60 * 1000; // 车辆外观图失败后的重
  * 云端有风控, 打开卡片就自动请求是要出事的。 */
 export const CAR3D_INFO_WS = "leapmotor/car3d/info";
 
+export const CAR3D_MARKET_PICTURES_WS = "leapmotor/car3d/market-pictures";
+export const CAR3D_MARKET_CATALOG_WS = "leapmotor/car3d/market-catalog";
+export const CAR3D_MARKET_VARIANTS_WS = "leapmotor/car3d/market-variants";
+
 export const CAR3D_ENSURE_WS = "leapmotor/car3d/ensure";
 
 export const CAR3D_POLL_MS = 2000; // ensure 后问进度的间隔(装配在后台跑, 只有 info 看得到状态)
@@ -307,6 +311,22 @@ export interface Car3dInfo {
   error?: string;
 }
 
+export interface Car3dMarketPicture {
+  color: string;
+  url: string;
+}
+
+export interface Car3dMarketModel {
+  name: string;
+}
+
+export interface Car3dMarketVariant {
+  id: string;
+  year: string;
+  energy: string;
+  edition: string;
+}
+
 /* 本机覆盖(存 localStorage, 键带设备 id)。缺字段 = 没设过 → 用集成选项/实车色;
  * img 的 "" 是**明确清掉**(此时集成选项里的默认图也不再顶上来)。 */
 export interface Car3dPrefs {
@@ -315,6 +335,18 @@ export interface Car3dPrefs {
   bg?: string;
   img?: string | null;
   location?: "map" | "photo";
+  /** 本机强制使用 2D 外观图；未设置时沿用原有的自动 / 3D 行为。 */
+  modelView?: "2d";
+  /** 2D 模式下选择的官方商城车色与整车渲染图。 */
+  market2dColor?: string;
+  market2dUrl?: string;
+  /** 2D 外观图缩放倍数；缺省为 1.5。 */
+  market2dScale?: number;
+  market2dModel?: string;
+  market2dModelId?: string;
+  market2dYear?: string;
+  market2dEnergy?: string;
+  market2dEdition?: string;
 }
 
 /* 当前生效的车漆: tsp=色表色号 / hex=自定义色 / auto=实车色(素材建时定色) */
@@ -334,6 +366,16 @@ export interface ControlCtx {
   _candidates: Candidate[];
   _call(domain: string, service: string, data: Record<string, any>, busyKey?: string): Promise<boolean>;
   _car3d: Car3dInfo | null;
+  _marketPictures: Car3dMarketPicture[];
+  _marketPicturesLoading: boolean;
+  _marketPicturesError: string;
+  _marketModels: Car3dMarketModel[];
+  _marketVariants: Car3dMarketVariant[];
+  _marketSelectedModel: string;
+  _marketSelectedYear: string;
+  _marketSelectedVariant: string;
+  _marketCatalogLoading: boolean;
+  _marketVariantsLoading: boolean;
   _car3dBusy: boolean;
   _car3dReloading: boolean;
   _car3dErr: string;
@@ -374,12 +416,16 @@ export interface ControlCtx {
   _num(key: string): number | null;
   _onAcPower(): void;
   _onCar3dDownload(): void;
+  _loadCar2dPictures(force?: boolean): void;
+  _selectCar2dModel(model: string): void;
+  _selectCar2dYear(year: string): void;
+  _selectCar2dVariant(id: string): void;
   _onCar3dRefresh(): void;
   _onLock(): void | Promise<void>;
   _onSeat(key: string, delta: number): void;
   _onTemp(delta: number): void;
   _onTrunk(id: string, on: boolean): void | Promise<void>;
-  _open: { climate: boolean; window: boolean; preset: boolean; photo: boolean; tires: boolean; seats: boolean; charge: boolean; car3d: boolean };
+  _open: { climate: boolean; window: boolean; preset: boolean; photo: boolean; tires: boolean; seats: boolean; charge: boolean; car3d: boolean; car2dSettings: boolean };
   /** 设置子卡里的取色器(彩虹圆点开): 开的是哪一颗(""=关 / accent / hex) + 面板当前 HSV */
   _palOpen: "" | "accent" | "hex";
   _palH: number;

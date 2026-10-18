@@ -70,7 +70,34 @@ export function tariffForm(draft: Record<string,string>, saving: boolean, error:
                            edit: (key: string,value: string)=>void, save: ()=>void, close: ()=>void,
                            periods:{start:string;end:string;price:string}[], editPeriod:(i:number,key:'start'|'end'|'price',value:string)=>void,addPeriod:()=>void,removePeriod:(i:number)=>void): TemplateResult {
   const input=(key:string,label:string,type="number",min="0",max="100")=>html`<label>${label}<input type=${type} min=${min} max=${max} step=${type==="time"?60:.01} .value=${live(draft[key]||"")} @input=${(e:Event)=>edit(key,(e.target as HTMLInputElement).value)} ?disabled=${saving}></label>`;
-  return html`<div class="tariffBackdrop" @click=${(e:Event)=>{if(e.target===e.currentTarget&&!saving)close()}} @keydown=${(e:KeyboardEvent)=>{if(e.key==='Escape'&&!saving){e.stopPropagation();close()}if(e.key==='Tab'){const nodes=Array.from((e.currentTarget as HTMLElement).querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled)')).filter(n=>n.offsetParent!==null),first=nodes[0],last=nodes[nodes.length-1],active=first?.getRootNode() as ShadowRoot;if(e.shiftKey&&active?.activeElement===first){e.preventDefault();last?.focus()}else if(!e.shiftKey&&active?.activeElement===last){e.preventDefault();first?.focus()}}}}><section class="tariffForm" role="dialog" aria-modal="true" aria-label="电价设置" tabindex="-1"><header class="tariffHead"><div><b>电价设置</b><small>${timezone}</small></div><button aria-label="关闭电价设置" @click=${close} ?disabled=${saving}>×</button></header><div class="tariffScroll"><section class="tariffSection"><b>交流慢充 · 家用峰谷价</b><div class="tariffGrid">${input("ac_peak_price","峰电价 · 元/kWh")}${input("ac_valley_price","谷电价 · 元/kWh")}${input("ac_efficiency","交流效率 · %","number","50","100")}${input("valley_start","谷电开始","time")}${input("valley_end","谷电结束","time")}</div><p class="billNote">支持跨午夜，谷电时段之外使用峰电价。</p></section><section class="tariffSection"><b>直流快充 · 公共分时价</b><p class="billNote">填写含服务费的单价，时段须无重叠并覆盖 24 小时。开始与结束相同表示全天；价格全部留空可暂不设置分时价。</p><div class="periodRows">${periods.map((p,i)=>html`<div class="periodRow"><label>开始<input type="time" aria-label=${'时段'+(i+1)+'开始'} .value=${live(p.start)} @input=${(e:Event)=>editPeriod(i,'start',(e.target as HTMLInputElement).value)} ?disabled=${saving}></label><label>结束<input type="time" aria-label=${'时段'+(i+1)+'结束'} .value=${live(p.end)} @input=${(e:Event)=>editPeriod(i,'end',(e.target as HTMLInputElement).value)} ?disabled=${saving}></label><label>元/kWh<input type="number" min="0" max="100" step="0.01" aria-label=${'时段'+(i+1)+'电价'} .value=${live(p.price)} @input=${(e:Event)=>editPeriod(i,'price',(e.target as HTMLInputElement).value)} ?disabled=${saving}></label><button aria-label=${'删除时段'+(i+1)} @click=${()=>removePeriod(i)} ?disabled=${saving||periods.length===1}>×</button></div>`)}</div><button class="addPeriod" @click=${addPeriod} ?disabled=${saving||periods.length>=24}>添加电价时段</button></section><section class="tariffSection"><div class="tariffGrid">${input("dc_efficiency","直流效率 · %","number","50","100")}</div><p class="billNote">交流和直流按各自效率折算取电量；未知枪型保留旧默认效率。费用按对应枪型计价，未单独修正的历史费用按当前设置重算。</p></section>${error?html`<p class="billNote error" role="alert">${error}</p>`:nothing}</div><div class="tariffActions"><button @click=${close} ?disabled=${saving}>取消</button><button class="savePrice" @click=${save} ?disabled=${saving}>${saving?"保存中…":"保存电价"}</button></div></section></div>`;
+  const efficiency=(key:string,label:string)=>html`<label class="tariffEfficiency"><span>${label}</span><span class="tariffEfficiencyInput"><input type="number" min="50" max="100" step="1" .value=${live(draft[key]||"")} @input=${(e:Event)=>edit(key,(e.target as HTMLInputElement).value)} ?disabled=${saving}><i>%</i></span></label>`;
+  return html`<div class="tariffBackdrop" @click=${(e:Event)=>{if(e.target===e.currentTarget&&!saving)close()}} @keydown=${(e:KeyboardEvent)=>{if(e.key==='Escape'&&!saving){e.stopPropagation();close()}if(e.key==='Tab'){const nodes=Array.from((e.currentTarget as HTMLElement).querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled)')).filter(n=>n.offsetParent!==null),first=nodes[0],last=nodes[nodes.length-1],active=first?.getRootNode() as ShadowRoot;if(e.shiftKey&&active?.activeElement===first){e.preventDefault();last?.focus()}else if(!e.shiftKey&&active?.activeElement===last){e.preventDefault();first?.focus()}}}}><section class="tariffForm" role="dialog" aria-modal="true" aria-label="电价设置" tabindex="-1">
+    <header class="tariffHead"><div><b>电价设置</b><small>${timezone}</small></div><button aria-label="关闭电价设置" @click=${close} ?disabled=${saving}>×</button></header>
+    <div class="tariffScroll">
+      <section class="tariffSection"><div class="tariffSectionHead"><b>交流慢充</b><span>家用峰谷价</span></div>
+        <div class="tariffGrid">${input("ac_peak_price","峰电价 · 元/kWh")}${input("ac_valley_price","谷电价 · 元/kWh")}</div>
+        <div class="tariffMeta"><div class="tariffTimeGroup"><span class="tariffFieldLabel">谷电时段</span><div class="tariffTimeRange">
+          ${input("valley_start","开始","time")}<span class="tariffTimeArrow">至</span>${input("valley_end","结束","time")}
+        </div></div>${efficiency("ac_efficiency","交流效率")}</div>
+        <p class="billNote">支持跨午夜，谷电时段之外使用峰电价。</p>
+      </section>
+      <section class="tariffSection"><div class="tariffSectionHead"><b>直流快充</b><span>公共分时价</span></div>
+        <p class="billNote">填写含服务费的单价，时段须无重叠并覆盖 24 小时。开始与结束相同表示全天；价格全部留空可暂不设置分时价。</p>
+        <div class="periodRows">${periods.map((p,i)=>html`<div class="periodRow">
+          <div class="periodTimes"><label><span>开始</span><input type="time" aria-label=${'时段'+(i+1)+'开始'} .value=${live(p.start)} @input=${(e:Event)=>editPeriod(i,'start',(e.target as HTMLInputElement).value)} ?disabled=${saving}></label><span class="periodTimeArrow">至</span><label><span>结束</span><input type="time" aria-label=${'时段'+(i+1)+'结束'} .value=${live(p.end)} @input=${(e:Event)=>editPeriod(i,'end',(e.target as HTMLInputElement).value)} ?disabled=${saving}></label></div>
+          <label class="periodPrice"><span>电价 · 元/kWh</span><input type="number" min="0" max="100" step="0.01" aria-label=${'时段'+(i+1)+'电价'} .value=${live(p.price)} @input=${(e:Event)=>editPeriod(i,'price',(e.target as HTMLInputElement).value)} ?disabled=${saving}></label>
+          <button aria-label=${'删除时段'+(i+1)} @click=${()=>removePeriod(i)} ?disabled=${saving||periods.length===1}>×</button>
+        </div>`)}</div>
+        <button class="addPeriod" @click=${addPeriod} ?disabled=${saving||periods.length>=24}>添加电价时段</button>
+      </section>
+      <section class="tariffSection"><div class="tariffSectionHead"><b>能耗折算</b><span>电池侧 → 电网侧</span></div>
+        ${efficiency("dc_efficiency","直流效率")}
+        <p class="billNote">交流和直流按各自效率折算取电量；未知枪型保留旧默认效率。费用按对应枪型计价，未单独修正的历史费用按当前设置重算。</p>
+      </section>
+      ${error?html`<p class="billNote error" role="alert">${error}</p>`:nothing}
+    </div>
+    <div class="tariffActions"><button @click=${close} ?disabled=${saving}>取消</button><button class="savePrice" @click=${save} ?disabled=${saving}>${saving?"保存中…":"保存电价"}</button></div>
+  </section></div>`;
 }
 
 export const energyPanelStyles = `
@@ -118,6 +145,35 @@ export const energyPanelStyles = `
   .tariffGrid { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:12px 0; }
   .tariffGrid label { display:flex;flex-direction:column;gap:5px;font-size:11px;color:var(--secondary-text-color,#6b7280); }
   .tariffGrid input { min-width:0; width:100%;box-sizing:border-box;border:0;border-radius:var(--lm-radius-control, 8px);padding:8px;background:var(--lm-surface-inset, var(--secondary-background-color,#eef1f5));color:var(--primary-text-color,#212121);font:inherit; }
+  .tariffForm { width:min(520px,100%);container-type:inline-size; }
+  .tariffSectionHead { display:flex;align-items:baseline;gap:8px; }
+  .tariffSectionHead span { margin-left:auto;font-size:10px;color:var(--secondary-text-color,#6b7280); }
+  .tariffSectionHead b { font-size:13px; }
+  .tariffSection .tariffGrid { margin:10px 0; }
+  .tariffMeta { display:grid;gap:10px;margin:10px 0; }
+  .tariffTimeGroup { display:grid;gap:5px; }
+  .tariffFieldLabel,.tariffTimeRange label,.periodTimes label,.periodPrice,.tariffEfficiency { font-size:10px;color:var(--secondary-text-color,#6b7280); }
+  .tariffTimeRange { display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:8px; }
+  .tariffTimeRange label,.periodTimes label { display:grid;gap:4px;min-width:0; }
+  .tariffTimeRange label>span,.periodTimes label>span { font-size:9px; }
+  .tariffTimeArrow,.periodTimeArrow { text-align:center;font-size:11px;color:var(--secondary-text-color,#6b7280); }
+  .tariffTimeRange input,.tariffEfficiencyInput input { box-sizing:border-box;min-width:0;width:100%;border:0;border-radius:var(--lm-radius-control,8px);padding:8px 7px;background:var(--lm-surface-inset,var(--secondary-background-color,#eef1f5));color:var(--primary-text-color,#212121);font:inherit; }
+  .tariffEfficiency { display:flex;flex-direction:column;gap:5px;width:min(100%,180px); }
+  .tariffEfficiencyInput { display:flex;align-items:center;gap:6px; }
+  .tariffEfficiencyInput input { width:90px; }
+  .tariffEfficiencyInput i { font-style:normal; }
+  .periodRows { display:grid;gap:8px;margin:12px 0; }
+  .periodRow { display:grid;grid-template-columns:minmax(0,1.35fr) minmax(100px,.8fr) 32px;align-items:end;gap:8px; }
+  .periodTimes { display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:end;gap:5px;min-width:0; }
+  .periodPrice { display:grid;gap:4px;min-width:0;white-space:nowrap; }
+  .periodTimes input,.periodPrice input { box-sizing:border-box;min-width:0;width:100%;height:36px;border:0;border-radius:var(--lm-radius-control,8px);padding:7px 6px;background:var(--lm-surface-inset,var(--secondary-background-color,#eef1f5));color:var(--primary-text-color,#212121);font:inherit; }
+  .periodRow button { width:32px;height:36px;padding:0; }
+  @container (max-width:360px) {
+    .periodRow { grid-template-columns:minmax(0,1fr) 32px;column-gap:6px; }
+    .periodTimes { grid-column:1/-1; }
+    .periodPrice { grid-column:1;grid-row:2; }
+    .periodRow button { grid-column:2;grid-row:2; }
+  }
   .tariffActions { display:flex;justify-content:flex-end;gap:8px; }
   .tariffActions button { box-shadow:var(--lm-shadow-control, 0 1px 4px #0002);border:0;border-radius:var(--lm-radius-control, 8px);padding:8px 12px;font:inherit;cursor:pointer;background:var(--lm-surface-control, var(--card-background-color,#fff));color:inherit; }
   .tariffActions .savePrice { background:var(--primary-color,#03a9f4);color:white; }

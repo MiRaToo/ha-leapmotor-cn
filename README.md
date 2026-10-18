@@ -9,14 +9,16 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/MiRaToo/ha-leapmotor-cn/releases/latest"><img alt="发布版 v0.3.0" src="https://img.shields.io/badge/%E7%A8%B3%E5%AE%9A%E7%89%88-v0.3.0-brightgreen.svg"></a>
+  <a href="https://github.com/MiRaToo/ha-leapmotor-cn/releases/latest"><img alt="发布版 v0.3.1" src="https://img.shields.io/badge/%E7%A8%B3%E5%AE%9A%E7%89%88-v0.3.1-brightgreen.svg"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-AGPL--3.0-blue"></a>
   <img alt="Home Assistant" src="https://img.shields.io/badge/Home%20Assistant-2024.11%2B-41BDF5?logo=homeassistant&logoColor=white">
 </p>
 
 这是一个非官方的 Home Assistant 自定义集成。集成通过零跑云端接口登录，提供车辆实体、行程与能耗记录，以及六张可直接加入 Lovelace 仪表盘的卡片。项目与零跑汽车及其关联公司无隶属、合作或背书关系。
 
-当前版本：**v0.3.0**。
+当前版本：**v0.3.1**。
+
+代码托管：[GitHub](https://github.com/MiRaToo/ha-leapmotor-cn) · [GitCode 同步仓库](https://gitcode.com/MiraRato/ha-leapmotor-cn)。日常更新以 GitHub 为准，GitCode 通过仓库镜像自动同步代码、分支和标签。
 
 ## 功能
 
@@ -44,6 +46,8 @@
 
 卡片提供玻璃拟态、轻阴影、新粗野主义、极简扁平和孟菲斯五种界面风格，默认使用玻璃拟态；风格设置在卡片间保持一致。自定义数据卡支持车辆状态、行程统计和 Home Assistant 实体数据，每张卡独立保存所选内容。卡片配置示例见[仪表盘与卡片说明](docs/dashboard.md)。
 
+控制卡片的设置中可切换“自动 / 3D”与“仅 2D”；2D 外观可按商城车型、年款、能源、配置和颜色选择，并调整车图大小。“隐藏卡片外框”默认关闭，开启后去掉卡片最外层的边框和阴影，保留内部子卡片效果。
+
 ## 安全接入建议
 
 建议使用单独的零跑子账号接入。零跑云同一账号通常只允许一个活跃登录，而集成需要持续轮询；使用主账号可能影响官方 App 的登录状态。
@@ -54,6 +58,20 @@
 
 ## 安装
 
+项目地址（可直接复制）：
+
+GitHub：
+
+```text
+https://github.com/MiRaToo/ha-leapmotor-cn
+```
+
+GitCode 同步仓库：
+
+```text
+https://gitcode.com/MiraRato/ha-leapmotor-cn
+```
+
 ### HACS
 
 1. 在 HACS 的集成页面添加[自定义仓库](https://github.com/MiRaToo/ha-leapmotor-cn)，类型选择“集成”。
@@ -62,7 +80,7 @@
 
 ### 手动安装
 
-将 <code>custom_components/leapmotor</code> 目录复制到 Home Assistant 配置目录下的 <code>custom_components/</code>，重启 Home Assistant，再从“设置 → 设备与服务”添加“零跑汽车”。
+从上方任一仓库下载代码，将 <code>custom_components/leapmotor</code> 目录复制到 Home Assistant 配置目录下的 <code>custom_components/</code>，重启 Home Assistant，再从“设置 → 设备与服务”添加“零跑汽车”。
 
 安装后会创建车辆设备及对应实体。卡片资源由集成自动注册；在仪表盘中添加相应的自定义卡片即可。详细步骤见[接入指南](docs/SETUP.md)与[部署说明](docs/DEPLOY.md)。
 

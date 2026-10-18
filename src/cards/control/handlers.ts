@@ -6,10 +6,11 @@
  */
 import { fmtNum } from "../../lib/format";
 import { writePalette } from "../../lib/palette";
-import { cancelPreview, commitPreview, previewStyle } from "../../lib/appearance";
+import { cancelPreview, commitPreview, previewStyle, readAppearance, setHideCardFrame } from "../../lib/appearance";
 import { isStyleId } from "../../lib/ui/presets";
 import { PRESET_MEMO_MS } from "./types";
 import { CAR3D_BACKGROUNDS } from "./types";
+import { car3dColors } from "./render-hero";
 import { onPalEye, onPalHue } from "./picker";
 import type { ControlCtx } from "./types";
 
@@ -26,6 +27,7 @@ export function onClick(ctx: ControlCtx, ev: Event) {
   const el = t && t.closest ? (t.closest("[data-act]") as HTMLElement | null) : null;
   if (!el || (el as any).disabled) return;
   const act = el.dataset.act;
+  if (act === "hidecardframe") return setHideCardFrame(!readAppearance().hideCardFrame);
   if(act==='wrapopen')return ctx._showWrap(true);
   if(act==='paintconfirm'||act==='paintcancel')return ctx._finishPaint(act==='paintconfirm');
   if (act === "lock" || act === "lockround") return ctx._onLock();
@@ -62,6 +64,7 @@ export function onClick(ctx: ControlCtx, ev: Event) {
       ctx._open.car3d = key === "car3d";
     }
     ctx._render();
+    if (on && key === "car3d" && ctx._car3dPrefs.modelView === "2d") ctx._loadCar2dPictures();
     return;
   }
   if (act === "smclose") {
@@ -158,6 +161,40 @@ export function onClick(ctx: ControlCtx, ev: Event) {
     return;
   }
   // ── 车模设置(3D 车模): 颜色 / 背景 / 自定义外观图 / 下载素材 ──
+  if (act === "car3dviewmode") {
+    if (el.dataset.val === "2d") {
+      ctx._car3dPrefs.modelView = "2d";
+      ctx._open.car2dSettings = true;
+    } else delete ctx._car3dPrefs.modelView; // 恢复原有的自动 / 3D 行为
+    ctx._saveCar3dPrefs();
+    ctx._render();
+    if (ctx._car3dPrefs.modelView === "2d") ctx._loadCar2dPictures();
+    return;
+  }
+  if (act === "car2dmenu") {
+    ctx._open.car2dSettings = !ctx._open.car2dSettings;
+    ctx._render();
+    return;
+  }
+  if (act === "car2dpictures") {
+    ctx._loadCar2dPictures(true);
+    return;
+  }
+  if (act === "car2dcolor") {
+    const color = el.dataset.val || "";
+    const picture = ctx._marketPictures.find((item) => item.color === color);
+    if (!picture) return;
+    ctx._car3dPrefs.market2dColor = picture.color;
+    ctx._car3dPrefs.market2dUrl = picture.url;
+    const matching3d = car3dColors(ctx).find((item) => item.name === color);
+    if (matching3d) {
+      ctx._car3dPrefs.tsp = String(matching3d.tsp);
+      delete ctx._car3dPrefs.hex;
+    }
+    ctx._saveCar3dPrefs();
+    ctx._render();
+    return;
+  }
   if (act === "car3drefresh") return ctx._onCar3dRefresh();
   if (act === "car3ddl") return ctx._onCar3dDownload();
   if (act === "car3dcolor") {
@@ -256,6 +293,9 @@ export function onChange(ctx: ControlCtx, ev: Event) {
   const el = ev.target as HTMLInputElement | null;
   if (!el || !el.dataset) return;
   const act = el.dataset.act;
+  if (act === "car2dmodel") return ctx._selectCar2dModel(el.value);
+  if (act === "car2dyear") return ctx._selectCar2dYear(el.value);
+  if (act === "car2dvariant") return ctx._selectCar2dVariant(el.value);
   if (act === "charge_limit") {
     const id = el.dataset.entity;
     if (!id) return;
@@ -313,6 +353,15 @@ export function onInput(ctx: ControlCtx, ev: Event) {
   }
   if (el.dataset.act === "palhue") {
     onPalHue(ctx, el);
+    return;
+  }
+  if (el.dataset.act === "car2dscale") {
+    const scale = Number(el.value);
+    if (Number.isFinite(scale)) {
+      ctx._car3dPrefs.market2dScale = Math.round(Math.max(1, Math.min(2.5, scale)) * 100) / 100;
+      ctx._saveCar3dPrefs();
+      ctx._scheduleRender();
+    }
     return;
   }
   if (el.dataset.act !== "charge_limit") return;

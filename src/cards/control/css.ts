@@ -223,6 +223,11 @@ export const CARD_CSS = `${interactionStyles}        /* 配色: 与「零跑·�
         .card.narrow .carModel.hasTire { padding: 4px 0 30px; }
         /* 整车展示图以 contain 保证原始比例。无素材时不绘制车图。 */
         .carImg { width: 100%; height: 100%; object-fit: contain; }
+        /* 商城 2D 车图的留白较多，放大主体；保留容器尺寸供胎压与状态浮层定位。 */
+        .carModel.model2d .carImg {
+          transform: scale(var(--lm-car-2d-image-scale, 1.5));
+          transform-origin: center;
+        }
         /* ── 车模左侧的充电状态块 ──
            绝对定位(不占宽度 → 出现/展开都不挤动车模); **top 锚定**而不是垂直居中:
            这样收起↔展开时"左上角"不动, 只向下长(实测两态 dx/dy 完全一致)。
@@ -959,6 +964,29 @@ export const CARD_CSS = `${interactionStyles}        /* 配色: 与「零跑·�
            不是整块填充。末尾那颗"彩虹圆"(conic-gradient)点开取色器。 */
         .cRow.palRC { align-items: flex-start; }
         .cRow.palRC .cC { flex: 1 1 100%; margin-left: 0; justify-content: flex-start; gap: 8px 12px; }
+        .market2dPicker { display: flex; flex-direction: column; align-items: stretch; gap: 9px; width: 100%; min-width: 0; }
+        .market2dSelects { display: flex; flex-wrap: wrap; gap: 8px; width: 100%; }
+        .market2dField { display: flex; flex: 1 1 165px; flex-direction: column; gap: 4px; min-width: 0; font-size: 11px; color: var(--secondary-text-color, #6b7280); }
+        .market2dField select { width: 100%; min-width: 0; font-size: 12px; }
+        .market2dColors { display: flex; flex-wrap: wrap; gap: 7px; }
+        .market2dError { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+        .market2dNote { font-size: 10.5px; line-height: 1.35; opacity: .62; }
+        .market2dSettings { width: 100%; min-width: 0; }
+        .market2dHeader {
+          display: flex; align-items: center; gap: 8px; width: 100%; min-height: 40px;
+          padding: 7px 10px; border: 0; border-radius: var(--lm-radius-control, 12px);
+          background: var(--lm-surface-control, var(--secondary-background-color, #e7eaed));
+          color: var(--primary-text-color, #222); text-align: left;
+        }
+        .market2dHeader > span:first-of-type { font-weight: 600; }
+        .market2dHeader .market2dSummary { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; opacity: .64; }
+        .market2dHeader .market2dChevron { flex: none; transition: transform .18s ease; }
+        .market2dHeader[aria-expanded="true"] .market2dChevron { transform: rotate(180deg); }
+        .market2dBody { display: flex; flex-direction: column; gap: 10px; padding: 10px 2px 2px; }
+        .market2dScale { display: flex; flex-direction: column; gap: 5px; }
+        .market2dScaleLabel { display: flex; justify-content: space-between; align-items: center; font-size: 12px; }
+        .market2dScaleLabel output { color: var(--primary-color, #03a9f4); font-weight: 600; font-variant-numeric: tabular-nums; }
+        .market2dScale input { width: 100%; margin: 2px 0; accent-color: var(--primary-color, #03a9f4); }
         .palDot {
           display: flex; flex-direction: column; align-items: center; gap: 6px;
           padding: 2px 0 0; background: none; border: 0; box-shadow: none; cursor: pointer;

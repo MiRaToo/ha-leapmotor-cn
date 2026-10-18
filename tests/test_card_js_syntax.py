@@ -18,7 +18,7 @@ import pytest
 
 WWW = pathlib.Path(__file__).resolve().parent.parent / "custom_components" / "leapmotor" / "www"
 CARDS = ["leapmotor-map.js", "leapmotor-trips.js", "leapmotor-control.js",
-         "leapmotor-energy.js", "leapmotor-lastweek.js"]
+         "leapmotor-energy.js", "leapmotor-lastweek.js", "leapmotor-metrics.js"]
 
 
 def _node():

@@ -86,16 +86,33 @@ import { isDark } from "../../lib/theme";
 import { applyAppearance, bindAppearance, unbindAppearance } from "../../lib/appearance";
 import { hasOverlay, openConfirm } from "../../lib/ui/overlay";
 import { defineCard, registerCustomCard, banner } from "../../lib/register";
-import type { RegistryEntity, RegistryDevice, Candidate, ClPending, TempPending, PresetMemo, Car3dInfo, Car3dPrefs, ControlCtx } from "./types";
-import { CARD_VERSION, PANELS, SECTIONS, SHOW_EXTRA, KEY_NAMES, KEY_SUFFIX, KEYS_BY_LEN, CAR3D_INFO_WS, CAR3D_ENSURE_WS, CAR3D_POLL_MS, CAR3D_POLL_MAX, CAR3D_SYNC_MS, CAR3D_DROP_PCT, LOW_TIRE_BAR, TIRE_DEFS, TEMP_DEBOUNCE_MS, TEMP_PENDING_MS, PRESET_MEMO_MS } from "./types";
+import type { RegistryEntity, RegistryDevice, Candidate, ClPending, TempPending, PresetMemo, Car3dInfo, Car3dMarketPicture, Car3dMarketModel, Car3dMarketVariant, Car3dPrefs, ControlCtx } from "./types";
+import { CARD_VERSION, PANELS, SECTIONS, SHOW_EXTRA, KEY_NAMES, KEY_SUFFIX, KEYS_BY_LEN, CAR3D_INFO_WS, CAR3D_MARKET_PICTURES_WS, CAR3D_MARKET_CATALOG_WS, CAR3D_MARKET_VARIANTS_WS, CAR3D_ENSURE_WS, CAR3D_POLL_MS, CAR3D_POLL_MAX, CAR3D_SYNC_MS, CAR3D_DROP_PCT, LOW_TIRE_BAR, TIRE_DEFS, TEMP_DEBOUNCE_MS, TEMP_PENDING_MS, PRESET_MEMO_MS } from "./types";
 import { CARD_CSS } from "./css";
 import { actionsPanel, actionsVisible, cabinPanel, carToolsPanel, car3dBodyPanel, car3dPanel, car3dVisible, carDocksPanel, chargeBodyPanel, chargingPanel, chargingVisible, climatePanel, climateVisible, emptyPanel, fuelPanel, fuelVisible, heroFull, heroPanel, heroVisible, hintPanel, locationPanel, locationVisible, photoPanel, toastPanel } from "./templates";
-import { car3dHexNow, car3dBackgroundNow, car3dAutoTsp, car3dView } from "./render-hero";
+import { car3dHexNow, car3dBackgroundNow, car3dAutoTsp, car3dColors, car3dSelTsp, car3dView } from "./render-hero";
 import { CAR3D_BACKGROUNDS } from "./types";
 import { vehiclePose } from "./car3d-state";
 import { cabinAny, locBg } from "./render-panels";
 import { onPalFocusOut, onPalKeyDown, onPalPointer, palInit, palPickerT, placePalPop } from "./picker";
 import { onClick, onChange, onInput, onTitleDblClick } from "./handlers";
+
+const MARKET_IMAGE_HOSTS = new Set([
+  "lpmall-dop-prod.oss-cn-hangzhou.aliyuncs.com",
+  "ueapp-oss-static.leapmotor.com",
+  "ueapp-oss-static.leapmotor.cn",
+  "lp-website-oss-static.leapmotor.com",
+]);
+const MIN_MARKET_YEAR = 2020;
+
+function safeMarketPictureUrl(value: unknown): string {
+  try {
+    const url = new URL(String(value || ""));
+    return url.protocol === "https:" && MARKET_IMAGE_HOSTS.has(url.hostname) ? url.href : "";
+  } catch {
+    return "";
+  }
+}
 
 class LeapmotorControlCard extends LitElement implements ControlCtx {
   private _built = false;
@@ -146,7 +163,7 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
   // 刷新后弹窗自己弹出、遮罩盖住整张卡片, 这个坑座椅那张卡踩过)。
   /** @internal 供 render-* / handlers 取用(对应 types.ts 的 ControlCtx); 运行时行为不变 */
   public _open = { climate: true, window: false, preset: false, photo: false, tires: false,
-                    seats: false, charge: false, car3d: false };
+                    seats: false, charge: false, car3d: false, car2dSettings: false };
   /** @internal 供 render-* / handlers 取用(对应 types.ts 的 ControlCtx); 运行时行为不变 */
   public _warnOpen = false;   // 车模右上角告警: false = 收起为红色「!」(默认), true = 逐条展开
   /** @internal 供 render-* / handlers 取用(对应 types.ts 的 ControlCtx); 运行时行为不变 */
@@ -210,6 +227,19 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
   /** @internal 供 render-* / handlers 取用(对应 types.ts 的 ControlCtx); 运行时行为不变 */
   public _car3dBusy = false;         // ensure 进行中(按钮禁用)
   public _car3dReloading = false;    // 用户主动重载 3D 查看器
+  public _marketPictures: Car3dMarketPicture[] = [];
+  public _marketPicturesLoading = false;
+  public _marketPicturesError = "";
+  public _marketModels: Car3dMarketModel[] = [];
+  public _marketVariants: Car3dMarketVariant[] = [];
+  public _marketSelectedModel = "";
+  public _marketSelectedYear = "";
+  public _marketSelectedVariant = "";
+  public _marketCatalogLoading = false;
+  public _marketVariantsLoading = false;
+  private _marketPicturesAskedDevice = "";
+  private _marketActual: { model: string; year: string; energy: string; edition: string; model_id: string; color: string } | null = null;
+  private _marketSelectionReq = 0;
   private _car3dPollTimer: ReturnType<typeof setTimeout> | null = null;
   private _car3dPolling = false;      // 轮询链在跑(含 callWS 往返期间, 免得重绘插进第二条链)
   private _car3dPollLeft = 0;         // 轮询剩余次数
@@ -1565,6 +1595,314 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
     });
   }
 
+  /** 用户进入 2D 配置时按需读取公开商城目录, 不下载 3D 素材包。 */
+  public _loadCar2dPictures(force = false) {
+    const hass = this._hass;
+    const device = this._device || this._picked || "";
+    const loadKey = device || "market-catalog";
+    if (!hass?.callWS || this._marketCatalogLoading || this._marketPicturesLoading) return;
+    if (!force && this._marketPicturesAskedDevice === loadKey) return;
+    const prefsKey = this._car3dPrefsStoreKey();
+    this._marketPicturesAskedDevice = loadKey;
+    this._marketCatalogLoading = true;
+    this._marketPicturesLoading = true;
+    this._marketPicturesError = "";
+    this._marketModels = [];
+    this._marketVariants = [];
+    this._marketActual = null;
+    this._marketSelectionReq += 1;
+    this._scheduleRender();
+    const catalogRequest = hass.callWS<{ models?: Car3dMarketModel[]; reason?: string }>(
+      { type: CAR3D_MARKET_CATALOG_WS });
+    const actualRequest: Promise<{
+      pictures?: Car3dMarketPicture[];
+      actual_color?: string;
+      model?: string;
+      year?: string | number;
+      energy?: string;
+      edition?: string;
+      model_id?: string;
+      error?: string;
+    }> = device ? hass.callWS({ type: CAR3D_MARKET_PICTURES_WS, device_id: device }) : Promise.resolve({});
+    Promise.allSettled([catalogRequest, actualRequest]).then(([catalogReply, actualReply]) => {
+      if (this._car3dPrefsStoreKey() !== prefsKey) return;
+      this._marketCatalogLoading = false;
+      const catalog = catalogReply.status === "fulfilled" ? catalogReply.value : null;
+      this._marketModels = Array.isArray(catalog?.models)
+        ? catalog.models.filter((item) => item && typeof item.name === "string" && item.name.trim())
+        : [];
+      const actual = actualReply.status === "fulfilled" ? actualReply.value : null;
+      this._marketActual = actual ? {
+        model: String(actual.model || ""), year: String(actual.year || ""),
+        energy: String(actual.energy || ""), edition: String(actual.edition || ""),
+        model_id: String(actual.model_id || ""), color: String(actual.actual_color || ""),
+      } : null;
+      this._marketPictures = this._safeMarketPictures(actual?.pictures);
+      this._marketPicturesLoading = false;
+
+      if (!this._marketModels.length) {
+        this._marketPicturesError = String(catalog?.reason || "商城车型目录暂时无法读取");
+        if (!this._marketPictures.length && actual?.error) this._marketPicturesError = String(actual.error);
+        this._render();
+        return;
+      }
+      const wantedModel = this._car3dPrefs.market2dModel || this._marketActual?.model || this._car3d?.model_param?.carType || "";
+      const model = this._marketModels.find((item) => item.name.toLocaleLowerCase() === wantedModel.toLocaleLowerCase())
+        || this._marketModels[0];
+      this._marketSelectedModel = model.name;
+      this._render();
+      this._loadCar2dVariants(model.name);
+    }).catch((err: unknown) => {
+      if (this._car3dPrefsStoreKey() !== prefsKey) return;
+      this._marketCatalogLoading = false;
+      this._marketPicturesLoading = false;
+      this._marketPicturesError = String(err instanceof Error ? err.message : "商城车型暂时无法读取");
+      this._render();
+    });
+  }
+
+  private _safeMarketPictures(value: unknown): Car3dMarketPicture[] {
+    return Array.isArray(value)
+      ? value.flatMap((item) => {
+          const row = item as Car3dMarketPicture | null;
+          const url = row && safeMarketPictureUrl(row.url);
+          return row && typeof row.color === "string" && url ? [{ color: row.color, url }] : [];
+        })
+      : [];
+  }
+
+  private _loadCar2dVariants(model: string) {
+    const hass = this._hass;
+    if (!hass?.callWS || !model) return;
+    const request = ++this._marketSelectionReq;
+    const prefsKey = this._car3dPrefsStoreKey();
+    this._marketSelectedModel = model;
+    this._marketSelectedYear = "";
+    this._marketVariants = [];
+    this._marketSelectedVariant = "";
+    this._marketVariantsLoading = true;
+    this._marketPicturesLoading = true;
+    this._marketPicturesError = "";
+    this._render();
+    hass.callWS<{ variants?: Car3dMarketVariant[]; reason?: string }>(
+      { type: CAR3D_MARKET_VARIANTS_WS, model }).then((result) => {
+      if (this._car3dPrefsStoreKey() !== prefsKey || request !== this._marketSelectionReq) return;
+      this._marketVariantsLoading = false;
+      this._marketVariants = Array.isArray(result?.variants)
+        ? result.variants.filter((item) => item && item.id && Number(item.year) >= MIN_MARKET_YEAR && item.energy && item.edition)
+        : [];
+      const savedModel = this._car3dPrefs.market2dModel === model;
+      const savedYear = savedModel && Number(this._car3dPrefs.market2dYear) >= MIN_MARKET_YEAR
+        ? String(this._car3dPrefs.market2dYear) : "";
+      const saved = savedModel
+        ? this._marketVariants.find((item) => item.id === this._car3dPrefs.market2dModelId)
+          || this._marketVariants.find((item) => item.year === savedYear
+            && item.energy === this._car3dPrefs.market2dEnergy && item.edition === this._car3dPrefs.market2dEdition)
+          || this._marketVariants.find((item) => item.year === savedYear)
+        : undefined;
+      const actual = this._marketActual?.model.toLocaleLowerCase() === model.toLocaleLowerCase()
+        ? this._marketVariants.find((item) => item.year === this._marketActual?.year
+          && item.energy === this._marketActual?.energy && item.edition === this._marketActual?.edition)
+        : undefined;
+      const variant = saved || (savedYear ? undefined : actual || this._marketVariants[0]);
+      if (!variant) {
+        const actualModel = this._marketActual?.model.toLocaleLowerCase() === model.toLocaleLowerCase();
+        const unavailableYear = savedYear
+          || (actualModel ? String(this._marketActual?.year || "") : "")
+          || this._marketVariants[0]?.year
+          || String(new Date().getFullYear());
+        this._loadCar2dYearVariants(unavailableYear);
+        return;
+      }
+      this._marketSelectedYear = variant.year;
+      this._marketSelectedVariant = variant.id;
+      this._render();
+      this._loadCar2dVariantPictures(variant);
+    }).catch((err: unknown) => {
+      if (this._car3dPrefsStoreKey() !== prefsKey || request !== this._marketSelectionReq) return;
+      this._marketVariantsLoading = false;
+      this._marketPicturesLoading = false;
+      this._marketPicturesError = String(err instanceof Error ? err.message : "车型配置暂时无法读取");
+      this._render();
+    });
+  }
+
+  public _selectCar2dModel(model: string) {
+    if (!model || model === this._marketSelectedModel || !this._marketModels.some((item) => item.name === model)) return;
+    this._car3dPrefs.market2dModel = model;
+    delete this._car3dPrefs.market2dModelId;
+    delete this._car3dPrefs.market2dYear;
+    delete this._car3dPrefs.market2dEnergy;
+    delete this._car3dPrefs.market2dEdition;
+    delete this._car3dPrefs.market2dColor;
+    delete this._car3dPrefs.market2dUrl;
+    this._saveCar3dPrefs();
+    this._marketSelectedYear = "";
+    this._loadCar2dVariants(model);
+  }
+
+  public _selectCar2dVariant(id: string) {
+    const variant = this._marketVariants.find((item) => item.id === id && item.year === this._marketSelectedYear);
+    if (variant) this._loadCar2dVariantPictures(variant);
+  }
+
+  public _selectCar2dYear(year: string) {
+    const numericYear = Number(year);
+    const latest = Math.max(new Date().getFullYear(), ...this._marketVariants.map((item) => Number(item.year) || 0));
+    if (!Number.isInteger(numericYear) || numericYear < MIN_MARKET_YEAR || numericYear > latest
+      || (year === this._marketSelectedYear && this._marketSelectedVariant)) return;
+    this._marketSelectedYear = year;
+    const variants = this._marketVariants.filter((item) => item.year === year);
+    if (!variants.length) {
+      this._loadCar2dYearVariants(year);
+      return;
+    }
+    const saved = this._car3dPrefs.market2dModel === this._marketSelectedModel
+      ? variants.find((item) => item.id === this._car3dPrefs.market2dModelId)
+        || variants.find((item) => item.energy === this._car3dPrefs.market2dEnergy
+          && item.edition === this._car3dPrefs.market2dEdition)
+      : undefined;
+    const actual = this._marketActual?.model.toLocaleLowerCase() === this._marketSelectedModel.toLocaleLowerCase()
+      ? variants.find((item) => item.year === this._marketActual?.year
+        && item.energy === this._marketActual?.energy && item.edition === this._marketActual?.edition)
+      : undefined;
+    this._loadCar2dVariantPictures(saved || actual || variants[0]);
+  }
+
+  private _loadCar2dYearVariants(year: string) {
+    const hass = this._hass;
+    const model = this._marketSelectedModel;
+    if (!hass?.callWS || !model) {
+      this._setCar2dYearUnavailable(year);
+      return;
+    }
+    const request = ++this._marketSelectionReq;
+    const prefsKey = this._car3dPrefsStoreKey();
+    this._marketSelectedYear = year;
+    this._marketSelectedVariant = "";
+    this._marketVariantsLoading = true;
+    this._marketPicturesLoading = true;
+    this._marketPictures = [];
+    this._marketPicturesError = "";
+    this._render();
+    hass.callWS<{ variants?: Car3dMarketVariant[]; reason?: string }>({
+      type: CAR3D_MARKET_VARIANTS_WS,
+      model,
+      year,
+    }).then((result) => {
+      if (this._car3dPrefsStoreKey() !== prefsKey || request !== this._marketSelectionReq) return;
+      this._marketVariantsLoading = false;
+      const discovered = Array.isArray(result?.variants)
+        ? result.variants.filter((item) => item && item.id && item.year === year && item.energy && item.edition)
+        : [];
+      const merged = new Map(this._marketVariants.map((item) => [`${item.year}:${item.id}`, item]));
+      discovered.forEach((item) => merged.set(`${item.year}:${item.id}`, item));
+      this._marketVariants = [...merged.values()];
+      const variants = this._marketVariants.filter((item) => item.year === year);
+      if (!variants.length) {
+        this._setCar2dYearUnavailable(year);
+        return;
+      }
+      const saved = this._car3dPrefs.market2dModel === model
+        ? variants.find((item) => item.id === this._car3dPrefs.market2dModelId)
+          || variants.find((item) => item.energy === this._car3dPrefs.market2dEnergy
+            && item.edition === this._car3dPrefs.market2dEdition)
+        : undefined;
+      const actual = this._marketActual?.model.toLocaleLowerCase() === model.toLocaleLowerCase()
+        ? variants.find((item) => item.year === this._marketActual?.year
+          && item.energy === this._marketActual?.energy && item.edition === this._marketActual?.edition)
+        : undefined;
+      this._loadCar2dVariantPictures(saved || actual || variants[0]);
+    }).catch((err: unknown) => {
+      if (this._car3dPrefsStoreKey() !== prefsKey || request !== this._marketSelectionReq) return;
+      this._marketVariantsLoading = false;
+      this._marketPicturesLoading = false;
+      this._marketPicturesError = String(err instanceof Error ? err.message : "年款配置暂时无法读取");
+      this._render();
+    });
+  }
+
+  private _setCar2dYearUnavailable(year: string) {
+    this._marketSelectionReq += 1;
+    this._marketSelectedYear = year;
+    this._marketSelectedVariant = "";
+    this._marketPictures = [];
+    this._marketPicturesLoading = false;
+    this._marketPicturesError = "该年款暂无商城配置";
+    this._car3dPrefs.market2dModel = this._marketSelectedModel;
+    this._car3dPrefs.market2dYear = year;
+    delete this._car3dPrefs.market2dModelId;
+    delete this._car3dPrefs.market2dEnergy;
+    delete this._car3dPrefs.market2dEdition;
+    delete this._car3dPrefs.market2dColor;
+    delete this._car3dPrefs.market2dUrl;
+    this._saveCar3dPrefs();
+    this._render();
+  }
+
+  private _loadCar2dVariantPictures(variant: Car3dMarketVariant) {
+    const hass = this._hass;
+    const model = this._marketSelectedModel;
+    if (!hass?.callWS || !model || !variant) return;
+    const request = ++this._marketSelectionReq;
+    const prefsKey = this._car3dPrefsStoreKey();
+    const sameVariant = this._car3dPrefs.market2dModel === model
+      && this._car3dPrefs.market2dModelId === variant.id;
+    if (!sameVariant) {
+      delete this._car3dPrefs.market2dColor;
+      delete this._car3dPrefs.market2dUrl;
+    }
+    this._marketSelectedVariant = variant.id;
+    this._marketSelectedYear = variant.year;
+    this._marketPicturesLoading = true;
+    this._marketPicturesError = "";
+    this._car3dPrefs.market2dModel = model;
+    this._car3dPrefs.market2dModelId = variant.id;
+    this._car3dPrefs.market2dYear = variant.year;
+    this._car3dPrefs.market2dEnergy = variant.energy;
+    this._car3dPrefs.market2dEdition = variant.edition;
+    this._saveCar3dPrefs();
+    this._render();
+    hass.callWS<{
+      pictures?: Car3dMarketPicture[];
+      actual_color?: string;
+      error?: string;
+    }>({
+      type: CAR3D_MARKET_PICTURES_WS,
+      ...((this._device || this._picked) ? { device_id: this._device || this._picked } : {}),
+      model,
+      year: variant.year,
+      energy: variant.energy,
+      edition: variant.edition,
+      model_id: variant.id,
+    }).then((result) => {
+      if (this._car3dPrefsStoreKey() !== prefsKey || request !== this._marketSelectionReq) return;
+      this._marketPicturesLoading = false;
+      const pictures = this._safeMarketPictures(result?.pictures);
+      this._marketPictures = pictures;
+      this._marketPicturesError = pictures.length ? "" : String(result?.error || "该配置没有商城颜色图片");
+      const actualSame = this._marketActual?.model.toLocaleLowerCase() === model.toLocaleLowerCase()
+        && this._marketActual?.year === variant.year && this._marketActual?.energy === variant.energy
+        && this._marketActual?.edition === variant.edition;
+      const preferred = this._car3dPrefs.market2dColor || (actualSame ? this._marketActual?.color : "");
+      const picture = pictures.find((item) => item.color === preferred) || pictures[0];
+      if (picture) {
+        this._car3dPrefs.market2dColor = picture.color;
+        this._car3dPrefs.market2dUrl = picture.url;
+        this._saveCar3dPrefs();
+      } else {
+        delete this._car3dPrefs.market2dColor;
+        delete this._car3dPrefs.market2dUrl;
+      }
+      this._render();
+    }).catch((err: unknown) => {
+      if (this._car3dPrefsStoreKey() !== prefsKey || request !== this._marketSelectionReq) return;
+      this._marketPicturesLoading = false;
+      this._marketPicturesError = String(err instanceof Error ? err.message : "商城颜色暂时无法读取");
+      this._render();
+    });
+  }
+
   /** 「下载 3D 车模素材」: **唯一**会联网的入口, 只由用户点击触发。
    *  装配在后台跑, 这里拿到"downloading"就开始每 2 秒问一次 info。 */
   /** @internal 供 render-* / handlers 取用(对应 types.ts 的 ControlCtx); 运行时行为不变 */
@@ -1651,6 +1989,20 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
   private _loadCar3dPrefs() {
     const key = this._car3dPrefsStoreKey();
     if (this._car3dPrefsLoaded && this._car3dPrefsKey === key) return;
+    if (this._car3dPrefsKey !== key) {
+      this._marketPictures = [];
+      this._marketPicturesLoading = false;
+      this._marketPicturesError = "";
+      this._marketModels = [];
+      this._marketVariants = [];
+      this._marketSelectedModel = "";
+      this._marketSelectedVariant = "";
+      this._marketCatalogLoading = false;
+      this._marketVariantsLoading = false;
+      this._marketActual = null;
+      this._marketPicturesAskedDevice = "";
+      this._marketSelectionReq += 1;
+    }
     this._car3dPrefsLoaded = true;
     this._car3dPrefsKey = key;
     this._car3dPrefs = {};
@@ -1669,6 +2021,19 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
       if (typeof o.bg === "string" && CAR3D_BACKGROUNDS.some(([key]) => key === o.bg)) this._car3dPrefs.bg = o.bg;
       if (o.location === "photo" || o.location === "map") this._car3dPrefs.location = o.location;
       if (typeof o.img === "string") this._car3dPrefs.img = o.img;
+      if (o.modelView === "2d") this._car3dPrefs.modelView = "2d";
+      const market2dScale = Number(o.market2dScale);
+      if (Number.isFinite(market2dScale) && market2dScale >= 1 && market2dScale <= 2.5) {
+        this._car3dPrefs.market2dScale = market2dScale;
+      }
+      if (typeof o.market2dColor === "string" && o.market2dColor.length <= 32) this._car3dPrefs.market2dColor = o.market2dColor;
+      const marketUrl = safeMarketPictureUrl(o.market2dUrl);
+      if (marketUrl) this._car3dPrefs.market2dUrl = marketUrl;
+      if (typeof o.market2dModel === "string" && o.market2dModel.length <= 96) this._car3dPrefs.market2dModel = o.market2dModel;
+      if (typeof o.market2dModelId === "string" && o.market2dModelId.length <= 96) this._car3dPrefs.market2dModelId = o.market2dModelId;
+      if (typeof o.market2dYear === "string" && o.market2dYear.length <= 96) this._car3dPrefs.market2dYear = o.market2dYear;
+      if (typeof o.market2dEnergy === "string" && o.market2dEnergy.length <= 96) this._car3dPrefs.market2dEnergy = o.market2dEnergy;
+      if (typeof o.market2dEdition === "string" && o.market2dEdition.length <= 96) this._car3dPrefs.market2dEdition = o.market2dEdition;
     } catch (err) { /* 内容坏了就当没存过 */ }
   }
 
@@ -1681,6 +2046,18 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
     if (p.bg) o.bg = String(p.bg);
     if (p.location) o.location = p.location;
     if (p.img != null) o.img = String(p.img);
+    if (p.modelView === "2d") o.modelView = "2d";
+    if (Number.isFinite(p.market2dScale) && p.market2dScale! >= 1 && p.market2dScale! <= 2.5) {
+      o.market2dScale = String(p.market2dScale);
+    }
+    if (p.market2dColor) o.market2dColor = String(p.market2dColor);
+    const marketUrl = safeMarketPictureUrl(p.market2dUrl);
+    if (marketUrl) o.market2dUrl = marketUrl;
+    if (p.market2dModel) o.market2dModel = String(p.market2dModel);
+    if (p.market2dModelId) o.market2dModelId = String(p.market2dModelId);
+    if (p.market2dYear) o.market2dYear = String(p.market2dYear);
+    if (p.market2dEnergy) o.market2dEnergy = String(p.market2dEnergy);
+    if (p.market2dEdition) o.market2dEdition = String(p.market2dEdition);
     try {
       if (Object.keys(o).length) window.localStorage.setItem(this._car3dPrefsStoreKey(), JSON.stringify(o));
       else window.localStorage.removeItem(this._car3dPrefsStoreKey());

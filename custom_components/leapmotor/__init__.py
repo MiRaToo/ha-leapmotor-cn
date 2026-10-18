@@ -32,12 +32,12 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 # 前端模块: 把 www/ 下的六张卡片注册成全局卡片(用户无需手动放 www/ 或配资源)。
 # CARD_VERSION 与各自 JS 文件头里的同名常量保持一致(改 JS 记得一起升, 好让浏览器拿到新文件)。
-CARD_VERSION = "1.6.18"           # leapmotor-map.js
-TRIPS_CARD_VERSION = "1.6.23"     # leapmotor-trips.js
-CONTROL_CARD_VERSION = "1.9.61"   # leapmotor-control.js
-ENERGY_CARD_VERSION = "1.4.10"    # leapmotor-energy.js
-LASTWEEK_CARD_VERSION = "1.1.19"  # leapmotor-lastweek.js
-METRICS_CARD_VERSION = "1.0.6"    # leapmotor-metrics.js
+CARD_VERSION = "1.6.20"           # leapmotor-map.js
+TRIPS_CARD_VERSION = "1.6.26"     # leapmotor-trips.js
+CONTROL_CARD_VERSION = "1.9.73"   # leapmotor-control.js
+ENERGY_CARD_VERSION = "1.4.13"    # leapmotor-energy.js
+LASTWEEK_CARD_VERSION = "1.1.21"  # leapmotor-lastweek.js
+METRICS_CARD_VERSION = "1.0.8"    # leapmotor-metrics.js
 _CARDS = (
     ("leapmotor-map.js", CARD_VERSION),
     ("leapmotor-trips.js", TRIPS_CARD_VERSION),
