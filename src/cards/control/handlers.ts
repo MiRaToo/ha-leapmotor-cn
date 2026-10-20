@@ -34,6 +34,7 @@ export function onClick(ctx: ControlCtx, ev: Event) {
   if (act === "trunk") return ctx._onTrunk(el.dataset.entity!, el.dataset.on === "1");
   if (act === "tires") {
     ctx._open.tires = !ctx._open.tires;
+    if(ctx._open.tires)ctx.shadowRoot?.querySelector('.p-carview .tirePads')?.removeAttribute('data-projected');
     ctx._render();
     return;
   }

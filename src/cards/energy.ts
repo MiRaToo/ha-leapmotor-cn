@@ -52,7 +52,7 @@ import { interactionStyles } from "../lib/motion";
 import { uiStyles } from "../lib/ui/styles";
 import { bindAppearance, unbindAppearance } from "../lib/appearance";
 import { bindScrub } from "../lib/scrub";
-import { chargePanel, tariffForm, decimal, energyPanelStyles, type ChargeData, type ChargeSession } from "./energy-charging";
+import { chargePanel, tariffForm, decimal, energyPanelStyles, sessionPowerSamples, type ChargeData, type ChargeSession } from "./energy-charging";
 
 const CARD_VERSION = CARD_VERSIONS.energy;
 
@@ -156,6 +156,7 @@ class LeapmotorEnergyCard extends LitElement {
   private _chargeLastLoad = 0;
   private _chargeKey = "";
   private _chargeSelected = -1;
+  private _chargeSessionSelected:Record<string,number>={};
   private _tariffOpen = false;
   private _priceId='';private _priceMode='auto';private _priceValue='';private _priceError='';private _priceSaving=false;
   private _tariffSaving = false;
@@ -398,7 +399,32 @@ class LeapmotorEnergyCard extends LitElement {
   private _bindChargeScrub() {
     const host=this.shadowRoot?.querySelector<HTMLElement>(".chargeBody");
     if(!host||this._unbindChargeScrub)return;
-    this._unbindChargeScrub=bindScrub(host,(clientX)=>{const svg=host.querySelector(".chargeSvg"),n=this._chargeData?.days.length||0;if(!svg||!n)return;const r=svg.getBoundingClientRect(),width=Number(svg.getAttribute("viewBox")?.split(" ")[2])||350,x=(clientX-r.left)/Math.max(1,r.width)*width,i=Math.max(0,Math.min(n-1,Math.floor((x-32)/(width-50)*n)));if(i!==this._chargeSelected){this._chargeSelected=i;this.requestUpdate()}},target=>!!target.closest?.(".chargeSvg"),{hover:true,clear:()=>{if(this._chargeSelected!==-1){this._chargeSelected=-1;this.requestUpdate()}}});
+    let active:{kind:"daily"}|{kind:"session";id:string}|null=null;
+    this._unbindChargeScrub=bindScrub(host,(clientX)=>{
+      if(active?.kind==="daily"){
+        const svg=host.querySelector(".chargeSvg"),n=this._chargeData?.days.length||0;if(!svg||!n)return;
+        const r=svg.getBoundingClientRect(),width=Number(svg.getAttribute("viewBox")?.split(" ")[2])||350,x=(clientX-r.left)/Math.max(1,r.width)*width,i=Math.max(0,Math.min(n-1,Math.floor((x-32)/(width-50)*n)));
+        if(i!==this._chargeSelected){this._chargeSelected=i;this.requestUpdate()}
+        return;
+      }
+      if(active?.kind!=="session")return;
+      const id=active.id;
+      const svg=Array.from(host.querySelectorAll<SVGSVGElement>(".sessionPowerSvg")).find(el=>el.dataset.sessionId===id);
+      const session=this._chargeData?.sessions.find(s=>s.id===id),samples=session?sessionPowerSamples(session):[];
+      if(!svg||!samples.length)return;
+      const rect=svg.getBoundingClientRect(),width=Number(svg.getAttribute("viewBox")?.split(" ")[2])||360;
+      const px=(clientX-rect.left)/Math.max(1,rect.width)*width,left=Number(svg.dataset.plotLeft)||42,right=Number(svg.dataset.plotRight)||348;
+      const start=Number(svg.dataset.plotStart),end=Number(svg.dataset.plotEnd),ratio=Math.max(0,Math.min(1,(px-left)/Math.max(1,right-left))),targetAt=start+(end-start)*ratio;
+      let index=0,distance=Infinity;
+      for(let i=0;i<samples.length;i++){const d=Math.abs(samples[i][0]-targetAt);if(d<distance){distance=d;index=i;}}
+      if(this._chargeSessionSelected[id]!==index){this._chargeSessionSelected[id]=index;this.requestUpdate()}
+    },target=>{
+      const daily=target.closest?.(".chargeSvg");
+      if(daily){active={kind:"daily"};return true;}
+      const session=target.closest?.(".sessionPowerSvg") as HTMLElement|null;
+      if(session?.dataset.sessionId){active={kind:"session",id:session.dataset.sessionId};return true;}
+      active=null;return false;
+    },{hover:true,clear:()=>{active=null;if(this._chargeSelected!==-1){this._chargeSelected=-1;this.requestUpdate()}}});
   }
 
   // ── 取数 ──
@@ -670,7 +696,7 @@ class LeapmotorEnergyCard extends LitElement {
         <div class="lmsg" ?hidden=${this._mode!=="drive"}></div>
         <section class="chartSec" ?hidden=${this._mode!=="drive"}><div class="plotHeading"><b>每日趋势</b><span>滑动选择日期</span></div><div class="chartBox"></div><div class="srcNote"></div><div class="ctrls"></div>${this._data?.reev?html`<p class="billNote">逐日耗油按行车燃油量下降估算，缺样本留空；近期油耗使用云端窗口。油量变化有误差，安装前无法追溯。</p>`:nothing}</section>
 
-        <div class="chargeBody" ?hidden=${this._mode!=="charge"}>${chargePanel(this._chargeData,this._chargeErr,this._chargeSelected,i=>{if(i!==this._chargeSelected){this._chargeSelected=i;this.requestUpdate()}},s=>this._sessionPrice(s),html`<div class="energyTools"><button class=${this._range==="week"?"on":""} aria-pressed=${this._range==="week"} aria-label="近 7 天" title="近 7 天" @click=${()=>this._chargeRange("week")}>周</button><button class=${this._range==="month"?"on":""} aria-pressed=${this._range==="month"} aria-label="近 30 天" title="近 30 天" @click=${()=>this._chargeRange("month")}>月</button></div>`,html`<button class="priceBtn" @click=${()=>this._openTariff()} ?disabled=${!this._hass?.user?.is_admin}>电价设置</button>`,{width:this._chargePlotWidth,series:this._chargeSeries,chart:this._chargeChart,toggle:key=>{if(this._chargeSeries.includes(key)){if(this._chargeSeries.length>1)this._chargeSeries=this._chargeSeries.filter(k=>k!==key)}else this._chargeSeries=[...this._chargeSeries,key];this.requestUpdate()},switchChart:()=>{this._chargeChart=this._chargeChart==='line'?'bar':'line';this.requestUpdate()}})}</div>
+        <div class="chargeBody" ?hidden=${this._mode!=="charge"}>${chargePanel(this._chargeData,this._chargeErr,this._chargeSelected,i=>{if(i!==this._chargeSelected){this._chargeSelected=i;this.requestUpdate()}},s=>this._sessionPrice(s),html`<div class="energyTools"><button class=${this._range==="week"?"on":""} aria-pressed=${this._range==="week"} aria-label="近 7 天" title="近 7 天" @click=${()=>this._chargeRange("week")}>周</button><button class=${this._range==="month"?"on":""} aria-pressed=${this._range==="month"} aria-label="近 30 天" title="近 30 天" @click=${()=>this._chargeRange("month")}>月</button></div>`,html`<button class="priceBtn" @click=${()=>this._openTariff()} ?disabled=${!this._hass?.user?.is_admin}>电价设置</button>`,{width:this._chargePlotWidth,series:this._chargeSeries,chart:this._chargeChart,toggle:key=>{if(this._chargeSeries.includes(key)){if(this._chargeSeries.length>1)this._chargeSeries=this._chargeSeries.filter(k=>k!==key)}else this._chargeSeries=[...this._chargeSeries,key];this.requestUpdate()},switchChart:()=>{this._chargeChart=this._chargeChart==='line'?'bar':'line';this.requestUpdate()}},this._chargeSessionSelected,(id,index)=>{if(this._chargeSessionSelected[id]!==index){this._chargeSessionSelected[id]=index;this.requestUpdate()}})}</div>
       </div>
       <!-- 电价弹窗必须挂在 .card 外面: 玻璃风格给 .card 加了 backdrop-filter,
            会把它变成 fixed 后代的定位基准(遮罩会缩到卡片范围内)。 -->

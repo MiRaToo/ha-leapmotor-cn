@@ -5,9 +5,9 @@
 // 注意: __init__.py 的 CARD_VERSION 等仍用于 `?v=` 缓存刷新, 两边需一致(S3 会加校验测试)。
 export const CARD_VERSIONS = {
   map: "1.6.20",
-  trips: "1.6.26",
-  control: "1.9.73",
-  energy: "1.4.13",
+  trips: "1.6.27",
+  control: "1.9.75",
+  energy: "1.4.15",
   lastweek: "1.1.21",
   metrics: "1.0.8",
 } as const;

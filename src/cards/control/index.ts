@@ -92,7 +92,7 @@ import { CARD_CSS } from "./css";
 import { actionsPanel, actionsVisible, cabinPanel, carToolsPanel, car3dBodyPanel, car3dPanel, car3dVisible, carDocksPanel, chargeBodyPanel, chargingPanel, chargingVisible, climatePanel, climateVisible, emptyPanel, fuelPanel, fuelVisible, heroFull, heroPanel, heroVisible, hintPanel, locationPanel, locationVisible, photoPanel, toastPanel } from "./templates";
 import { car3dHexNow, car3dBackgroundNow, car3dAutoTsp, car3dColors, car3dSelTsp, car3dView } from "./render-hero";
 import { CAR3D_BACKGROUNDS } from "./types";
-import { vehiclePose } from "./car3d-state";
+import { vehiclePose, tireLayout } from "./car3d-state";
 import { cabinAny, locBg } from "./render-panels";
 import { onPalFocusOut, onPalKeyDown, onPalPointer, palInit, palPickerT, placePalPop } from "./picker";
 import { onClick, onChange, onInput, onTitleDblClick } from "./handlers";
@@ -1330,6 +1330,13 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
       const dataPx = hero.offsetHeight + "px";
       if (stage.style.getPropertyValue("--c3data") !== dataPx) stage.style.setProperty("--c3data", dataPx);
     }
+    if(this._open.tires){
+      const layout=tireLayout(this);
+      if(layout){
+        const bottomInset=Math.max(20,stage.offsetHeight-layout.tireBottom);
+        h=Math.max(h,Math.ceil(layout.tireTop+layout.tireHeight*2+40+bottomInset));
+      }
+    }
     const px = h + "px";
     if (stage.style.height !== px) stage.style.height = px;
     // 画布要伸到四个圆钮之下(渐变也只铺在那一段): --c3ext 由按钮/胎压两行的实际高度决定
@@ -1430,7 +1437,7 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
     this._syncCar3dPaint();
     // 浮动层(告警/充电/胎压)走 Lit 模板 —— 与 2D hero 的车模盒**同一份**(carDocksPanel);
     // ⚠️ 只换 .carDock 的内容: iframe 与 .p-carview 本身一行都没动(见上面的说明)。
-    if (this._car3dDock) render(carDocksPanel(this), this._car3dDock);
+    if (this._car3dDock) render(carDocksPanel(this, true), this._car3dDock);
     this._syncStage(); // 量得到真实尺寸了: 尺寸变了就补一条 view(见函数注释)
   }
 
@@ -1451,6 +1458,9 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
     const tsp = car3dAutoTsp(this);
     if (tsp) q.push("color=" + encodeURIComponent(tsp));
     if (p.seat != null && p.seat !== "") q.push("seat=" + encodeURIComponent(String(p.seat)));
+    if (Array.isArray(info?.preload) && info.preload.length) {
+      q.push("preload=" + encodeURIComponent(JSON.stringify(info.preload)));
+    }
     for (const [key, value] of [["roof", p.roofColor], ["sdk", p.sdkVersion], ["theme", p.theme], ["alias", p.alias]]) {
       if (value != null && value !== "") q.push(key + "=" + encodeURIComponent(String(value)));
     }
@@ -1543,10 +1553,24 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
   private _onCar3dMsg = (ev: MessageEvent) => {
     const f = this._car3dFrame;
     if (!f || ev.source !== f.contentWindow) return;
-    const d = ev.data as { t?: string; msg?: string; of?: string; ok?: boolean; points?:string } | null;
+    const d = ev.data as { t?: string; msg?: string; of?: string; ok?: boolean; points?:string; opacity?:number; available?:boolean } | null;
     if (!d || typeof d !== "object" || typeof d.t !== "string") return;
-    if(d.t==='tires'&&typeof d.points==='string'){
-      try{const points=JSON.parse(d.points),pads=this._carViewEl?.querySelector('.tirePads');if(pads&&Array.isArray(points)&&points.length===4){pads.setAttribute('data-projected','');for(const p of points){if(!['tire_fl','tire_fr','tire_rl','tire_rr'].includes(p.key)||!Number.isFinite(p.x)||!Number.isFinite(p.y))continue;const el=pads.querySelector<HTMLElement>('[data-tire="'+p.key+'"]');el?.style.setProperty('--tire-x',Math.max(3,Math.min(97,p.x))+'%');el?.style.setProperty('--tire-y',Math.max(3,Math.min(97,p.y))+'%')}}}catch{}return;
+    if(d.t==='tires'){
+      const pads=this._carViewEl?.querySelector<HTMLElement>('.tirePads');
+      if(!pads||!this._open.tires)return;
+      if(d.available===false){pads.removeAttribute('data-projected');return;}
+      try{
+        const points=JSON.parse(d.points||'null');
+        const keys=['tire_fl','tire_fr','tire_rl','tire_rr'];
+        if(!Array.isArray(points)||points.length!==4||new Set(points.map(p=>p?.key)).size!==4||
+          !points.every(p=>p&&keys.includes(p.key)&&Number.isFinite(p.x)&&Number.isFinite(p.y)))return;
+        for(const p of points){
+          const el=pads.querySelector<HTMLElement>('[data-tire="'+p.key+'"]');
+          el?.style.setProperty('--tire-x',p.x+'%');el?.style.setProperty('--tire-y',p.y+'%');
+        }
+        pads.style.setProperty('--tire-opacity',String(Number.isFinite(d.opacity)?clamp(d.opacity!,0,1):1));
+        pads.setAttribute('data-projected','');
+      }catch{}return;
     }
     if(d.t==='ack'&&d.of==='wrap'&&d.ok===false){this._showToast('当前车模未能应用车衣，请检查图片或材质支持','error');return;}
     if (d.t === "ready") {

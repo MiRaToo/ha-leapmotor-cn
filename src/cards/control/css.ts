@@ -929,7 +929,15 @@ export const CARD_CSS = `${interactionStyles}        /* 配色: 与「零跑·�
           bottom: auto;
           top: min(calc(var(--c3data, 123px) + 76px), calc(100% - 43px));
         }
-        .heroStage.stage3d .tirePads[data-projected]{bottom:0;}.heroStage.stage3d .tirePads[data-projected] .tP{left:var(--tire-x);top:var(--tire-y);right:auto;bottom:auto;transform:translate(-50%,-50%);text-align:center;}
+        .heroStage.stage3d .tirePads.projected { bottom: 0; opacity: 0; transition: opacity 160ms ease; }
+        .heroStage.stage3d .tirePads.projected .tP { pointer-events: none; }
+        .heroStage.stage3d .tirePads.projected[data-open][data-projected] { opacity: var(--tire-opacity, 0); transition: none; }
+        .heroStage.stage3d .tirePads.projected[data-open][data-projected] .tP { pointer-events: auto; }
+        .heroStage.stage3d .tirePads.projected[data-projected] .tP {
+          left: var(--tire-x); top: var(--tire-y); right: auto; bottom: auto;
+          transform: translate(-50%, -50%); text-align: center;
+        }
+        @media (prefers-reduced-motion: reduce) { .heroStage.stage3d .tirePads.projected { transition: none; } }
         /* ── 3D 车模(hero 车辆区的第二种画法) ──
            3D 时整个车模盒落在这个**独立容器**里, 而不是继续画在 .p-hero 里:
            hero 每次状态推送都整块换 innerHTML, iframe 被摘出文档就会销毁重建浏览上下文

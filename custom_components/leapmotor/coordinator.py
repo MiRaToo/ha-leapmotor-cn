@@ -447,6 +447,24 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         log.warning("重试前换 token 异常: %s", err)
                 else:
                     log.warning("车况拉取为空(%s), 原样重试一次(不换 token)", why)
+        # 保留原来的两次读取和签名续期；只有从未正常读过的 T03 才尝试国内区域路由。
+        compatibility_limited = False
+        if (not (state is not None and state.raw)
+                and str(self.session.car_type or "").strip().upper() == "T03"):
+            try:
+                compatibility = await self.hass.async_add_executor_job(
+                    self.client.try_t03_car_state, self.vin, code)
+            except Exception as err:  # noqa: BLE001  兼容尝试失败不能打断现有轮询
+                log.warning("T03 车况兼容读取未完成: %s", type(err).__name__)
+            else:
+                if compatibility is not None:
+                    if compatibility.raw:
+                        state = compatibility
+                    else:
+                        why += f"; T03 兼容读取未取得有效车况(code={compatibility.resp_code})"
+                        if is_rate_limited({"code": compatibility.resp_code}):
+                            self._enter_rate_limit("T03 车况兼容接口返回风控/限流提示")
+                            compatibility_limited = True
         if state is not None and state.raw:
             self.state = state
             self.car_state_problem = ""
@@ -488,7 +506,7 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #    (轻量首轮刷新期间一律跳过 —— 见 light_first_refresh 的说明)
         driving = bool(self.state and (
             self.state.vehicle_state == "driving" or (self.state.get("speed") or 0) > 0))
-        if not self.light_first_refresh:
+        if not self.light_first_refresh and not compatibility_limited:
             # 重数据(里程/能耗/配置)有**自己的节奏**(`HEAVY_REFRESH_SECONDS`), 与轮询档位无关:
             # 短停快档/出发提速时轮询会到 6 秒, 但这些数据在 10 分钟内几乎不变 ——
             # 跟着高频拉纯属浪费(它们还会顺带触发 HA 的写库与前端刷新)。

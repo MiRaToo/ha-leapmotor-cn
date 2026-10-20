@@ -1,6 +1,14 @@
 // 包装页只调用查看器能力，模型与查看器文件保持原样。版本与 car3d.py 同步。
-const WRAPPER_VERSION = 12;
+const WRAPPER_VERSION = 14;
 const q = new URLSearchParams(location.search);
+// 后端仅提示本车已落盘的文件；与查看器的 fetch 使用相同的 CORS/凭据模式。
+try{
+  const paths=JSON.parse(q.get("preload")||"[]");
+  if(Array.isArray(paths))for(const path of [...new Set(paths)].slice(0,2)){
+    if(typeof path!=="string"||!/^([A-Za-z0-9]+_[0-9]{4})\/\1_(starter|full)_car\.fbx$/.test(path))continue;
+    const link=document.createElement("link");link.rel="preload";link.as="fetch";link.crossOrigin="anonymous";link.href="./"+path;document.head.appendChild(link);
+  }
+}catch{ /* 预加载提示无效不影响查看器的正常加载。 */ }
 const cfg = {
   carType:q.get("car")||"C10", year:Number(q.get("year")||2026),
   carTypeCode:q.get("trim")||"", colorCode:Number(q.get("color")||0),
@@ -16,6 +24,7 @@ document.documentElement.style.setProperty("--boot-bg",bootColors[background]||b
 document.documentElement.style.colorScheme=["night","aurora","blueprint"].includes(background)?"dark":"light";
 let viewApplied=false, skyCache=null, poseCar=null, appliedPose={}, revealing=false;
 const started=performance.now();
+const loadTimes={};
 const post=m=>{if(parent!==window)parent.postMessage(m,location.origin)};
 const nextFrame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
 function sceneOf(){
@@ -188,44 +197,108 @@ async function setWrap(value){
   wrapConfig=next;return updateWrap();
 }
 let tireView=false,savedView=null,motionSpeed=-1,inView=true,tireFrame=0,tireTransition=false;
+let tireLayoutKey='',tireLabels=null,tireOpacity=0,tireResizeFrame=0;
+const tireKeys=['tire_fl','tire_fr','tire_rl','tire_rr'];
 const reduced=typeof matchMedia==='function'?matchMedia('(prefers-reduced-motion: reduce)'):null;
 // SDK 的 update 在没有角度标记时会从旧位置重算半径；锁定 controls 后也需标记才能更新。
 function commitCamera(c){const theta=c.getAzimuthalAngle?.();if(Number.isFinite(theta))c.setThetaImmediately?.(theta);c.update?.();}
-function fitTireCamera(){
-  const v=window.viewer,c=v?.controls,points=wheelPoints();if(!tireView||!savedView?.target||points.some(p=>!p)||!c?.target)return;
-  c.target.copy(savedView.target);c.setRadiusImmediately?.(radius);commitCamera(c);v.camera.updateMatrixWorld?.();
-  const ys=points.map(p=>(1-p.clone().project(v.camera).y)*.5*(innerHeight+(v.viewportSetter?.__cur_offset__||0)));
-  const top=Number.isFinite(pose.tireTop)?pose.tireTop:120,bottom=Number.isFinite(pose.tireBottom)?pose.tireBottom:innerHeight-85;
-  const available=Math.max(70,bottom-top),span=Math.max(...ys)-Math.min(...ys),distance=radius*Math.max(1,span/available)*1.2;
-  c.setRadiusImmediately?.(distance);commitCamera(c);v.camera.updateMatrixWorld?.();
-  const next=points.map(p=>(1-p.clone().project(v.camera).y)*.5*(innerHeight+(v.viewportSetter?.__cur_offset__||0)));
-  const dy=(top+bottom-Math.max(...next)-Math.min(...next))*.5;
-  const front=points[0].clone().sub(points[2]).normalize();
-  c.target.addScaledVector(front,dy*2*Math.tan(v.camera.fov*Math.PI/360)*distance/(innerHeight+(v.viewportSetter?.__cur_offset__||0)));
-  commitCamera(c);
+const bound=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+function tireBounds(){
+  const width=Number.isFinite(pose.tireWidth)?pose.tireWidth:64,height=Number.isFinite(pose.tireHeight)?pose.tireHeight:34;
+  const top=bound(Number.isFinite(pose.tireTop)?pose.tireTop:120,0,innerHeight);
+  const bottom=bound(Number.isFinite(pose.tireBottom)?pose.tireBottom:innerHeight-85,0,innerHeight);
+  return {width,height,top,bottom,left:width/2+8,right:innerWidth-width/2-8,
+    first:top+height/2,last:bottom-height/2,gap:width/2+12,
+    valid:innerWidth>=width*2+24&&bottom-top>=height*2+8};
+}
+function projectWheels(points){
+  const v=window.viewer;if(!v?.camera||points.some(p=>!p))return null;
+  v.camera.updateMatrixWorld?.();
+  const h=innerHeight+(v.viewportSetter?.__cur_offset__||0);
+  const out=points.map(p=>{const n=p.clone().project(v.camera);return {x:(n.x+1)*innerWidth/2,y:(1-n.y)*h/2}});
+  return out.every(p=>Number.isFinite(p.x)&&Number.isFinite(p.y))?out:null;
+}
+function fitTireCamera(points,b){
+  const v=window.viewer,c=v.controls;
+  // 用两根轮轴的中心求车头方向，避免单个轮位误差；世界 Y 为查看器的竖直轴。
+  const front=points[0].clone().addScaledVector(points[1],1).addScaledVector(points[2],-1).addScaledVector(points[3],-1);
+  if(!Number.isFinite(front.x)||!Number.isFinite(front.z)||Math.hypot(front.x,front.z)<.001)return null;
+  const center=points[0].clone();center.x=center.y=center.z=0;
+  points.forEach(p=>center.addScaledVector(p,.25));
+  cameraAt(c,{theta:Math.atan2(-front.x,-front.z),phi:.001,radius,target:center});
+  let projected=projectWheels(points);if(!projected)return null;
+  const span=key=>Math.max(...projected.map(p=>p[key]))-Math.min(...projected.map(p=>p[key]));
+  const distance=radius*Math.max(1,span('x')/Math.max(1,b.right-b.left-2*b.gap),span('y')/Math.max(1,b.last-b.first-8))*1.08;
+  c.setRadiusImmediately?.(distance);commitCamera(c);
+  projected=projectWheels(points);if(!projected)return null;
+  const dx=innerWidth/2-(Math.min(...projected.map(p=>p.x))+Math.max(...projected.map(p=>p.x)))/2;
+  const dy=(b.top+b.bottom-Math.min(...projected.map(p=>p.y))-Math.max(...projected.map(p=>p.y)))/2;
+  const scale=2*Math.tan(v.camera.fov*Math.PI/360)*distance/(innerHeight+(v.viewportSetter?.__cur_offset__||0));
+  if(!Number.isFinite(scale))return null;
+  const matrix=v.camera.matrixWorld?.elements;if(!matrix||matrix.length<11)return null;
+  const right=center.clone(),up=center.clone();
+  [right.x,right.y,right.z]=matrix.slice(0,3);[up.x,up.y,up.z]=matrix.slice(4,7);
+  c.target.addScaledVector(right,-dx*scale).addScaledVector(up,dy*scale);commitCamera(c);
+  projected=projectWheels(points);if(!projected)return null;
+  // 四轮身份决定左右列；不再以当前屏幕中线作 ±48px 的不连续判断。
+  // 部分素材的 LF/RF 节点在世界空间镜像；仅在车头已朝上后取屏幕左右轮列。
+  // 标签仍按车辆语义固定为左前/右前/左后/右后，不随起始视角重新分配。
+  const left=bound(Math.min(...projected.map(p=>p.x))-b.gap,b.left,innerWidth/2-b.width/2-4);
+  const rightX=bound(Math.max(...projected.map(p=>p.x))+b.gap,innerWidth/2+b.width/2+4,b.right);
+  const frontY=(projected[0].y+projected[1].y)/2,rearY=(projected[2].y+projected[3].y)/2;
+  const separation=bound(rearY-frontY,b.height+8,b.last-b.first);
+  const middle=bound((frontY+rearY)/2,b.first+separation/2,b.last-separation/2);
+  return [0,1,2,3].map(i=>({x:i%2?rightX:left,y:middle+(i<2?-1:1)*separation/2}));
 }
 function projectTires(){
-  if(!tireView)return;const points=wheelPoints(),v=window.viewer;if(points.some(p=>!p)||!v?.camera)return;
-  v.camera.updateMatrixWorld?.();
-  const projected=points.map(p=>{p.project(v.camera);return {x:(p.x+1)*50,y:(1-p.y)*50*(innerHeight+(v.viewportSetter?.__cur_offset__||0))/innerHeight}});
-  const mid=projected.reduce((n,p)=>n+p.x,0)/4;
-  post({t:'tires',points:JSON.stringify(projected.map((p,i)=>({key:['tire_fl','tire_fr','tire_rl','tire_rr'][i],x:Math.max(34/innerWidth*100,Math.min(100-34/innerWidth*100,p.x+(p.x<mid?-48:48)/innerWidth*100)),y:p.y})))});
+  if(!tireView||!tireLabels||innerWidth<=0||innerHeight<=0)return;
+  post({t:'tires',opacity:tireOpacity,points:JSON.stringify(tireLabels.map((p,i)=>({key:tireKeys[i],x:p.x/innerWidth*100,y:p.y/innerHeight*100})))});
 }
 function cameraState(c){return {theta:c.getAzimuthalAngle?.(),phi:c.getPolarAngle?.(),radius:c.getDistance?.()||window.viewer?.camera?.position?.distanceTo?.(c.target)||radius,target:c.target?.clone?.(),enabled:c.enabled};}
 function cameraAt(c,s){if(Number.isFinite(s.theta))c.setThetaImmediately?.(s.theta);if(Number.isFinite(s.phi))c.setPhiImmediately?.(s.phi);c.setRadiusImmediately?.(s.radius);if(s.target)c.target?.copy?.(s.target);c.update?.();}
-function transitionCamera(c,start,end,done){
+function transitionCamera(c,start,end,done,labels=tireLabels){
   cancelAnimationFrame(tireFrame);tireTransition=true;
-  if(reduced?.matches||!start.target?.lerp||!Number.isFinite(start.theta)||!Number.isFinite(start.phi)){cameraAt(c,end);tireTransition=false;done();return;}
+  const fromLabels=tireLabels,fromOpacity=tireOpacity,toOpacity=tireView?1:0;
+  const placeLabels=t=>{if(labels&&fromLabels)tireLabels=labels.map((p,i)=>({x:fromLabels[i].x+(p.x-fromLabels[i].x)*t,y:fromLabels[i].y+(p.y-fromLabels[i].y)*t}));tireOpacity=fromOpacity+(toOpacity-fromOpacity)*t;projectTires();};
+  const finish=()=>{cameraAt(c,end);placeLabels(1);tireFrame=0;tireTransition=false;done();};
+  if(reduced?.matches||!start.target?.lerp||!Number.isFinite(start.theta)||!Number.isFinite(start.phi)){finish();return;}
   const began=performance.now();let last=-Infinity;const delta=Math.atan2(Math.sin(end.theta-start.theta),Math.cos(end.theta-start.theta));
-  const step=()=>{const now=performance.now(),p=Math.min(1,(now-began)/460);if(now-last>=1000/30||p===1){last=now;const t=p*p*(3-2*p);cameraAt(c,{theta:start.theta+delta*t,phi:start.phi+(end.phi-start.phi)*t,radius:start.radius+(end.radius-start.radius)*t,target:start.target.clone().lerp(end.target,t)});redraw();projectTires();}if(p<1)tireFrame=requestAnimationFrame(step);else{tireFrame=0;tireTransition=false;done();}};
-  cameraAt(c,start);tireFrame=requestAnimationFrame(step);
+  const step=()=>{const now=performance.now(),p=Math.min(1,(now-began)/460);if(p===1){finish();return;}if(now-last>=1000/30){last=now;const t=p*p*(3-2*p);cameraAt(c,{theta:start.theta+delta*t,phi:start.phi+(end.phi-start.phi)*t,radius:start.radius+(end.radius-start.radius)*t,target:start.target.clone().lerp(end.target,t)});redraw();placeLabels(t);}tireFrame=requestAnimationFrame(step);};
+  cameraAt(c,start);placeLabels(0);tireFrame=requestAnimationFrame(step);
 }
-function setTireView(on){
+function restoreTireView(c,start){
+  const restore=savedView;if(!restore)return;
+  transitionCamera(c,start,restore,()=>{
+    c.minPolarAngle=restore.minPolar;c.maxDistance=restore.maxDistance;
+    c.minAzimuthAngle=restore.minAzimuth;c.maxAzimuthAngle=restore.maxAzimuth;
+    c.enableDamping=restore.damping;c.autoRotate=restore.autoRotate;c.enabled=restore.enabled;
+    savedView=null;tireLayoutKey='';tireLabels=null;tireOpacity=0;redraw();
+  });
+}
+function setTireView(on,force=false){
   const c=window.viewer?.controls;if(!c||!full)return;
-  if(tireView===on){if(on){fitTireCamera();projectTires()}return;}
-  const start=cameraState(c);c.stopViewControl?.();c.enabled=false;
-  if(on){savedView||={...start,minPolar:c.minPolarAngle,maxDistance:c.maxDistance};c.maxDistance=Math.max(c.maxDistance||40,160);c.minPolarAngle=.001;const points=wheelPoints(),front=points[0]?.clone?.().sub(points[2]);if(front&&Number.isFinite(front.x)&&Number.isFinite(front.z))c.setThetaImmediately?.(Math.atan2(-front.x,-front.z));c.setPhiImmediately?.(.001);tireView=true;fitTireCamera();const end=cameraState(c);transitionCamera(c,start,end,()=>{redraw();projectTires()});}
-  else if(savedView){const restore=savedView;tireView=false;transitionCamera(c,start,restore,()=>{savedView=null;c.minPolarAngle=restore.minPolar;c.maxDistance=restore.maxDistance;c.enabled=restore.enabled;redraw()});}
+  if(!on){if(savedView&&(tireView||force||!tireTransition)){tireView=false;restoreTireView(c,cameraState(c));}return;}
+  const b=tireBounds(),key=JSON.stringify([radius,offset,drop,innerWidth,innerHeight,b]);
+  if(tireView&&key===tireLayoutKey&&!force)return;
+  const points=wheelPoints(),initial=projectWheels(points);
+  if(!b.valid||!initial){
+    cancelAnimationFrame(tireFrame);tireFrame=0;tireTransition=false;tireLayoutKey='';tireLabels=null;tireOpacity=0;
+    post({t:'tires',available:false});return;
+  }
+  const start=cameraState(c);
+  if(!savedView){
+    savedView={...start,minPolar:c.minPolarAngle,maxDistance:c.maxDistance,minAzimuth:c.minAzimuthAngle,maxAzimuth:c.maxAzimuthAngle,damping:c.enableDamping,autoRotate:c.autoRotate};
+    c.stopViewControl?.();c.enabled=false;c.autoRotate=false;c.enableDamping=false;
+    // stopViewControl 不清除 SDK 的 sphericalDelta。无阻尼提交一次可消费并清空惯性，
+    // 再还原快照；两次更新之间不绘制，避免这次消费造成可见的首帧跳动。
+    commitCamera(c);cameraAt(c,start);
+  }
+  if(!tireLabels){tireLabels=initial.map(p=>({x:bound(p.x,b.left,b.right),y:bound(p.y,b.first,b.last)}));tireOpacity=0;}
+  c.minPolarAngle=.001;c.maxDistance=Infinity;c.minAzimuthAngle=-Infinity;c.maxAzimuthAngle=Infinity;
+  const labels=fitTireCamera(points,b),end=cameraState(c);cameraAt(c,start);
+  if(!labels){tireView=false;restoreTireView(c,start);post({t:'tires',available:false});return;}
+  tireView=true;tireLayoutKey=key;
+  transitionCamera(c,start,end,()=>{redraw();projectTires();},labels);
 }
 function syncMotion(){
   const speed=full&&!document.hidden&&inView&&!reduced?.matches&&typeof pose.speed==='number'?Math.max(0,Math.min(200,pose.speed)):0;
@@ -236,7 +309,12 @@ function syncMotion(){
   window.viewer?.setFPS?.(20,0,'VehicleMove');
   if(speed)window.viewer?.setFPS?.(20,Infinity,'VehicleMove');
 }
-reduced?.addEventListener?.('change',syncMotion);
+reduced?.addEventListener?.('change',()=>{syncMotion();if(savedView)setTireView(tireView,true);});
+window.addEventListener('resize',()=>{
+  cancelAnimationFrame(tireResizeFrame);
+  // 包装层监听先于 SDK 注册；等 SDK 更新 viewport/aspect 后再计算投影。
+  tireResizeFrame=requestAnimationFrame(()=>{tireResizeFrame=0;if(savedView)setTireView(tireView,true);});
+});
 if(typeof IntersectionObserver==='function')new IntersectionObserver(entries=>{inView=entries.some(e=>e.isIntersecting);syncMotion()}).observe(document.documentElement);
 function applyPose(){
   const car=window.car,v=window.viewer;
@@ -260,10 +338,10 @@ async function reveal(){
   await setBackground(background);setPaint(paint);if(wrapConfig){try{if(!await setWrap(wrapConfig))post({t:'ack',of:'wrap',ok:false})}catch{post({t:'ack',of:'wrap',ok:false})}}applyPose();
   applyView(true);setTireView(pose.tires===1);await nextFrame();await nextFrame();redraw();projectTires();
   document.documentElement.classList.remove("pending");released=true;syncMotion();
-  post({t:"ready",ms:performance.now()-started});
+  loadTimes.ready=performance.now()-started;post({t:"ready",ms:loadTimes.ready});
 }
-window.onFirstFrame=()=>{first=true;post({t:"first",ms:performance.now()-started})};
-window.onFullCarLoaded=()=>{full=true;clearTimeout(timeout);setPaint(paint);post({t:"full",ms:performance.now()-started});void reveal()};
+window.onFirstFrame=()=>{first=true;loadTimes.first=performance.now()-started;post({t:"first",ms:loadTimes.first})};
+window.onFullCarLoaded=()=>{full=true;clearTimeout(timeout);setPaint(paint);loadTimes.full=performance.now()-started;post({t:"full",ms:loadTimes.full});void reveal()};
 window.addEventListener("message",ev=>{
   if(ev.source!==parent||ev.origin!==location.origin)return;
   const d=ev.data;if(!d||typeof d!=="object")return;
@@ -281,14 +359,21 @@ window.addEventListener("message",ev=>{
     if(Number.isFinite(d.radius)&&d.radius>0)radius=d.radius;
     if(Number.isFinite(d.offset))offset=d.offset;
     if(Number.isFinite(d.drop))drop=d.drop;
-    post({t:"ack",of:"view",ok:released?applyView():true});if(!tireTransition){fitTireCamera();projectTires();}
-  }else if(d.t==="probe")post({t:"ack",of:"probe",version:WRAPPER_VERSION,full,first,released,
+    if(released&&savedView){
+      // 记住新尺寸下的普通取景；胎压过渡由同一个动画接管，不能被 applyView 抢写。
+      savedView.radius=radius;
+      if(savedView.target&&window.viewer.controls.__leapBaseY!==undefined)savedView.target.y=window.viewer.controls.__leapBaseY+drop/100*.335*radius;
+      window.viewer.setOffsetVertical?.(offset*100);setTireView(tireView,true);
+      post({t:'ack',of:'view',ok:true});
+    }else post({t:"ack",of:"view",ok:released?applyView():true});
+  }else if(d.t==="probe")post({t:"ack",of:"probe",version:WRAPPER_VERSION,full,first,released,loadTimes:{...loadTimes},
     hasPaint:!!window.car?.carPaint_CarPaintMaterial,hasSky:!!skyNode(),background,
     stateMethods:["handleDoorLFWindow","handleDoorRFWindow","handleDoorLRWindow","handleDoorRRWindow","handleTrunk"].filter(k=>typeof window.car?.[k]==="function")});
 });
 window.__api={setBackground,setPaint,setWrap,applyView,applyPose,redraw,sceneOf,skyNode,version:WRAPPER_VERSION};
 const timeout=setTimeout(()=>{if(!full){if(first)void reveal();post({t:"err",msg:first?"完整模型未就绪，当前显示简化车模":"车模加载超时，请导出诊断检查素材完整性"})}},25000);
 try{
+  if(background==="night")void nightImage();
   window.web3dPerformanceOptions={metricsEnabled:false,dynamicDprEnabled:true,transitionPixelRatioCap:1.25};
   await import(`./index.js?v=${WRAPPER_VERSION}`);
   await window.newInit(JSON.stringify(cfg),JSON.stringify({width:innerWidth,height:innerHeight,energy:0,inland:0}));

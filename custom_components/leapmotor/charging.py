@@ -235,18 +235,31 @@ class ChargeRecorder:
         if not self.active:
             self.active = {"id": f"charge-{int(at * 1000)}", "started_at": at, "last_at": at,
                            "soc_start": soc, "soc_end": soc, "intervals": [], "partial": False,
-                           "power_samples": [], "peak_kw": None, "charge_types": []}
+                           "power_samples": [], "soc_samples": [], "peak_kw": None, "charge_types": []}
         dc, plug = state.flag("dc_cable_connected"), state.flag("charge_plug")
         kind = "dc" if dc is True else "ac" if dc is False and plug is True else "unknown"
         known=[k for k in self.active.get("charge_types",[]) if k!="unknown"]
         if kind!="unknown" and known and kind not in known:
             self._finish(float(self.active["last_at"]),"充电枪类型改变")
-            self.active={"id":f"charge-{int(at*1000)}","started_at":at,"last_at":at,"soc_start":soc,"soc_end":soc,"intervals":[],"partial":False,"power_samples":[],"peak_kw":None,"charge_types":[]}
+            self.active={"id":f"charge-{int(at*1000)}","started_at":at,"last_at":at,"soc_start":soc,"soc_end":soc,"intervals":[],"partial":False,"power_samples":[],"soc_samples":[],"peak_kw":None,"charge_types":[]}
         kinds=self.active.setdefault("charge_types", [])
         if kind not in kinds: kinds.append(kind)
         samples=self.active.setdefault("power_samples", [])
+        # Keep SOC values aligned by index with power_samples to avoid storing a second timestamp
+        # for every telemetry frame. Pad old stored sessions with nulls if upgrading mid-session.
+        soc_samples=self.active.get("soc_samples")
+        if not isinstance(soc_samples,list):
+            soc_samples=[]
+            self.active["soc_samples"]=soc_samples
+        if len(soc_samples)<len(samples):
+            soc_samples.extend([None]*(len(samples)-len(soc_samples)))
+        elif len(soc_samples)>len(samples):
+            del soc_samples[len(samples):]
         samples.append([at,power])
-        if len(samples)>1024: samples[:]=samples[::2]+[samples[-1]]
+        soc_samples.append(soc)
+        if len(samples)>1024:
+            samples[:]=samples[::2]+[samples[-1]]
+            soc_samples[:]=soc_samples[::2]+[soc_samples[-1]]
         if power is not None: self.active["peak_kw"]=max(self.active.get("peak_kw") or 0,power)
         previous = self._previous
         if previous:
@@ -340,6 +353,7 @@ class ChargeRecorder:
                             "charge_type": kinds[0] if len(kinds)==1 else "mixed" if kinds else "unknown",
                             "peak_kw": session.get("peak_kw"), "average_kw": round(sum(p[2] for p in known)/hours,2) if hours else None,
                             "power_samples": session.get("power_samples",[]),
+                            "soc_samples": session.get("soc_samples",[]),
                             "partial": expired or session.get("partial", False)})
         for d in daily.values():
             for key in ("kwh", "grid_kwh", "peak_kwh", "valley_kwh", "cost"):

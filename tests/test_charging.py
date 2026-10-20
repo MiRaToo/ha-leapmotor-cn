@@ -187,8 +187,19 @@ def test_charging_power_and_type_require_plug_evidence():
     s=rec.view(now=T0+60)["sessions"][0]
     assert s["charge_type"]=="ac" and s["peak_kw"]==6 and s["average_kw"]==6
     assert len(s["power_samples"])==2
+    assert s["soc_samples"]==[40,40]
     other=recorder();feed(other,frame(T0),frame(T0+60))
     assert other.view(now=T0+60)["sessions"][0]["charge_type"]=="unknown"
+
+def test_soc_samples_follow_power_samples_and_preserve_missing_frames():
+    rec=recorder()
+    feed(rec,frame(T0,40),frame(T0+60,41))
+    missing=frame(T0+120)
+    missing.signals.pop("soc")
+    feed(rec,missing)
+    session=rec.view(now=T0+120)["sessions"][0]
+    assert [p[0] for p in session["power_samples"]]==[T0,T0+60,T0+120]
+    assert session["soc_samples"]==[40,41,None]
 
 def test_missing_and_stale_timestamps_do_not_create_samples():
     rec = recorder()

@@ -15,6 +15,7 @@ import random
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlsplit
@@ -1136,6 +1137,106 @@ def parse_car_state(payload: dict) -> CarState:
     return st
 
 
+# T03 的国内 App 使用具名字段分支；只在明确识别为 T03 时归一化，不改其它车型的解析。
+# 窗口映射使用国内的 644/645/865/866，不能搬用海外的后排座椅信号号。
+_T03_NAMED_SIGNALS = {
+    "1204": ("soc",), "1318": ("totalMileage",), "1319": ("speed",),
+    "3260": ("expectedMileage",), "2188": ("liveRemainingRange",),
+    "1010": ("gearStatus",), "1944": ("vehicleState",),
+    "2": ("longitude",), "3": ("latitude",),
+    "1298": ("driverDoorLockStatus",), "1281": ("bbcmBackDoorStatus",),
+    "1277": ("lbcmDriverDoorStatus",), "1278": ("rbcmDriverDoorStatus",),
+    "1279": ("lbcmLeftRearDoorStatus",), "1280": ("rbcmRightRearDoorStatus",),
+    "1258": ("bcmKeyPositionOn3",),
+    "2646": ("leftFrontTirePressure",), "2653": ("rightFrontTirePressure",),
+    "2660": ("leftRearTirePressure",), "2667": ("rightRearTirePressure",),
+    "2641": ("leftFrontTirePressureState",), "2648": ("rightFrontTirePressureState",),
+    "2655": ("leftRearTirePressureState",), "2662": ("rightRearTirePressureState",),
+    "644": ("leftFrontWindowPercent",), "645": ("leftRearWindowPercent",),
+    "865": ("rightFrontWindowPercent",), "866": ("rightRearWindowPercent",),
+    "1693": ("driverWindowStatus",), "1694": ("rightFrontWindowStatus",),
+    "1695": ("leftRearWindowStatus",), "1696": ("rightRearWindowStatus",),
+    "1938": ("acSwitch",), "2183": ("acSetting",),
+    "1349": ("indoorTemp", "interiorTemp"), "1941": ("acAirVolume",),
+    "1943": ("acCircleMode",), "1177": ("batteryVoltage",),
+    "1178": ("batteryCurrent",), "1200": ("chargeRemainTime",),
+    "1182": ("minSingleTemp", "minBatteryTemp"), "1149": ("chargeState",),
+    "1197": ("dcInputFastCharge",),
+}
+_T03_BOOLEAN_SIGNALS = {
+    "1298", "1281", "1277", "1278", "1279", "1280", "1258", "1938", "1943",
+    "1693", "1694", "1695", "1696", "2641", "2648", "2655", "2662",
+}
+T03_COMPAT_COOLDOWN_SECONDS = 3600
+
+
+def _t03_code(payload: Any) -> int | None:
+    value = payload.get("code", payload.get("result")) if isinstance(payload, dict) else None
+    try:
+        return int(value) if not isinstance(value, bool) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _t03_timestamp(*values: Any) -> int:
+    for value in values:
+        number = _num(value)
+        if number is not None and math.isfinite(number) and number > 0:
+            return int(number * 1000 if number < 10_000_000_000 else number)
+        if isinstance(value, str):
+            try:
+                date = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if date.tzinfo is None:
+                    date = date.replace(tzinfo=timezone(timedelta(hours=8)))
+                return max(0, int(date.timestamp() * 1000))
+            except (ValueError, OverflowError, OSError):
+                pass
+    return 0
+
+
+def parse_t03_car_state(payload: Any, vin: str) -> CarState:
+    """兼容 T03 数字/具名 signalMap 与具名 data；失败和未知值不产生假车况。"""
+    code = _t03_code(payload)
+    if is_rate_limited(payload):
+        return CarState(resp_code=1023)
+    if code != 0:
+        return CarState(resp_code=code)
+    data = payload.get("data")
+    if not isinstance(data, dict) or data.get("vin", vin) != vin:
+        return CarState(resp_code=code)
+    source = next((data[key] for key in ("signalMap", "signal")
+                   if isinstance(data.get(key), dict) and data[key]), data)
+    if not isinstance(source, dict):
+        return CarState(resp_code=code)
+    named = any(name in source for names in _T03_NAMED_SIGNALS.values() for name in names)
+    raw: dict[str, float] = {}
+    for sid in (*SIGNAL_IDS, "3724", "3725", "2190", "2191"):
+        # 具名帧里的少量数字键可能只是占位(例如 2188=0)，不能压过 expectedMileage。
+        names = _T03_NAMED_SIGNALS.get(sid, ()) if named else (sid,)
+        for name in names:
+            value = source.get(name)
+            if isinstance(value, bool):
+                if sid not in _T03_BOOLEAN_SIGNALS:
+                    continue
+                value = int(value)
+            if sid in _T03_BOOLEAN_SIGNALS and isinstance(value, str):
+                value = {"true": 1, "false": 0}.get(value.lower(), value)
+            number = _num(value)
+            if number is not None and math.isfinite(number):
+                raw[sid] = number
+                break
+    # 只含时间/未知键的报文不算有效车况，不能覆盖上一帧。
+    if not any(key != "sts" for key in raw):
+        return CarState(resp_code=code)
+    collected = _t03_timestamp(data.get("collectTimeMs"), source.get("collectTimeMs"),
+                              data.get("collectTime"), source.get("collectTime"), source.get("sts"))
+    reported = _t03_timestamp(source.get("sts"), collected)
+    if reported:
+        raw["sts"] = reported
+    return parse_car_state({"code": 0, "data": {"vin": vin, "collectTime": collected,
+                                                  "signalMap": raw}})
+
+
 @dataclass
 class Session:
     """一套可用的车端会话材料。
@@ -1315,6 +1416,10 @@ class LeapmotorClient:
         # vin 与 key)与响应体。
         self.last_asset_meta: dict = {}
         self._legacy_routes: dict[str, tuple[float, str]] = {}
+        self._t03_state_paths: dict[str, tuple[str, bool, float]] = {}
+        self._t03_primary_ok: set[str] = set()
+        self._t03_probe_after: dict[str, float] = {}
+        self.last_state_meta: dict[str, Any] = {}
 
     # ---- HTTP 底层 ----
     def _http(self, method: str, url: str, headers: dict[str, str],
@@ -1385,10 +1490,10 @@ class LeapmotorClient:
             h["cartype"] = s.car_type
         return h
 
-    def sign(self, payload: dict[str, Any]) -> str:
+    def sign(self, payload: dict[str, Any], *, signed_headers: dict | None = None) -> str:
         """对「业务参数 ∪ 签名头」求 HMAC-SHA256。"""
         merged = dict(payload)
-        merged.update(self._signed_headers())
+        merged.update(self._signed_headers() if signed_headers is None else signed_headers)
         return hmac.new(
             self.session.hkdf_key, sort_and_concat(merged).encode("utf-8"), hashlib.sha256
         ).hexdigest()
@@ -1396,8 +1501,8 @@ class LeapmotorClient:
     def build_headers(self, payload: dict[str, Any] | None = None) -> dict[str, str]:
         payload = dict(payload or {})
         headers = self._signed_headers()
+        sig = self.sign(payload, signed_headers=headers)
         headers.update(self._extra_headers())
-        sig = self.sign(payload)
         headers["sign"] = sig
         headers["digest"] = sig
         return headers
@@ -2313,10 +2418,92 @@ class LeapmotorClient:
         """
         vin = vin or self.session.car_vin
         self._require_session()
+        t03 = self._is_t03(vin)
+        if t03 and vin in self._t03_state_paths:
+            base, form, expires = self._t03_state_paths[vin]
+            if time.monotonic() < expires:
+                return self._read_t03_state(vin, base, form=form, strategy="t03-route")
+            del self._t03_state_paths[vin]
         body: dict[str, Any] = {"vin": vin}
         url = f"{BASE_URL}{EP_SIGNAL_QUERY}"
         resp = self._http("POST", url, self.build_headers(body), body, form=True)
+        if t03:
+            state = parse_t03_car_state(resp, vin)
+            self._note_t03_state(resp, state, "standard", BASE_URL, True)
+            if state.raw:
+                self._t03_primary_ok.add(vin)
+            return state
         return parse_car_state(resp)
+
+    def _is_t03(self, vin: str) -> bool:
+        return (str(self.session.car_type or "").strip().upper() == "T03"
+                and vin == self.session.car_vin)
+
+    def _note_t03_state(self, response: Any, state: CarState, strategy: str,
+                        base: str, form: bool) -> None:
+        data = response.get("data") if isinstance(response, dict) else None
+        source = next((data[key] for key in ("signalMap", "signal")
+                       if isinstance(data.get(key), dict) and data[key]), data) if isinstance(data, dict) else None
+        named = isinstance(source, dict) and any(
+            name in source for names in _T03_NAMED_SIGNALS.values() for name in names)
+        self.last_state_meta = {
+            "strategy": strategy, "host": urlsplit(base).hostname,
+            "encoding": "form" if form else "json", "code": state.resp_code,
+            "schema": "named" if named else "numbered" if isinstance(source, dict) else "empty",
+            "recognized_signal_count": len(state.signals),
+        }
+
+    def _read_t03_state(self, vin: str, base: str, *, form: bool, strategy: str) -> CarState:
+        body = {"vin": vin}
+        headers = self.build_headers(body)
+        headers.update({"cartype": "T03", "carvin": vin})
+        response = self._http("POST", f"{base}{EP_SIGNAL_QUERY}", headers, body, form=form)
+        state = parse_t03_car_state(response, vin)
+        self._note_t03_state(response, state, strategy, base, form)
+        return state
+
+    def try_t03_car_state(self, vin: str, previous_code: int | None) -> CarState | None:
+        """原链路完成重试后才调用；只读、限次探测，成功后按 VIN 复用。
+
+        国内 App 已确认使用 getCarRoute.appRegion + JSON 车况请求。没有证据的海外
+        旧端点不进入发布版；失败最多每小时再尝试一次，已正常读过的车不切换路径。
+        """
+        if (not self._is_t03(vin) or vin in self._t03_primary_ok or vin in self._t03_state_paths
+                or previous_code not in {0, 100, *SIGNATURE_ERROR_CODES}
+                or time.monotonic() < self._t03_probe_after.get(vin, 0)):
+            return None
+        self._t03_probe_after[vin] = time.monotonic() + T03_COMPAT_COOLDOWN_SECONDS
+        self._require_session()
+        route = self.global_call("v1/vehicle/getCarRoute", {"vin": vin})
+        code = 1023 if is_rate_limited(route) else _t03_code(route)
+        data = route.get("data") if isinstance(route, dict) else None
+        if code != 0 or not isinstance(data, dict) or data.get("vin", vin) != vin:
+            self.last_state_meta = {"strategy": "t03-route-discovery", "code": code,
+                                    "recognized_signal_count": 0}
+            return CarState(resp_code=code)
+        base = str(data.get("appRegion") or "").rstrip("/")
+        try:
+            parsed = urlsplit(base)
+            valid = not (parsed.scheme != "https" or not (parsed.hostname or "").endswith(
+                (".leapmotor.com", ".leapmotor.cn")) or parsed.username or parsed.password
+                or parsed.port not in (None, 443) or parsed.path or parsed.query or parsed.fragment)
+        except ValueError:
+            valid = False
+        if not valid:
+            self.last_state_meta = {"strategy": "t03-route-discovery", "error": "invalid_appRegion",
+                                    "recognized_signal_count": 0}
+            return None
+        # 原网关的 form 已试过；只在不同区域且 JSON 明确无数据时再试该区域的 form。
+        modes = [False, True] if base != BASE_URL else [False]
+        for form in modes:
+            state = self._read_t03_state(vin, base, form=form, strategy="t03-route-probe")
+            if state.raw:
+                self._t03_state_paths[vin] = (base, form, time.monotonic() + T03_COMPAT_COOLDOWN_SECONDS)
+                log.info("T03 车况兼容读取成功，后续复用本车区域路由")
+                return state
+            if state.resp_code not in (0, 100):
+                return state
+        return state
 
 
 # ── 指令码(cmdId) ───────────────────────────────────────────────────

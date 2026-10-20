@@ -100,6 +100,16 @@ def test_signals_empty():
     assert redact_signals({}) == {}
 
 
+def test_named_t03_coordinates_and_legacy_coordinates_are_masked():
+    raw = {"latitude": 31.123456, "longitude": 121.987654, "2190": 31.123456,
+           "2191": 121.987654, "soc": 56, "totalMileage": 73489}
+    result = redact_signals(raw)
+    for key in ("latitude", "longitude", "2190", "2191"):
+        assert result[key] == "<masked-location>"
+    assert result["soc"] == 56 and result["totalMileage"] == 73489
+    assert "31.123456" not in repr(result) and "121.987654" not in repr(result)
+
+
 def test_mask_value_keeps_only_shape():
     assert mask_value("s3cret") == "<str:len6>"
     assert mask_value(12345) == "<int:len5>"

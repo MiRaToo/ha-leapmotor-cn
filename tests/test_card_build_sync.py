@@ -57,6 +57,20 @@ def _ts_versions() -> dict[str, str]:
     return out
 
 
+def test_car3d_wrapper_versions_match() -> None:
+    """HTML 预载/入口与 Python 安装器一致，避免加载旧包装页或重复请求模块。"""
+    installer = (WWW.parent / "car3d.py").read_text(encoding="utf-8")
+    wrapper = (WWW / "car3d" / "view.js").read_text(encoding="utf-8")
+    html = (WWW / "car3d" / "view.html").read_text(encoding="utf-8")
+    asset_version = re.search(r"^ASSET_VERSION\s*=\s*(\d+)", installer, re.MULTILINE)
+    wrapper_version = re.search(r"^const WRAPPER_VERSION\s*=\s*(\d+)", wrapper, re.MULTILINE)
+    assert asset_version and wrapper_version
+    assert wrapper_version.group(1) == asset_version.group(1)
+    for entry in ("index.js", "view.js"):
+        version = re.search(rf'\./{re.escape(entry)}\?v=(\d+)', html)
+        assert version and version.group(1) == asset_version.group(1), entry
+
+
 @pytest.mark.parametrize("name", list(CARDS))
 def test_versions_match_between_ts_and_python(name: str) -> None:
     py = _py_versions()

@@ -768,8 +768,15 @@ class TripRecorder:
                  self._dt(frame_time), self._active.start_soc)
 
     def _add_point(self, st, now: float | None = None) -> None:
-        lat, lon = st.latitude_wgs, st.longitude_wgs
-        if lat is None or lon is None or (lat == 0 and lon == 0):
+        try:
+            # Compare the same six-decimal values that are stored below. The raw WGS
+            # conversion often has more precision, so comparing before rounding lets
+            # an unchanged position through on every poll.
+            lat = round(float(st.latitude_wgs), 6)
+            lon = round(float(st.longitude_wgs), 6)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(lat) or not math.isfinite(lon) or (lat == 0 and lon == 0):
             return                                        # 没有定位/占位 (0,0) 不写
         if self._points and self._points[-1][0] == lat and self._points[-1][1] == lon:
             return                                        # 与上一点完全相同(堵车/静止)不重复写
@@ -778,7 +785,7 @@ class TripRecorder:
         # [lat, lon, speed], 卡片按长度兼容, 不受影响。
         speed = round(float(st.get("speed") or 0.0), 1)
         ts = round(float(now), 1) if now else None
-        self._points.append([round(lat, 6), round(lon, 6), speed, ts, st.soc])
+        self._points.append([lat, lon, speed, ts, st.soc])
         if len(self._points) > MAX_TRACK_POINTS:
             self._points = downsample(self._points, MAX_TRACK_POINTS)
 

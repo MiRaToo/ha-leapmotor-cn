@@ -14,6 +14,8 @@ import hashlib
 # 车辆位置相关信号(原始帧里的键): 2=经度 3=纬度; 3724/3725=另一组(高度/备用坐标)。
 # 这些是**住址级**信息, 导出时一律掩码。
 LOCATION_SIGNAL_IDS = ("2", "3", "3724", "3725")
+LOCATION_FIELD_NAMES = ("latitude", "longitude", "latitudeSigned", "longitudeSigned",
+                        "lat", "lon", "lng", "2190", "2191")
 
 # 条目里允许导出的键(白名单)。其余(尤其是 token/密钥/操作密码)一律不导出。
 # ⚠️ 连 `operate_pwd_mode` 都不放行: 它与操作密码同属凭据配置, 诊断用不到。
@@ -63,7 +65,7 @@ def redact_signals(raw: dict | None) -> dict:
     """
     out: dict = {}
     for k, v in (raw or {}).items():
-        if str(k) in LOCATION_SIGNAL_IDS:
+        if str(k) in LOCATION_SIGNAL_IDS or str(k) in LOCATION_FIELD_NAMES:
             out[str(k)] = "<masked-location>"
         else:
             out[str(k)] = v

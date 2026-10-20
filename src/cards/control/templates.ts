@@ -541,16 +541,17 @@ function warnDockT(ctx: ControlCtx): TemplateResult | typeof nothing {
 /** 车模盒里的浮动层(充电块 + 告警 + 打开胎压时的四角读数)。
  *  2D 车模盒(.p-hero 里)与 3D 的浮动层(.p-carview 里的 .carDock)**共用这一份** ——
  *  迁移途中曾是"字符串版给 3D、另抄一份模板给 2D", C 档收尾时已合并。 */
-export function carDocksPanel(ctx: ControlCtx): TemplateResult {
+export function carDocksPanel(ctx: ControlCtx, projected = false): TemplateResult {
   const present = TIRE_DEFS.filter((d) => ctx._entId(d[0]));
   const on = present.length && ctx._vis("tires") && ctx._open.tires;
   const corners = tireCorners(ctx);
   // 充电块占着左侧那一条(见 css.ts): 充电中给读数层加 .hasChg, 左列读数让开它。
   // 告警列表展开时同理给 .hasWarn: 3D 下右列读数让开它(告警块自己钉在舞台右缘 10px 不动)。
-  const pads = on
-    ? html`<div class="tirePads${isCharging(ctx) ? " hasChg" : ""}${ctx._warnOpen
+  // 3D 保留节点以淡出，并等待第一帧有效投影后入场；2D 仍使用原来的角落定位。
+  const pads = on || (projected && present.length && ctx._vis("tires"))
+    ? html`<div class="tirePads${projected ? " projected" : ""}${isCharging(ctx) ? " hasChg" : ""}${ctx._warnOpen
       ? " hasWarn"
-      : ""}">${present.slice(0, 4).map((d, i) => tirePadT(ctx, d, corners[i]))}</div>`
+      : ""}" ?data-open=${!!on} aria-hidden=${on ? "false" : "true"}>${present.slice(0, 4).map(d => tirePadT(ctx, d, corners[TIRE_DEFS.indexOf(d)]))}</div>`
     : nothing;
   return html`${chgDockT(ctx)}${warnDockT(ctx)}${pads}`;
 }

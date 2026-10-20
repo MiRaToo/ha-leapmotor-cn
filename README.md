@@ -9,14 +9,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/MiRaToo/ha-leapmotor-cn/releases/latest"><img alt="发布版 v0.3.1" src="https://img.shields.io/badge/%E7%A8%B3%E5%AE%9A%E7%89%88-v0.3.1-brightgreen.svg"></a>
+  <a href="https://github.com/MiRaToo/ha-leapmotor-cn/releases/latest"><img alt="发布版 v0.3.2" src="https://img.shields.io/badge/%E7%A8%B3%E5%AE%9A%E7%89%88-v0.3.2-brightgreen.svg"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-AGPL--3.0-blue"></a>
   <img alt="Home Assistant" src="https://img.shields.io/badge/Home%20Assistant-2024.11%2B-41BDF5?logo=homeassistant&logoColor=white">
 </p>
 
 这是一个非官方的 Home Assistant 自定义集成。集成通过零跑云端接口登录，提供车辆实体、行程与能耗记录，以及六张可直接加入 Lovelace 仪表盘的卡片。项目与零跑汽车及其关联公司无隶属、合作或背书关系。
 
-当前版本：**v0.3.1**。
+当前版本：**v0.3.2**。
 
 代码托管：[GitHub](https://github.com/MiRaToo/ha-leapmotor-cn) · [GitCode 同步仓库](https://gitcode.com/MiraRato/ha-leapmotor-cn)。日常更新以 GitHub 为准，GitCode 通过仓库镜像自动同步代码、分支和标签。
 
@@ -47,6 +47,8 @@
 卡片提供玻璃拟态、轻阴影、新粗野主义、极简扁平和孟菲斯五种界面风格，默认使用玻璃拟态；风格设置在卡片间保持一致。自定义数据卡支持车辆状态、行程统计和 Home Assistant 实体数据，每张卡独立保存所选内容。卡片配置示例见[仪表盘与卡片说明](docs/dashboard.md)。
 
 控制卡片的设置中可切换“自动 / 3D”与“仅 2D”；2D 外观可按商城车型、年款、能源、配置和颜色选择，并调整车图大小。“隐藏卡片外框”默认关闭，开启后去掉卡片最外层的边框和阴影，保留内部子卡片效果。
+
+T03 车况读取提供[尝试性兼容与验证说明](docs/T03-COMPATIBILITY.md)，仍需中国版车主验证；其它车型继续使用原有车况链路。
 
 ## 安全接入建议
 

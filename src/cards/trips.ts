@@ -224,6 +224,8 @@ interface Prep {
   breaks: [Pt, Pt][];
   lo: number | null;
   hi: number | null;
+  locationSampleCount?: number;
+  status?: "location-stale";
 }
 interface Trip {
   id: unknown;
@@ -581,7 +583,16 @@ class LeapmotorTripsCard extends LitElement {
   /** 原始轨迹(WGS-84)→ 显示坐标, 并按距离切成 runs(实线)/ breaks(虚线)。
    *  保留可选的第三维车速(p[2]), 供速度热力图着色用。 */
   _prepare(raw: any[], maxN: number): Prep {
-    const src = simplify(raw || [], maxN);
+    const source = raw || [];
+    let locationSampleCount = 0;
+    for (const p of source) {
+      if (!p || p.length < 2) continue;
+      const lat = Number(p[0]), lon = Number(p[1]);
+      if (Number.isFinite(lat) && Number.isFinite(lon) && !(lat === 0 && lon === 0)) {
+        locationSampleCount++;
+      }
+    }
+    const src = simplify(source, maxN);
     const disp: Pt[] = [];
     for (const p of src) {
       if (!p || p.length < 2) continue;
@@ -622,7 +633,7 @@ class LeapmotorTripsCard extends LitElement {
       cur.push(disp[i]);
     }
     if (cur.length) runs.push(cur);
-    return { runs: runs, breaks: breaks, lo: lo, hi: hi };
+    return { runs: runs, breaks: breaks, lo: lo, hi: hi, locationSampleCount };
   }
 
   async _openDetail(id: unknown, keepView?: boolean) {
@@ -684,7 +695,7 @@ class LeapmotorTripsCard extends LitElement {
       for (const item of items) {
         const t = (item && item.trip) || {};
         const prep = this._prepare((item && item.points) || [], 400);
-        if (!prep.runs.length) continue;
+        if (!this._hasDrawableRoute(prep)) continue;
         out.push({
           id: t.id,
           runs: prep.runs,
@@ -1281,6 +1292,7 @@ class LeapmotorTripsCard extends LitElement {
       const runs: Pt[][] = [];
       const breaks: [Pt, Pt][] = [];
       let dLo: number | null = null, dHi: number | null = null; // 当天的速度区间(供配色)
+      let hasStaleLocation = false;
       const dayTrips = this._trips.filter(
         (t) => t && t.started_at && dayKey(t.started_at) === key);
       for (const t of dayTrips) {
@@ -1291,6 +1303,11 @@ class LeapmotorTripsCard extends LitElement {
         } catch (e) { raw = []; }
         const prep = raw && raw.length ? this._prepare(raw, 120) : null;
         if (!prep) continue;
+        const positions = this._uniquePositionPoints(this._flatPrep(prep));
+        if (positions.length < 2) {
+          if (this._hasStaleLocation(prep)) hasStaleLocation = true;
+          continue; // 单段只有一个位置时，不把它与当天其它行程的孤立点连起来
+        }
         for (const r of prep.runs) runs.push(r);
         for (const b of prep.breaks) breaks.push(b);
         if (prep.lo != null && prep.hi != null) {
@@ -1299,7 +1316,11 @@ class LeapmotorTripsCard extends LitElement {
         }
       }
       if (seq !== this._thumbSeq) return;
-      this._dayPrep[key] = runs.length ? { runs, breaks, lo: dLo, hi: dHi } : null;
+      this._dayPrep[key] = runs.length
+        ? { runs, breaks, lo: dLo, hi: dHi }
+        : hasStaleLocation
+          ? { runs: [], breaks: [], lo: dLo, hi: dHi, status: "location-stale" }
+          : null;
     }
     const card = this._dayEl(key);
     if (card) this._paintDayThumb(card);
@@ -1339,7 +1360,25 @@ class LeapmotorTripsCard extends LitElement {
     }
     box.innerHTML = "";
     svg!.innerHTML = "";
-    if (pts.length < 2) {
+    el.classList.remove("location-unavailable");
+    el.title = "行程缩略图";
+    const positions = this._uniquePositionPoints(pts);
+    if (positions.length < 2) {
+      if (positions.length === 1) {
+        el.classList.add("empty", "location-unavailable");
+        const stale = this._hasStaleLocation(prep);
+        el.title = stale ? "定位未更新，无法绘制路线" : "轨迹点不足，无法绘制路线";
+        const dot = document.createElement("span");
+        dot.className = "location-dot";
+        dot.setAttribute("aria-label", "已知位置");
+        const ph = document.createElement("span");
+        ph.className = "ph";
+        ph.textContent = stale ? "定位未更新" : "轨迹点不足";
+        ph.title = stale ? "已有采样都落在同一位置，无法绘制路线" : "至少需要两个不同位置才能绘制路线";
+        el.appendChild(dot);
+        el.appendChild(ph);
+        return;
+      }
       // 补记/没轨迹: 浅灰底 + 起终点一条虚线; 连坐标都没有就写一个"无轨迹"
       el.classList.add("empty");
       const a = t ? this._point(t.start_lat, t.start_lon) : null;
@@ -1405,11 +1444,12 @@ class LeapmotorTripsCard extends LitElement {
     box.innerHTML = "";
     svg!.innerHTML = "";
     el.classList.toggle("dark", this._effMapStyle() === "dark");
-    if (pts.length < 2) {
+    if (!prep || !this._hasDrawableRoute(prep)) {
       el.classList.add("empty");
       const ph = document.createElement("span");
       ph.className = "ph";
-      ph.textContent = "当天无轨迹";
+      ph.textContent = prep?.status === "location-stale" ? "定位未更新" : "当天无轨迹";
+      if (prep?.status === "location-stale") ph.title = "当天的行程采样只有重复位置，无法绘制路线";
       el.appendChild(ph);
       return;
     }
@@ -1440,6 +1480,28 @@ class LeapmotorTripsCard extends LitElement {
     for (const run of prep.runs) for (const p of run) out.push(p);
     for (const br of prep.breaks) { out.push(br[0]); out.push(br[1]); }
     return out;
+  }
+
+  /** 按存储精度折叠相同位置，供路线有效性判断使用；趋势图仍保留所有时间/速度样本。 */
+  _uniquePositionPoints(points: Pt[]): Pt[] {
+    const unique = new Map<string, Pt>();
+    for (const p of points || []) {
+      const lat = p[3] != null ? Number(p[3]) : Number(p[0]);
+      const lon = p[4] != null ? Number(p[4]) : Number(p[1]);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+      const key = lat.toFixed(6) + "," + lon.toFixed(6);
+      if (!unique.has(key)) unique.set(key, p);
+    }
+    return Array.from(unique.values());
+  }
+
+  _hasDrawableRoute(prep: Prep | null): boolean {
+    return !!prep && this._uniquePositionPoints(this._flatPrep(prep)).length >= 2;
+  }
+
+  _hasStaleLocation(prep: Prep | null): boolean {
+    return !!prep && (prep.locationSampleCount || 0) > 1 &&
+      this._uniquePositionPoints(this._flatPrep(prep)).length === 1;
   }
 
   /**
@@ -1623,13 +1685,20 @@ class LeapmotorTripsCard extends LitElement {
       for (const br of prep.breaks) out.push(br[0], br[1]);
     };
     if (this._overlayTracks) for (const t of this._overlayTracks) push(t as any);
-    push(this._sel);
-    // 没有轨迹点(补记)时, 至少把起终点纳入取景范围
-    if (!out.length && this._selTrip) {
-      const s = this._point(this._selTrip.start_lat, this._selTrip.start_lon);
-      const e = this._point(this._selTrip.end_lat, this._selTrip.end_lon);
-      if (s) out.push(s as unknown as Pt);
-      if (e) out.push(e as unknown as Pt);
+    if (this._hasDrawableRoute(this._sel)) push(this._sel);
+    // 没有可绘制路线时, 用唯一已知位置定位；补记行程则使用摘要中的起终点。
+    if (!this._hasDrawableRoute(this._sel) && this._selTrip) {
+      let hasSelectedPosition = false;
+      if (this._sel) {
+        const known = this._uniquePositionPoints(this._flatPrep(this._sel))[0];
+        if (known) { out.push(known); hasSelectedPosition = true; }
+      }
+      if (!hasSelectedPosition) {
+        const s = this._point(this._selTrip.start_lat, this._selTrip.start_lon);
+        const e = this._point(this._selTrip.end_lat, this._selTrip.end_lon);
+        if (s) out.push(s as unknown as Pt);
+        if (e) out.push(e as unknown as Pt);
+      }
     }
     return out;
   }
@@ -1660,6 +1729,12 @@ class LeapmotorTripsCard extends LitElement {
       if (xy[0] > maxX) maxX = xy[0];
       if (xy[1] < minY) minY = xy[1];
       if (xy[1] > maxY) maxY = xy[1];
+    }
+    // 单一已知位置只用于地图定位提示，不要把地图放大到街区级甚至超出瓦片范围。
+    if (Math.max(maxX - minX, maxY - minY) < 1e-6) {
+      this._zoom = 15;
+      this._center = unproject((minX + maxX) / 2, (minY + maxY) / 2, 0);
+      return true;
     }
     const pad = 36;
     const spanX = Math.max(maxX - minX, 1e-9);
@@ -1843,6 +1918,7 @@ class LeapmotorTripsCard extends LitElement {
     frag.appendChild(defsEl);
     // 先画叠加的(细、半透明), 再把选中的那段压在上面(粗、醒目)
     for (const t of this._overlayTracks) {
+      if (!this._hasDrawableRoute(t as any)) continue;
       const draw = (runs: any[], color: string, width: number, dash: boolean) => {
         for (const run of runs) {
           if (run.length < 2) continue;
@@ -1852,20 +1928,21 @@ class LeapmotorTripsCard extends LitElement {
       draw(t.runs, t.color, 2.5, false);
       draw(t.breaks, t.color, 2, true);
     }
-    if (this._sel) {
-      for (const run of this._sel.runs) {
+    const selected = this._sel;
+    if (selected && this._hasDrawableRoute(selected)) {
+      for (const run of selected.runs) {
         if (run.length < 2) continue;
         // 热力图只在"开了且这点列真的带 speed"时用; 否则单色红。
         const hasSpeed = !!this._heatmap && run.some((p) => p.length >= 3 && p[2] != null);
         if (hasSpeed) {
           frag.appendChild(this._polyHeatmap(run, mapPt, 3.5, defsEl, this._flow,
-            this._sel && this._sel.lo, this._sel && this._sel.hi));
+            selected.lo, selected.hi));
         } else {
           frag.appendChild(this._poly(run, mapPt, "#e53935", 3.5, false));
           if (this._flow) frag.appendChild(this._polyFlow(run, mapPt, 3.5));
         }
       }
-      for (const br of this._sel.breaks) {
+      for (const br of selected.breaks) {
         frag.appendChild(this._poly(br, mapPt, "#e53935", 2.5, true));
       }
     }
@@ -1982,8 +2059,14 @@ class LeapmotorTripsCard extends LitElement {
     if (!start && this._selTrip) start = this._point(this._selTrip.start_lat, this._selTrip.start_lon) as unknown as Pt;
     if (!end && this._selTrip) end = this._point(this._selTrip.end_lat, this._selTrip.end_lon) as unknown as Pt;
     let html = "";
-    if (start) html += '<div class="mk start" style="' + place(start) + '">起</div>';
-    if (end) html += '<div class="mk end" style="' + place(end) + '">终</div>';
+    const knownPosition = this._sel && !this._hasDrawableRoute(this._sel)
+      ? this._uniquePositionPoints(this._flatPrep(this._sel))[0] : null;
+    if (knownPosition) {
+      html += '<div class="mk loc" style="' + place(knownPosition) + '">位</div>';
+    } else {
+      if (start) html += '<div class="mk start" style="' + place(start) + '">起</div>';
+      if (end) html += '<div class="mk end" style="' + place(end) + '">终</div>';
+    }
     if (this._pt) {
       // 气泡横向夹回地图内(靠边时不要溢出), 竖向固定点在点上方
       html += '<div class="mk pt" style="'+(this._pt.p?place(this._pt.p):'left:'+this._pt.x+'px;top:'+this._pt.y+'px')+'"></div>';
@@ -2005,8 +2088,13 @@ class LeapmotorTripsCard extends LitElement {
       text = this._selTrip.reconstructed ? "这段没有轨迹(靠里程跳变补记)" : "这段没有轨迹";
     } else if (this._selTrip && !this._sel) {
       text = "轨迹点太少, 画不出路线";
-    } else if (this._selTrip && !this._sel!.runs.length) {
-      text = "轨迹点太少, 画不出路线";
+    } else if (this._selTrip && !this._hasDrawableRoute(this._sel)) {
+      const positions = this._uniquePositionPoints(this._flatPrep(this._sel));
+      text = positions.length === 1 && this._hasStaleLocation(this._sel)
+        ? "定位未更新，无法绘制路线"
+        : positions.length === 1
+          ? "轨迹点不足，无法绘制路线"
+          : "轨迹点没有有效定位，无法绘制路线";
     }
     this._mhintEl.textContent = text;
     this._mhintEl.style.display = text ? "block" : "none";
@@ -2856,6 +2944,12 @@ class LeapmotorTripsCard extends LitElement {
           position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%);
           text-align: center; font-size: 9px; line-height: 1.3;
         }
+        .thumb.location-unavailable .ph { top: auto; bottom: 3px; transform: none; }
+        .thumb .location-dot {
+          position: absolute; z-index: 1; left: 50%; top: 43%; width: 10px; height: 10px;
+          margin: -5px 0 0 -5px; border: 2px solid #fff; border-radius: 50%;
+          background: #1e88e5; box-shadow: 0 1px 4px rgba(0,0,0,.45);
+        }
 
         .rbody { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
         .rline1 { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
@@ -3070,6 +3164,7 @@ class LeapmotorTripsCard extends LitElement {
         }
         .mk.start { background: #111; }
         .mk.end { background: #e53935; }
+        .mk.loc { background: #1e88e5; }
         /* 点中的轨迹点: 小蓝点 + 信息气泡 */
         .mk.pt {
           width: 11px; height: 11px; margin: -5.5px 0 0 -5.5px;

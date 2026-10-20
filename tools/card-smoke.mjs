@@ -671,9 +671,10 @@ for (const name of CARDS) {
     bill.remove();
     const priced=window.document.createElement('leapmotor-energy');window.document.body.appendChild(priced);priced.setConfig({type:'custom:leapmotor-energy',entry_id:'price-car'});
     const priceCalls=[];let failPrice=true;
-    const record={id:'s1',started_at:1791900000,last_at:1791903600,ended_at:1791903600,kwh:6,grid_kwh:6.67,cost:3,sources:['power'],active:false,partial:false,charge_type:'ac'};
+    const record={id:'s1',started_at:1791900000,last_at:1791903600,ended_at:1791903600,kwh:6,grid_kwh:6.67,cost:3,sources:['power'],active:false,partial:false,charge_type:'ac',power_samples:[[1791900000,4],[1791903600,6]],soc_samples:[40,55]};
     priced.hass={...billHass,callWS:async msg=>{priceCalls.push(msg);if(msg.type==='leapmotor/energy/daily')return{days:[],summary:{}};if(msg.type==='leapmotor/charging/price'){if(failPrice)throw Error('保存失败');return{saved:true}};return{...history(7),sessions:[record],summary:{kwh:6,grid_kwh:6.67,cost:3,count:1}}}};
-    await tick();const pr=priced.shadowRoot,pclick=t=>[...pr.querySelectorAll('button')].find(b=>b.textContent.trim()===t)?.click();pclick('充电与电费');await tick();pclick('修改本次价格');await tick();
+    await tick();const pr=priced.shadowRoot,pclick=t=>[...pr.querySelectorAll('button')].find(b=>b.textContent.trim()===t)?.click();pclick('充电与电费');await tick();priced._chargeSessionSelected.s1=1;priced.requestUpdate();await priced.updateComplete;
+    if(!pr.querySelector('.socLine')||!pr.querySelector('.powerReadout')?.textContent.includes('SOC 55%'))fail('energy: 充电详情没有绘制 SOC 过程曲线或交互读数');else ok('energy: 充电过程 SOC 曲线与拖动读数已显示');pclick('修改本次价格');await tick();
     const mode=pr.querySelector('.sessionPrice select');mode.value='total';mode.dispatchEvent(new window.Event('change',{bubbles:true}));await tick();const value=pr.querySelector('.sessionPrice input');value.value='12.5';value.dispatchEvent(new window.Event('input',{bubbles:true}));pclick('保存本次价格');await tick();
     if(!pr.querySelector('.sessionPrice .error')||pr.querySelector('.sessionPrice input').value!=='12.5')fail('energy: 单次价格失败后丢失输入或假报成功');else ok('energy: 单次价格保存失败保留金额并显示错误');
     failPrice=false;pclick('保存本次价格');await tick();
@@ -1811,6 +1812,7 @@ for (const name of CARDS) {
         if (msg.type === "leapmotor/car3d/info") {
           return {
             ready, car_type: "C10", year: 2026,
+            preload: ["C10_2026/C10_2026_starter_car.fbx", "C10_2026/C10_2026_full_car.fbx"],
             model_param: { carType: "C10", year: 2026, carTypeCode: "530舒享版", colorCode: 8, seat: 5 },
             colors: [{ tsp: 0, name: "金属黑", hex: "#353535" }],
             options: { car3d_color: "", car3d_bg: "auto", car3d_image: optImg || "" },
@@ -1871,6 +1873,9 @@ for (const name of CARDS) {
     const sr6 = el6.shadowRoot;
     const fr1 = sr6.querySelector(".p-carview iframe");
     const src1 = fr1 ? fr1.getAttribute("src") || "" : "";
+    const hinted = new URL(src1 || '/', 'http://localhost').searchParams.get('preload');
+    if(JSON.stringify(JSON.parse(hinted || '[]')) !== JSON.stringify(["C10_2026/C10_2026_starter_car.fbx", "C10_2026/C10_2026_full_car.fbx"]))fail('control: 已存在的本车模型预加载提示未传入包装页');
+    else ok('control: 仅将后端已确认的本车模型文件传入预加载，普通推送保持稳定地址');
     if (!fr1) fail(`control: 3D 就绪时车模区没有 iframe`);
     else if (!/car=C10/.test(src1) || !/trim=530%E8%88%92%E4%BA%AB%E7%89%88/.test(src1)) {
       fail(`control: iframe src 参数不对(中文版型没 encode): ${src1}`);
@@ -2220,6 +2225,36 @@ for (const name of CARDS) {
       tgl6.dispatchEvent(new window.MouseEvent("click", { bubbles: true, composed: true }));
       await new Promise((r) => setTimeout(r, 30));
     }
+    // 明确绑定胎压实体，避免设备注册表夹具只有电量时整个胎压测试被跳过。
+    const tireCard=await mkCar3dEl(car3dHass(true,''));
+    tireCard.setConfig({type:'custom:leapmotor-control',entities:{tire_fl:'sensor.tai_ya_zuo_qian',tire_fr:'sensor.tai_ya_you_qian'}});
+    await new Promise(r=>setTimeout(r,60));
+    const tireRoot=tireCard.shadowRoot,tireToggle=tireRoot.querySelector('.carTools .tireTgl'),tireFrame=tireRoot.querySelector('iframe');
+    if(!tireToggle||!tireFrame)fail('control: 胎压投影测试必须存在按钮和 iframe');
+    else {
+      const clickTire=()=>tireToggle.dispatchEvent(new window.MouseEvent('click',{bubbles:true,composed:true}));
+      const sendTires=points=>window.dispatchEvent(new window.MessageEvent('message',{source:tireFrame.contentWindow,data:{t:'tires',points:JSON.stringify(points),opacity:.5}}));
+      const points=['tire_fl','tire_fr','tire_rl','tire_rr'].map((key,i)=>({key,x:i%2?75:25,y:i<2?40:70}));
+      const pads=tireRoot.querySelector('.p-carview .tirePads');
+      clickTire();await new Promise(r=>setTimeout(r,30));
+      if(!pads||pads.hasAttribute('data-projected'))fail('control: 首次有效投影前不能显示固定角落位置');
+      sendTires([points[0],points[0],points[2],points[3]]);
+      if(pads?.hasAttribute('data-projected'))fail('control: 重复轮位不能被当作有效投影');
+      sendTires(points);
+      if(!pads?.hasAttribute('data-projected')||pads.style.getPropertyValue('--tire-opacity')!=='.5'&&pads.style.getPropertyValue('--tire-opacity')!=='0.5')fail('control: 有效投影应同步坐标与动画透明度');
+      const firstPad=pads?.querySelector('[data-tire="tire_fl"]');
+      if(firstPad?.style.getPropertyValue('--tire-x')!=='25%')fail('control: 读数未使用对应轮位的投影');
+      tireCard.hass=car3dHass(true,'');await new Promise(r=>setTimeout(r,30));
+      if(tireRoot.querySelector('.p-carview .tirePads')!==pads||pads?.querySelector('[data-tire="tire_fl"]')!==firstPad)fail('control: 车况更新不能替换动画节点');
+      clickTire();await new Promise(r=>setTimeout(r,30));
+      if(tireRoot.querySelector('.p-carview .tirePads')!==pads||pads?.hasAttribute('data-open')||pads?.getAttribute('aria-hidden')!=='true')fail('control: 关闭时保留节点用于淡出并隐藏交互');
+      sendTires(points.map(p=>({...p,x:99})));
+      if(firstPad?.style.getPropertyValue('--tire-x')!=='25%')fail('control: 关闭后的晚到投影必须忽略');
+      clickTire();await new Promise(r=>setTimeout(r,30));
+      if(pads?.hasAttribute('data-projected'))fail('control: 重新打开不能闪现上一轮坐标');
+      else ok('control: 胎压等待投影、连续透明度、节点保留、淡出、晚到消息及重开全部验证');
+    }
+    tireCard.remove();
     // compact: 胎压整行不出现(行为与原实现一致)
     const el9 = window.document.createElement("leapmotor-control");
     window.document.body.appendChild(el9);

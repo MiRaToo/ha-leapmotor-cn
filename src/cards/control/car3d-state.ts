@@ -1,5 +1,30 @@
 import type { ControlCtx } from "./types";
 
+/** 读数完整矩形的可用区域，单位与 iframe 的 CSS 像素一致。隐藏的读数仍可测量尺寸。 */
+export function tireLayout(ctx: ControlCtx) {
+  const root=ctx.shadowRoot,view=root?.querySelector<HTMLElement>('.p-carview'),viewRect=view?.getBoundingClientRect();
+  if(!view||!viewRect||viewRect.height<=0)return null;
+  const scaleY=(view.clientHeight||viewRect.height)/viewRect.height;
+  const visibleRect=(el:HTMLElement|null|undefined)=>{
+    if(!el||!el.getClientRects().length)return null;
+    const rect=el.getBoundingClientRect();return rect.height>0?rect:null;
+  };
+  const header=visibleRect(root?.querySelector<HTMLElement>('.p-hero'));
+  const docks=[view.querySelector<HTMLElement>('.chgDock'),view.querySelector<HTMLElement>('.warnDock')]
+    .map(el=>visibleRect(el)).filter((rect):rect is DOMRect=>!!rect);
+  const top=Math.max(64,...[header,...docks].filter((rect):rect is DOMRect=>!!rect)
+    .map(rect=>(rect.bottom-viewRect.top)*scaleY+20));
+  const lowerControls=[root?.querySelector<HTMLElement>('.carTools'),root?.querySelector<HTMLElement>('.p-actions'),
+    ...Array.from(root?.querySelectorAll<HTMLElement>('.p-actions .winPop,.p-actions .presetPop')||[])]
+    .map(el=>visibleRect(el)).filter((rect):rect is DOMRect=>!!rect&&rect.bottom>viewRect.top&&rect.top<viewRect.bottom);
+  const bottom=lowerControls.length
+    ? Math.min(...lowerControls.map(rect=>(rect.top-viewRect.top)*scaleY))-20
+    : viewRect.height*scaleY-20;
+  const pads=Array.from(view.querySelectorAll<HTMLElement>('.tP'));
+  return {tireTop:top,tireBottom:bottom,
+    tireWidth:Math.max(64,...pads.map(el=>el.offsetWidth)),tireHeight:Math.max(34,...pads.map(el=>el.offsetHeight))};
+}
+
 /** 无信号时保留未知，不把未上报的车窗画成已关。百分比优先，枚举只兜底开/关。 */
 export function vehiclePose(ctx: ControlCtx): Record<string, string | number> {
   const out: Record<string, string | number> = { t: "vehicle" };
@@ -29,27 +54,6 @@ export function vehiclePose(ctx: ControlCtx): Record<string, string | number> {
   const speed=ctx._attr('vehicle_state','speed');
   out.speed=ctx._driving()&&speed!=null&&Number.isFinite(Number(speed))?Math.max(0,Math.min(200,Number(speed))):0;
   out.tires=ctx._open.tires?1:0;
-  if(ctx._open.tires){
-    const root=ctx.shadowRoot,view=root?.querySelector<HTMLElement>('.p-carview'),viewRect=view?.getBoundingClientRect();
-    if(view&&viewRect&&viewRect.height>0){
-      const visibleRect=(el:HTMLElement|null|undefined)=>{
-        if(!el||!el.getClientRects().length)return null;
-        const rect=el.getBoundingClientRect();return rect.height>0?rect:null;
-      };
-      const header=visibleRect(root?.querySelector<HTMLElement>('.p-hero'));
-      const docks=[view.querySelector<HTMLElement>('.chgDock'),view.querySelector<HTMLElement>('.warnDock')]
-        .map(el=>visibleRect(el)).filter((rect):rect is DOMRect=>!!rect);
-      const topEdge=Math.max(64,...[header,...docks].filter((rect):rect is DOMRect=>!!rect)
-        .map(rect=>rect.bottom-viewRect.top+20));
-      const lowerControls=[root?.querySelector<HTMLElement>('.carTools'),root?.querySelector<HTMLElement>('.p-actions'),
-        ...Array.from(root?.querySelectorAll<HTMLElement>('.p-actions .winPop,.p-actions .presetPop')||[])]
-        .map(el=>visibleRect(el)).filter((rect):rect is DOMRect=>!!rect&&rect.bottom>viewRect.top&&rect.top<viewRect.bottom);
-      const bottomEdge=lowerControls.length
-        ? Math.min(...lowerControls.map(rect=>rect.top-viewRect.top))-20
-        : viewRect.height-20;
-      out.tireTop=topEdge;
-      out.tireBottom=Math.max(topEdge+50,bottomEdge);
-    }
-  }
+  if(ctx._open.tires)Object.assign(out,tireLayout(ctx));
   return out;
 }

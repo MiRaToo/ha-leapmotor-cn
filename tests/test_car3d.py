@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import json
+import gzip
+import os
 import pathlib
 import sys
 import zipfile
@@ -81,6 +83,60 @@ def wrapper_src(tmp_path: pathlib.Path) -> pathlib.Path:
 @pytest.fixture()
 def base(tmp_path: pathlib.Path) -> pathlib.Path:
     return tmp_path / "car3d"
+
+
+def test_static_compression_preserves_sources_and_refreshes_changed_viewer(base, wrapper_src):
+    base.mkdir()
+    source = base / "index.js"
+    source.write_bytes(b"viewer source;" * 1000)
+    (base / "FBX.worker.js").write_bytes(b"worker source;" * 300)
+    car3d.install_wrapper(base, wrapper_src)
+    packed = base / "index.js.gz"
+    assert gzip.decompress(packed.read_bytes()) == source.read_bytes()
+    assert gzip.decompress((base / "FBX.worker.js.gz").read_bytes()) == b"worker source;" * 300
+    assert packed.stat().st_size < source.stat().st_size
+    before = packed.stat().st_mtime_ns
+    car3d.install_wrapper(base, wrapper_src)
+    assert packed.stat().st_mtime_ns == before
+    source.write_bytes(b"different viewer;" * 1000)
+    os.utime(source, ns=(before + 2_000_000_000, before + 2_000_000_000))
+    car3d.install_wrapper(base, wrapper_src)
+    assert gzip.decompress(packed.read_bytes()) == source.read_bytes()
+    assert not list(base.glob(".index.js.*"))
+
+
+def test_static_compression_failure_keeps_original_viewer_usable(base, wrapper_src, monkeypatch):
+    base.mkdir()
+    original = b"original viewer;" * 1000
+    (base / "index.js").write_bytes(original)
+    stale = base / "index.js.gz"
+    stale.write_bytes(gzip.compress(b"obsolete viewer"))
+    os.utime(stale, (1, 1))
+    monkeypatch.setattr(car3d.tempfile, "NamedTemporaryFile", lambda **_: (_ for _ in ()).throw(OSError("full")))
+    car3d.install_wrapper(base, wrapper_src)
+    assert (base / "index.js").read_bytes() == original
+    assert not stale.exists()
+    assert car3d.viewer_ready(base)
+    assert (base / "view.html").is_file()
+
+
+@pytest.mark.parametrize("car,year,trim,prefix", [
+    ("C10", 2026, "", "C10_2026"),
+    ("B10", 2025, "", "B10_2025"),
+    ("B05", 2026, "605Max", "Lafa5_2026"),
+    ("B05", 2026, "600Ultra", "Lafa5Ultra_2026"),
+])
+def test_preload_only_existing_files_for_selected_model(base, car, year, trim, prefix):
+    other = "C16_2025/C16_2025_full_car.fbx"
+    full = f"{prefix}/{prefix}_full_car.fbx"
+    starter = f"{prefix}/{prefix}_starter_car.fbx"
+    car3d.safe_extract(_zip({full: "full", other: "other"}), base)
+    param = {"carTypeCode": trim}
+    assert car3d.model_preloads(base, car, year, param) == [full]
+    car3d.safe_extract(_zip({starter: "starter"}), base)
+    assert car3d.model_preloads(base, car, year, param) == [starter, full]
+    assert car3d.model_preloads(base, car, year, {**param, "alias": "unknown"}) == []
+    assert car3d.model_preloads(base, "../C10", year, param) == []
 
 
 def test_first_assemble_downloads_everything(base, wrapper_src):

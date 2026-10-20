@@ -17,6 +17,9 @@ import functools
 import gzip
 import json
 import logging
+import os
+import re
+import tempfile
 import time
 import zipfile
 from io import BytesIO
@@ -90,7 +93,7 @@ log = logging.getLogger(__name__)
 
 DIR_NAME = "leapmotor-car3d"          # config/ 下的落盘目录
 URL_DIR = "car3d"                     # 静态路径后缀: /leapmotor-card/car3d/
-ASSET_VERSION = 12                    # 包装页版本: 变了只重铺包装页, 模型不重下
+ASSET_VERSION = 14                    # 包装页版本: 变了只重铺包装页, 模型不重下
 WRAPPER_FILES = ("view.html", "view.js", "textures/skybox_night_starry.jpg")
 MODEL_PARAM_FIELDS = ("carType", "year", "carTypeCode", "colorCode", "roofColor",
                       "seat", "sdkVersion", "theme", "alias")
@@ -183,7 +186,19 @@ def status(base: Path) -> dict:
         "asset_version": int(man.get("asset_version") or 0),
         "fetched_at": man.get("fetched_at"),
         "colors": man.get("colors") or [],
+        "preload": model_preloads(base, car_type, year, param),
     }
+
+
+def model_preloads(base: Path, car_type: str, year: Any, param: dict) -> list[str]:
+    """只提示本车实际存在的 FBX；未知别名交给官方查看器自行选择。"""
+    if param.get("alias"):
+        return []
+    prefix = model_prefix(car_type, year, param.get("carTypeCode") or "")
+    if not re.fullmatch(r"[A-Za-z0-9]+_[0-9]{4}", prefix):
+        return []
+    return [rel for part in ("starter", "full")
+            if (base / (rel := f"{prefix}/{prefix}_{part}_car.fbx")).is_file()]
 
 
 def ready(base: Path) -> bool:
@@ -265,6 +280,39 @@ def safe_extract(zip_bytes: bytes, dest: Path) -> int:
     return count
 
 
+def prepare_static_assets(base: Path) -> None:
+    """为现有静态服务生成 gzip 副本；失败仍可加载原文件，不改官方素材。"""
+    for name in ("index.js", "FBX.worker.js"):
+        source, target = base / name, base / f"{name}.gz"
+        temporary: Path | None = None
+        try:
+            if not source.is_file():
+                continue
+            stamp = source.stat()
+            if target.is_file() and target.stat().st_mtime_ns == stamp.st_mtime_ns:
+                continue
+            # 静态服务会优先选择 .gz；旧副本必须先失效，压缩失败时才能真正回退原文件。
+            target.unlink(missing_ok=True)
+            packed = gzip.compress(source.read_bytes(), compresslevel=6, mtime=0)
+            if len(packed) >= stamp.st_size:
+                continue
+            if source.stat().st_mtime_ns != stamp.st_mtime_ns:
+                continue
+            with tempfile.NamedTemporaryFile(dir=base, prefix=f".{name}.", delete=False) as out:
+                temporary = Path(out.name)
+                out.write(packed)
+            os.utime(temporary, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            temporary.replace(target)
+        except OSError as err:
+            log.warning("3D 静态资源压缩未完成，继续使用原文件: %s", err)
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
 def install_wrapper(base: Path, src: Path, version: int | None = None) -> list[str]:
     """把包装页与星空贴图铺进落盘目录(版本一致且文件在就跳过)。
 
@@ -273,6 +321,7 @@ def install_wrapper(base: Path, src: Path, version: int | None = None) -> list[s
     就仍然是 ready, 包装页由集成在 setup 时顺手刷新。
     """
     version = ASSET_VERSION if version is None else version      # 取当前值(便于热改/单测)
+    prepare_static_assets(base)
     man = read_manifest(base)
     if int(man.get("asset_version") or 0) == version and all(
             (base / f).is_file() for f in WRAPPER_FILES):

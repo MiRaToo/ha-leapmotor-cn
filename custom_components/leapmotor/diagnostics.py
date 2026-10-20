@@ -100,6 +100,7 @@ async def async_get_config_entry_diagnostics(
         "car3d": car3d_info,
         "diagnostics": {
             "car_state_problem": getattr(coord, "car_state_problem", "") if coord else "",
+            "car_state_request": getattr(getattr(coord, "client", None), "last_state_meta", {}),
             "entities": _entity_ids(hass, entry),
             "entity_count": len(_entity_ids(hass, entry)),
             "poll_interval_s": (

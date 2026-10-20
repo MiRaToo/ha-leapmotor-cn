@@ -296,6 +296,7 @@ export interface Car3dModelParam {
 
 export interface Car3dInfo {
   asset_version?: number;
+  preload?: string[];
   ready?: boolean;
   car_type?: string;
   year?: number | string;
