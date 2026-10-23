@@ -37,6 +37,7 @@ from . import api as _api
 from . import car3d
 from .const import DOMAIN
 from .diag_redact import vin_fingerprint
+from .vehicle_selector import VehicleSelectionError, resolve_coordinator
 
 log = logging.getLogger(__name__)
 
@@ -47,13 +48,16 @@ RISK_KEYWORDS = ("1023", "频繁", "风控")
 THROTTLE_S = 3.0
 
 
-def _coordinator(hass: HomeAssistant, entry_id: str = "") -> Any:
-    entries = hass.config_entries.async_entries(DOMAIN)
-    if entry_id:
-        entries = [e for e in entries if e.entry_id == entry_id]
-    if not entries:
-        raise HomeAssistantError("找不到零跑集成条目(先添加集成)")
-    return (hass.data.get(DOMAIN) or {}).get(entries[0].entry_id)
+def _coordinator(hass: HomeAssistant, selectors: dict[str, Any]) -> Any:
+    try:
+        return resolve_coordinator(hass, selectors)
+    except VehicleSelectionError as err:
+        messages = {
+            "vehicle_required": "配置了多辆车，请指定要采集的车辆",
+            "vehicle_conflict": "提供的车辆标识不一致",
+            "vehicle_unavailable": "所选车辆未加载或不存在",
+        }
+        raise HomeAssistantError(messages.get(str(err), "所选车辆不可用")) from err
 
 
 def _risk_hit(obj: Any) -> bool:
@@ -146,9 +150,7 @@ def _collect_sync(client: Any, vin: str, dest: Path, want_h5: bool) -> dict:
 
 async def _handle_collect(call: ServiceCall) -> dict:
     hass: HomeAssistant = call.hass
-    coord = _coordinator(hass, str(call.data.get("entry_id") or ""))
-    if coord is None:
-        raise HomeAssistantError("集成尚未就绪(等它连上后再试)")
+    coord = _coordinator(hass, dict(call.data))
     vin = str(getattr(coord, "vin", "") or "")
     if not vin:
         raise HomeAssistantError("读不到 VIN, 无法采集")
@@ -158,7 +160,7 @@ async def _handle_collect(call: ServiceCall) -> dict:
     car_type = str(getattr(coord.session, "car_type", "") or "")
     sub_version = str((coord.entry.data or {}).get("sub_version") or "")
 
-    dest_root = Path(hass.config.path(ASSETS_DIRNAME))
+    dest_root = Path(hass.config.path(ASSETS_DIRNAME)) / "vehicles" / vin_fingerprint(vin)
     # 目录名先占位, 拿到 modelParam 后再定(车型_年份)
     res = await hass.async_add_executor_job(
         _collect_sync, client, vin, dest_root / f"_tmp_{car_type or 'unknown'}",
@@ -204,17 +206,15 @@ async def _handle_car3d_probe(call: ServiceCall) -> dict:
     报告落到 `config/leapmotor-assets/car3d-diag/`(不写 VIN、不写完整 key), 可直接转发。
     """
     hass: HomeAssistant = call.hass
-    coord = _coordinator(hass, str(call.data.get("entry_id") or ""))
-    if coord is None:
-        raise HomeAssistantError("集成尚未就绪(等它连上后再试)")
+    coord = _coordinator(hass, dict(call.data))
     vin = str(getattr(coord, "vin", "") or "")
     if not vin:
         raise HomeAssistantError("读不到 VIN, 无法探测")
 
     state = getattr(coord, "state", None)
     signals = dict(getattr(state, "signals", None) or {})
-    base = car3d.root(hass)
-    st = (hass.data.get(DOMAIN) or {}).get(car3d.STATE_KEY) or {}
+    base = car3d.profile_root(hass, coord)
+    st = car3d._state(hass, coord)
     extra = car3d.probe_extra(
         integration_version=_manifest_version(),
         car_type=str((coord.entry.data or {}).get("car_type") or ""),
@@ -228,7 +228,7 @@ async def _handle_car3d_probe(call: ServiceCall) -> dict:
         signals=signals,
     )
 
-    dest = Path(hass.config.path(ASSETS_DIRNAME)) / "car3d-diag"
+    dest = Path(hass.config.path(ASSETS_DIRNAME)) / "vehicles" / vin_fingerprint(vin) / "car3d-diag"
     report = await hass.async_add_executor_job(
         lambda: car3d.probe_sync(coord.client, vin, dest, extra=extra,
                                  deep=bool(call.data.get("deep", False)),
@@ -259,6 +259,9 @@ async def async_register_asset_services(hass: HomeAssistant) -> None:
             _svc,
             schema=vol.Schema({
                 vol.Optional("entry_id"): cv.string,
+                vol.Optional("vin"): cv.string,
+                vol.Optional("device_id"): cv.string,
+                vol.Optional("entity_id"): cv.entity_id,
                 vol.Optional("include_h5", default=False): cv.boolean,
             }),
             supports_response=SupportsResponse.ONLY,
@@ -274,6 +277,9 @@ async def async_register_asset_services(hass: HomeAssistant) -> None:
             _probe,
             schema=vol.Schema({
                 vol.Optional("entry_id"): cv.string,
+                vol.Optional("vin"): cv.string,
+                vol.Optional("device_id"): cv.string,
+                vol.Optional("entity_id"): cv.entity_id,
                 vol.Optional("deep", default=False): cv.boolean,
                 vol.Optional("variants", default=True): cv.boolean,
             }),

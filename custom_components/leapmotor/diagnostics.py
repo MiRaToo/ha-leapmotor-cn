@@ -57,11 +57,11 @@ async def async_get_config_entry_diagnostics(
     # "3dkey 响应异常"/"不是 zip"这两类都是云端响应形状问题, 本地无法复现)。
     car3d_info: dict[str, Any] = {}
     try:
-        base = car3d.root(hass)
+        base = car3d.profile_root(hass, coord) if coord else car3d.root(hass)
         car3d_info = await hass.async_add_executor_job(car3d.status, base)
         car3d_info.pop("dir", None)                    # 本机路径对排查没用
         car3d_info.pop("colors", None)                 # 色表很长, 与故障无关
-        st = (hass.data.get(DOMAIN) or {}).get(car3d.STATE_KEY) or {}
+        st = car3d._state(hass, coord) if coord else (hass.data.get(DOMAIN) or {}).get(car3d.STATE_KEY) or {}
         car3d_info["state"] = st.get("state")
         car3d_info["last_error"] = st.get("error") or ""
         car3d_info["last_error_detail"] = st.get("detail") or ""

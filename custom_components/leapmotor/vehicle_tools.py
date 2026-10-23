@@ -51,15 +51,20 @@ def validate_panorama(encoded):
 def register(hass):
     import voluptuous as vol
     from homeassistant.components import websocket_api as ws
-    from homeassistant.helpers import entity_registry as er
     from .const import DOMAIN
+    from .vehicle_selector import VehicleSelectionError, resolve_coordinator
     from .amap import CONF_AMAP_KEY, search_places, validate_key
 
     def coordinator(msg):
-        entry=er.async_get(hass).async_get(msg["entity_id"])
-        coord=(hass.data.get(DOMAIN) or {}).get(entry.config_entry_id) if entry and entry.platform==DOMAIN else None
-        if coord is None:raise ValueError("没有找到所选车辆，请等待实体加载")
-        return coord
+        try:
+            return resolve_coordinator(hass, msg)
+        except VehicleSelectionError as err:
+            messages = {
+                "vehicle_required": "配置了多辆车，请先选择车辆实体",
+                "vehicle_conflict": "请求中的车辆标识不一致",
+                "vehicle_unavailable": "没有找到所选车辆，请等待实体加载",
+            }
+            raise ValueError(messages.get(str(err), "没有找到所选车辆")) from err
 
     def require(coord,cmd):
         if not coord.vehicle or not coord.vehicle.can(cmd):raise ValueError("该账号没有此功能权限")

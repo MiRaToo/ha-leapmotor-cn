@@ -87,6 +87,24 @@ def test_signstr_is_md5_mid16_of_sorted_values(captured):
     assert q["signStr"][0] == expected
 
 
+def test_account_refresh_uses_login_account_id_not_exchange_user_id(captured):
+    s = _sess(account_id="stable-account", user_id="vehicle-session-user")
+    api_client.LeapmotorClient(s).refresh_account_token()
+    q = urllib.parse.parse_qs(urllib.parse.urlsplit(captured["url"]).query)
+    assert q["accountId"][0] == "stable-account"
+
+
+def test_global_vehicle_headers_use_account_id(monkeypatch):
+    s = _sess(account_id="stable-account", user_id="vehicle-session-user",
+              hkdf_key_hex="00" * 32)
+    client = api_client.LeapmotorClient(s)
+    captured = {}
+    monkeypatch.setattr(client, "_http", lambda method, url, headers, **_: captured.update(
+        method=method, url=url, headers=headers) or {"code": 200})
+    client.global_call(api_client.EP_VEHICLE_LIST)
+    assert captured["headers"]["userId"] == "stable-account"
+
+
 def test_account_number_is_rsa_b64url_without_padding(captured):
     api_client.LeapmotorClient(_sess()).refresh_account_token()
     q = urllib.parse.parse_qs(urllib.parse.urlsplit(captured["url"]).query)

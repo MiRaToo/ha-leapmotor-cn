@@ -31,6 +31,7 @@ import { CARD_VERSIONS } from "../lib/version";
 import { interactionStyles } from "../lib/motion";
 import { uiStyles } from "../lib/ui/styles";
 import { bindAppearance, unbindAppearance } from "../lib/appearance";
+import { loadVehicleSelection, saveVehicleSelection, vehicleRequest, VEHICLE_PICKER_CSS, type VehicleOption } from "../lib/vehicle-selection";
 
 const CARD_VERSION = CARD_VERSIONS.lastweek;
 
@@ -74,6 +75,13 @@ class LeapmotorLastweekCard extends LitElement {
   private _fetchedOnce = false;
   private _style: "donut" | "bar" = "donut"; // donut(圆环, 仿官方 App) | bar(堆叠条)
   private _prefLoaded = false;
+  private _vehicleOptions: VehicleOption[] = [];
+  private _vehicleEntryId = "";
+  private _vehicleRequired = false;
+  private _vehicleLocked = false;
+  private _vehicleInitStarted = false;
+  private _vehicleGeneration = 0;
+  private _requestSeq = 0;
 
   static getStubConfig() {
     return { type: "custom:leapmotor-lastweek", style: "donut" };
@@ -105,7 +113,10 @@ class LeapmotorLastweekCard extends LitElement {
     if (!this._built) {
       this._built = true;
       this._loadPref();
-      this._load(false);
+      if (!this._vehicleInitStarted) {
+        this._vehicleInitStarted = true;
+        void this._initVehicleSelection();
+      }
       return;
     }
     this.requestUpdate();
@@ -145,16 +156,50 @@ class LeapmotorLastweekCard extends LitElement {
   }
 
   // ── 取数 ──
+  private async _initVehicleSelection(): Promise<void> {
+    const state = await loadVehicleSelection(this._hass, "lastweek", this._config, this);
+    this._vehicleOptions = state.vehicles;
+    this._vehicleEntryId = state.entryId;
+    this._vehicleRequired = state.required;
+    this._vehicleLocked = state.locked;
+    if (this._vehicleRequired) this._err = "请先选择要查看的车辆";
+    this.requestUpdate();
+    if (!this._vehicleRequired) void this._load(false);
+  }
+
+  private _onVehicleChange(entryId: string): void {
+    if (entryId === this._vehicleEntryId) return;
+    this._vehicleEntryId = entryId;
+    this._vehicleRequired = this._vehicleOptions.length > 1 && !entryId;
+    this._vehicleGeneration++;
+    this._requestSeq++;
+    this._loading = false;
+    this._data = null;
+    this._fetchedOnce = false;
+    this._err = this._vehicleRequired ? "请先选择要查看的车辆" : "";
+    saveVehicleSelection("lastweek", this._config, entryId, this);
+    this.requestUpdate();
+    if (entryId) void this._load(false);
+  }
+
+  private _vehicleSelector(): Record<string, string> {
+    return vehicleRequest(this._config, this._vehicleEntryId);
+  }
+
   private async _load(force: boolean) {
     if (!this._hass) return;
+    if (this._vehicleRequired) return;
+    const seq = ++this._requestSeq;
+    const vehicleGeneration = this._vehicleGeneration;
     this._loading = true;
     this._err = "";
     this._hint = "";
     this.requestUpdate();
     let res: any = null;
     try {
-      res = await callWs(this._hass, { type: "leapmotor/energy/lastweek", refresh: !!force });
+      res = await callWs(this._hass, { type: "leapmotor/energy/lastweek", refresh: !!force, ...this._vehicleSelector() });
     } catch (err) {
+      if (seq !== this._requestSeq || vehicleGeneration !== this._vehicleGeneration) return;
       this._loading = false;
       if (isUnknownCommand(err)) {
         // "命令没注册"是版本问题, 不是错误 —— 安静留空(与行程/里程卡同一约定)
@@ -167,6 +212,7 @@ class LeapmotorLastweekCard extends LitElement {
       this.requestUpdate();
       return;
     }
+    if (seq !== this._requestSeq || vehicleGeneration !== this._vehicleGeneration) return;
     this._loading = false;
     this._fetchedOnce = true;
     const bd = res && res.breakdown;
@@ -247,6 +293,7 @@ class LeapmotorLastweekCard extends LitElement {
       <div class="card">
         <div class="head">
           <span class="title">${title}</span>
+          ${!this._vehicleLocked && this._vehicleOptions.length > 1 ? html`<label class="lmVehiclePicker${this._vehicleRequired ? " required" : ""}"><span>车辆</span><select aria-label="选择车辆" .value=${this._vehicleEntryId} @change=${(e: Event) => this._onVehicleChange((e.currentTarget as HTMLSelectElement).value)}><option value="">${this._vehicleRequired ? "请选择车辆" : "切换车辆"}</option>${this._vehicleOptions.map((v) => html`<option value=${v.entry_id} ?disabled=${!v.available}>${v.name}${v.available ? "" : "（未加载）"}</option>`)}</select></label>` : nothing}
           <span class="sum">${sum}</span>
           <span class="spacer"></span>
           <button
@@ -362,6 +409,7 @@ class LeapmotorLastweekCard extends LitElement {
 
   static styles = css`
     ${unsafeCSS(interactionStyles)}
+    ${unsafeCSS(VEHICLE_PICKER_CSS)}
     :host { display: block; }
     .card {
       padding: 14px; box-sizing: border-box;

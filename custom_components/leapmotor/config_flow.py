@@ -17,6 +17,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigFlowResult
 
 from .api import LeapmotorClient, Session, new_device_id
+from .account_runtime import (AUTH_FIELDS, AUTH_GENERATION_FIELD, account_key, context_key,
+                              sync_new_auth)
 from .amap import CONF_AMAP_KEY, validate_key
 from .const import (
     CAR3D_BG_MODES,
@@ -70,52 +72,218 @@ class LeapmotorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._phone = ""
         self._session: dict[str, Any] = {}
         self._reauth_entry: config_entries.ConfigEntry | None = None
+        self._vehicles: list[Any] = []
 
     # ── 第一步: 填手机号, 发验证码 ──
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         errors: dict[str, str] = {}
+        accounts = self._existing_accounts()
         if user_input is not None:
-            phone = str(user_input[CONF_PHONE]).strip()
-            sess = Session()
-            sess.device_id = new_device_id()
-            client = LeapmotorClient(sess)
-            try:
-                resp = await self.hass.async_add_executor_job(client.request_sms_code, phone)
-            except Exception as err:  # noqa: BLE001
-                log.exception("发送验证码失败")
-                errors["base"] = "cannot_connect"
-                resp = {"code": -1, "message": str(err)}
-            code = resp.get("code")
-            if code == 200:
-                self._phone = phone
-                self._session = asdict(sess)
-                return await self.async_step_code()
-            if code == RISK_COOLDOWN:
-                errors["base"] = "risk_cooldown"
-            elif code == SMS_TOO_OFTEN:
-                errors["base"] = "sms_too_often"
-            elif not errors:
-                errors["base"] = "sms_failed"
-                log.warning("发送验证码返回: %s", str(resp)[:200])
+            existing_id = str(user_input.get("existing_account") or "")
+            if existing_id:
+                entry = next((e for e in self.hass.config_entries.async_entries(DOMAIN)
+                              if e.entry_id == existing_id), None)
+                if entry is None:
+                    errors["base"] = "account_unavailable"
+                else:
+                    self._phone = str(entry.data.get(CONF_PHONE) or "").strip()
+                    self._session = {**entry.data}
+                    sess = Session(**{k: v for k, v in entry.data.items()
+                                      if k in Session.__dataclass_fields__})
+                    client = LeapmotorClient(sess)
+                    sess, client, self._vehicles = await self._saved_account_vehicles(
+                        entry, sess, client)
+                    self._session = asdict(sess)
+                    if self._vehicles:
+                        available = self._available_vehicles(self._vehicles)
+                        if not available:
+                            errors["base"] = "no_new_vehicle"
+                        elif len(available) == 1:
+                            return await self._create_selected_entry(sess, available[0])
+                        else:
+                            self._vehicles = available
+                            return await self.async_step_vehicle()
+                    elif not errors:
+                        errors["base"] = "no_vehicle"
+            elif user_input.get(CONF_PHONE):
+                phone = str(user_input[CONF_PHONE]).strip()
+                sess = Session()
+                sess.device_id = new_device_id()
+                client = LeapmotorClient(sess)
+                try:
+                    resp = await self.hass.async_add_executor_job(client.request_sms_code, phone)
+                except Exception as err:  # noqa: BLE001
+                    log.exception("发送验证码失败")
+                    errors["base"] = "cannot_connect"
+                    resp = {"code": -1, "message": str(err)}
+                code = resp.get("code")
+                if code == 200:
+                    self._phone = phone
+                    self._session = asdict(sess)
+                    return await self.async_step_code()
+                if code == RISK_COOLDOWN:
+                    errors["base"] = "risk_cooldown"
+                elif code == SMS_TOO_OFTEN:
+                    errors["base"] = "sms_too_often"
+                elif not errors:
+                    errors["base"] = "sms_failed"
+                    log.warning("发送验证码返回: %s", str(resp)[:200])
+            elif accounts:
+                errors["base"] = "choose_account"
+            else:
+                errors["base"] = "phone_required"
 
+        schema: dict[Any, Any] = {vol.Optional(CONF_PHONE): str}
+        if accounts:
+            schema[vol.Optional("existing_account")] = selector.SelectSelector(
+                selector.SelectSelectorConfig(options=[
+                    {"value": entry_id, "label": label}
+                    for entry_id, label in accounts.items()
+                ], mode=selector.SelectSelectorMode.DROPDOWN)
+            )
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema({vol.Required(CONF_PHONE): str}),
+            data_schema=vol.Schema(schema),
             errors=errors,
             description_placeholders={"notice": "请使用【子账号】, 不要用主账号"},
         )
 
-    # ── 第二步: 填验证码, 完成登录 ──
+    async def _saved_account_vehicles(self, entry: config_entries.ConfigEntry,
+                                      sess: Session, client: LeapmotorClient
+                                      ) -> tuple[Session, LeapmotorClient, list[Any]]:
+        """读取已有账号车辆；失效时复用免短信续期，并优先使用运行时最新快照。"""
+        wanted = context_key(entry.data, entry.entry_id)
+        coordinator = next((item for item in (self.hass.data.get(DOMAIN) or {}).values()
+                            if getattr(item, "entry", None) is not None
+                            and context_key(item.entry.data, item.entry.entry_id) == wanted), None)
+        if coordinator is not None:
+            sess, client = coordinator.session, coordinator.client
+        try:
+            vehicles = await self.hass.async_add_executor_job(client.get_vehicle_list)
+        except Exception as err:  # noqa: BLE001
+            log.warning("读取已有账号车辆列表失败: %s", type(err).__name__)
+            vehicles = []
+        if vehicles or not sess.refresh_token:
+            return sess, client, vehicles
+
+        try:
+            if coordinator is not None:
+                from .account_runtime import async_refresh_account
+                refreshed = await async_refresh_account(coordinator, force=True)
+            else:
+                response = await self.hass.async_add_executor_job(client.refresh_account_token)
+                refreshed = response.get("code") in (0, 200) and bool(sess.token)
+            if refreshed:
+                vehicles = await self.hass.async_add_executor_job(client.get_vehicle_list)
+        except Exception as err:  # noqa: BLE001
+            log.warning("已有账号免短信续期或车辆列表刷新失败: %s", type(err).__name__)
+            vehicles = []
+        return sess, client, vehicles
+
+    def _existing_accounts(self) -> dict[str, str]:
+        """一个账号/登录设备只显示一次，复用时不再请求短信或创建新设备。"""
+        choices: dict[tuple[str, str], tuple[str, str]] = {}
+        for entry in self.hass.config_entries.async_entries(DOMAIN):
+            phone = str(entry.data.get(CONF_PHONE) or "").strip()
+            if not phone:
+                continue
+            key = context_key(entry.data, entry.entry_id)
+            if key in choices:
+                continue
+            label = self._account_label(phone, entry.data)
+            choices[key] = (entry.entry_id, label)
+        return {entry_id: label for entry_id, label in choices.values()}
+
+    @staticmethod
+    def _account_label(phone: str, data: dict[str, Any]) -> str:
+        digits = "".join(ch for ch in phone if ch.isdigit())
+        if digits.startswith("86") and len(digits) == 13:
+            digits = digits[2:]
+        masked = (digits[:3] + "****" + digits[-4:]) if len(digits) >= 7 else "已保存账号"
+        return f"{masked} · {str(data.get('car_nickname') or data.get('car_type') or '零跑账号')}"
+
+    def _available_vehicles(self, vehicles: list[Any]) -> list[Any]:
+        configured = {
+            str(entry.data.get("vin") or "").upper()
+            for entry in self.hass.config_entries.async_entries(DOMAIN)
+            if entry.data.get("vin")
+        }
+        seen: set[str] = set()
+        result = []
+        for vehicle in vehicles:
+            vin = str(getattr(vehicle, "vin", "") or "").strip()
+            canonical = vin.upper()
+            if not vin or canonical in seen or canonical in configured:
+                continue
+            seen.add(canonical)
+            result.append(vehicle)
+        return result
+
+    def _vehicle_schema(self) -> vol.Schema:
+        def label(vehicle: Any) -> str:
+            kind = {"owner": "自有车辆", "shared": "共享车辆"}.get(
+                str(getattr(vehicle, "source", "unknown")), "车辆")
+            name = getattr(vehicle, "nick_name", "") or getattr(vehicle, "car_type", "") or "零跑"
+            return f"{name} · {kind} · {str(vehicle.vin)[-6:]}"
+
+        return vol.Schema({vol.Required("vin"): selector.SelectSelector(
+            selector.SelectSelectorConfig(options=[
+                {"value": str(v.vin), "label": label(v)}
+                for v in self._vehicles
+            ], mode=selector.SelectSelectorMode.DROPDOWN)
+        )})
+
+    async def async_step_vehicle(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        errors: dict[str, str] = {}
+        if not self._vehicles:
+            return self.async_abort(reason="no_new_vehicle")
+        if user_input is not None:
+            vehicle = next((v for v in self._vehicles
+                            if str(v.vin) == str(user_input.get("vin"))), None)
+            if vehicle is None:
+                errors["base"] = "vehicle_unavailable"
+            else:
+                if self._reauth_entry is not None:
+                    errors["base"] = "reauth_vehicle_mismatch"
+                else:
+                    return await self._create_selected_entry(Session(**{
+                        k: v for k, v in self._session.items()
+                        if k in Session.__dataclass_fields__
+                    }), vehicle)
+        return self.async_show_form(
+            step_id="vehicle", data_schema=self._vehicle_schema(), errors=errors,
+        )
+
+    async def _create_selected_entry(self, sess: Session, vehicle: Any) -> ConfigFlowResult:
+        # PIN and its encoding are vehicle settings, not part of the shared login.
+        # A newly added car starts with the existing safe defaults for its own options.
+        sess.operate_pwd = ""
+        sess.operate_pwd_mode = DEFAULT_PWD_MODE
+        sess.car_vin = str(vehicle.vin)
+        sess.car_type = str(vehicle.car_type or "")
+        data = asdict(sess)
+        data.update({CONF_PHONE: self._phone or str(sess.phone or ""),
+                     "vin": str(vehicle.vin), "car_type": str(vehicle.car_type or ""),
+                     "car_nickname": str(vehicle.nick_name or ""),
+                     "vehicle_source": str(getattr(vehicle, "source", "unknown"))})
+        await self.async_set_unique_id(f"{DOMAIN}_{vehicle.vin}")
+        self._abort_if_unique_id_configured()
+        # Existing-account vehicle additions may have obtained a newer auth
+        # snapshot. Persist that whole generation to sibling entries before the
+        # new entry becomes available to the runtime.
+        data[AUTH_GENERATION_FIELD] = sync_new_auth(self.hass, data)
+        return self.async_create_entry(
+            title=f"零跑 {vehicle.car_type or ''} {str(vehicle.vin)[-6:]}".strip(),
+            data=data,
+        )
+
     async def async_step_code(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         errors: dict[str, str] = {}
         if user_input is not None and user_input.get("resend"):
-            # 勾了「重新发送验证码」: 只重发, 不校验(验证码只有 5 分钟有效,
-            # 超时后不必退出流程重来 —— 这一步就是给用户原地重发的)
             sess = Session(**self._session)
             client = LeapmotorClient(sess)
             try:
-                resp = await self.hass.async_add_executor_job(
-                    client.request_sms_code, self._phone)
+                resp = await self.hass.async_add_executor_job(client.request_sms_code, self._phone)
                 if resp.get("code") != 200:
                     errors["base"] = ("sms_too_often" if resp.get("code") == SMS_TOO_OFTEN
                                       else "sms_failed")
@@ -123,7 +291,7 @@ class LeapmotorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             except Exception:  # noqa: BLE001
                 log.exception("重发验证码失败")
                 errors["base"] = "cannot_connect"
-            user_input = None            # 落回"再显示一次表单"
+            user_input = None
         if user_input is not None:
             code = str(user_input[CONF_SMS_CODE]).strip()
             sess = Session(**self._session)
@@ -136,9 +304,8 @@ class LeapmotorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 r = {}
             if not errors:
                 if r.get("code") != 200 or not sess.token:
-                    errors["base"] = (
-                        "risk_cooldown" if r.get("code") == RISK_COOLDOWN else "invalid_auth"
-                    )
+                    errors["base"] = ("risk_cooldown" if r.get("code") == RISK_COOLDOWN
+                                      else "invalid_auth")
                     log.warning("登录返回: %s", str(r)[:200])
                 else:
                     try:
@@ -153,29 +320,47 @@ class LeapmotorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not errors:
                 sess.seal_key()
                 try:
-                    vehicles = await self.hass.async_add_executor_job(client.get_vehicle_list)
+                    self._vehicles = await self.hass.async_add_executor_job(client.get_vehicle_list)
                 except Exception:  # noqa: BLE001
-                    vehicles = []
-                if not vehicles:
+                    self._vehicles = []
+                if not self._vehicles:
                     errors["base"] = "no_vehicle"
-                else:
-                    v = vehicles[0]
-                    data = asdict(sess)
-                    data[CONF_PHONE] = self._phone
-                    data["vin"] = v.vin
-                    data["car_type"] = v.car_type or data.get("car_type", "")
-                    data["car_nickname"] = v.nick_name
-                    if self._reauth_entry is not None:
-                        # 重新认证: 把新会话写回原条目并重载(不要新建条目)
-                        log.info("重新认证成功, 更新原条目")
+                elif self._reauth_entry is not None:
+                    old_vin = str(self._reauth_entry.data.get("vin") or "")
+                    vehicle = next((v for v in self._vehicles if str(v.vin) == old_vin), None)
+                    if vehicle is None:
+                        errors["base"] = "reauth_vehicle_missing"
+                    elif account_key(self._reauth_entry.data.get(CONF_PHONE)) != account_key(self._phone):
+                        errors["base"] = "reauth_account_mismatch"
+                    else:
+                        data = dict(self._reauth_entry.data)
+                        fresh = asdict(sess)
+                        data.update({name: fresh[name] for name in AUTH_FIELDS if name in fresh})
+                        data.update({"vin": old_vin, "car_vin": old_vin,
+                                     "car_type": vehicle.car_type or data.get("car_type", ""),
+                                     "car_nickname": vehicle.nick_name or data.get("car_nickname", ""),
+                                     "vehicle_source": getattr(vehicle, "source", "unknown")})
+                        data[AUTH_GENERATION_FIELD] = sync_new_auth(
+                            self.hass, data,
+                            excluded_entry_id=self._reauth_entry.entry_id)
+                        log.info("重新认证成功, 更新原 VIN 条目及同会话车辆")
                         return self.async_update_reload_and_abort(
-                            self._reauth_entry, data=data)
-                    await self.async_set_unique_id(f"{DOMAIN}_{v.vin}")
-                    self._abort_if_unique_id_configured()
-                    return self.async_create_entry(
-                        title=f"零跑 {v.car_type or ''} {v.vin[-6:]}".strip(),
-                        data=data,
-                    )
+                            self._reauth_entry,
+                            data_updates={k: data[k] for k in (*AUTH_FIELDS, AUTH_GENERATION_FIELD,
+                                      "vin", "car_vin", "car_type", "car_nickname",
+                                      "vehicle_source") if k in data},
+                        )
+                else:
+                    available = self._available_vehicles(self._vehicles)
+                    if not available:
+                        errors["base"] = "already_configured"
+                    elif len(available) == 1:
+                        return await self._create_selected_entry(sess, available[0])
+                    else:
+                        self._session = asdict(sess)
+                        self._phone = self._phone
+                        self._vehicles = available
+                        return await self.async_step_vehicle()
 
         return self.async_show_form(
             step_id="code",
@@ -186,7 +371,6 @@ class LeapmotorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
             description_placeholders={"phone": self._phone},
         )
-
     # ── 重新认证: 账号 token(约 6 小时)过期后, HA 会弹出「重新认证」 ──
     async def async_step_reauth(self, entry_data: dict[str, Any]) -> ConfigFlowResult:
         """重新登录: 手机号已知, 直接发验证码, 用户只填 6 位数字即可。

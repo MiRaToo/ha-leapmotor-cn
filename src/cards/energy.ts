@@ -52,6 +52,7 @@ import { interactionStyles } from "../lib/motion";
 import { uiStyles } from "../lib/ui/styles";
 import { bindAppearance, unbindAppearance } from "../lib/appearance";
 import { bindScrub } from "../lib/scrub";
+import { loadVehicleSelection, saveVehicleSelection, vehicleRequest, VEHICLE_PICKER_CSS, type VehicleOption } from "../lib/vehicle-selection";
 import { chargePanel, tariffForm, decimal, energyPanelStyles, sessionPowerSamples, type ChargeData, type ChargeSession } from "./energy-charging";
 
 const CARD_VERSION = CARD_VERSIONS.energy;
@@ -144,6 +145,12 @@ class LeapmotorEnergyCard extends LitElement {
   private _watchId = "";
   private _watchStamp = "";
   private _vin = "";
+  private _vehicleOptions: VehicleOption[] = [];
+  private _vehicleEntryId = "";
+  private _vehicleRequired = false;
+  private _vehicleLocked = false;
+  private _vehicleInitStarted = false;
+  private _vehicleGeneration = 0;
   private _pendingTimer: ReturnType<typeof setTimeout> | null = null; // pending>0 时的自动续拉定时器
   private _prefLoaded = false;
   private _rafPending = false;
@@ -215,7 +222,10 @@ class LeapmotorEnergyCard extends LitElement {
     this._loadPref();
     this._build();
     this._renderAll();
-    this._load();
+    if (!this._vehicleInitStarted) {
+      this._vehicleInitStarted = true;
+      void this._initVehicleSelection();
+    }
   }
 
   getCardSize(): number {
@@ -430,8 +440,10 @@ class LeapmotorEnergyCard extends LitElement {
   // ── 取数 ──
   private async _load(force?: boolean): Promise<void> {
     if (!this._hass) return;
+    if (this._vehicleRequired) return;
     const range = this._range;
     const seq = ++this._loadSeq; // 给这轮取数发号; 结果回来时对不上就作废
+    const vehicleGeneration = this._vehicleGeneration;
     if (!force && this._cache[range]) {
       // 有缓存就直接换用缓存(切回周视图走的这条路 —— 之前漏了换数据, 看起来"切不回去")
       this._data = this._cache[range];
@@ -448,10 +460,10 @@ class LeapmotorEnergyCard extends LitElement {
     try {
       res = await callWs<EnergyData>(this._hass, { type: "leapmotor/energy/daily", days: days, ...this._vehicleSelector() });
     } catch (err) {
-      if (seq !== this._loadSeq) return; // 期间用户切了视图 → 丢弃
+      if (seq !== this._loadSeq || vehicleGeneration !== this._vehicleGeneration) return; // 期间用户切车/视图 → 丢弃
       res = this._fallback(err, range);
     }
-    if (seq !== this._loadSeq) return;
+    if (seq !== this._loadSeq || vehicleGeneration !== this._vehicleGeneration) return;
     this._loading = false;
     if (res) {
       this._data = res;
@@ -581,13 +593,58 @@ class LeapmotorEnergyCard extends LitElement {
 
   // ── 渲染(lit 模板: header/消息/外壳) ──
   private _vehicleSelector(): Record<string,string> {
-    if (this._config?.entry_id) return {entry_id:String(this._config.entry_id)};
-    const vin = this._config?.vin || this._vin;
-    return vin ? {vin:String(vin)} : {};
+    const configured = vehicleRequest(this._config, this._vehicleEntryId);
+    if (Object.keys(configured).length) return configured;
+    return this._vin ? {vin: this._vin} : {};
+  }
+
+  private async _initVehicleSelection(): Promise<void> {
+    const state = await loadVehicleSelection(this._hass, "energy", this._config, this);
+    this._vehicleOptions = state.vehicles;
+    this._vehicleEntryId = state.entryId;
+    this._vehicleRequired = state.required;
+    this._vehicleLocked = state.locked;
+    if (this._vehicleRequired) this._err = "请先选择要查看的车辆";
+    this.requestUpdate();
+    if (!this._vehicleRequired) {
+      this._load();
+      if (this._mode === "charge") void this._loadCharge();
+    }
+  }
+
+  private _onVehicleChange(entryId: string): void {
+    if (entryId === this._vehicleEntryId) return;
+    this._vehicleEntryId = entryId;
+    this._vehicleRequired = this._vehicleOptions.length > 1 && !entryId;
+    this._vehicleGeneration++;
+    ++this._loadSeq;
+    ++this._chargeSeq;
+    this._loading = false;
+    this._chargeLoading = false;
+    this._cache = {};
+    this._chargeCache = {};
+    this._chargeKey = "";
+    this._data = null;
+    this._chargeData = null;
+    this._vin = "";
+    this._day = -1;
+    this._chargeSelected = -1;
+    this._err = this._vehicleRequired ? "请先选择要查看的车辆" : "";
+    this._chargeErr = "";
+    saveVehicleSelection("energy", this._config, entryId, this);
+    if (this._pendingTimer) clearTimeout(this._pendingTimer);
+    this._pendingTimer = null;
+    this._renderAll();
+    if (entryId) {
+      this._load();
+      if (this._mode === "charge") void this._loadCharge();
+    }
   }
 
   private async _loadCharge(force = false) {
     if (!this._hass) return;
+    if (this._vehicleRequired) return;
+    const vehicleGeneration = this._vehicleGeneration;
     const key = JSON.stringify(this._vehicleSelector()) + ":" + this._range;
     if (this._chargeLoading && key === this._chargeKey) return;
     const seq = ++this._chargeSeq;
@@ -598,11 +655,11 @@ class LeapmotorEnergyCard extends LitElement {
     this._chargeLoading=true;this._chargeErr="";this._chargeLastLoad=Date.now();this.requestUpdate();
     try {
       const data=await callWs<ChargeData>(this._hass,{type:"leapmotor/charging/history",days:this._range==="week"?7:30,...this._vehicleSelector()});
-      if(seq!==this._chargeSeq)return;
+      if(seq!==this._chargeSeq||vehicleGeneration!==this._vehicleGeneration)return;
       if(!data||!Array.isArray(data.days)||!data.tariff)throw new Error("充电记录尚未就绪");
       this._chargeData=data;this._chargeCache[key]=data;
     } catch(err) {
-      if(seq!==this._chargeSeq)return;
+      if(seq!==this._chargeSeq||vehicleGeneration!==this._vehicleGeneration)return;
       this._chargeErr="充电记录读取失败："+String((err as {message?:string})?.message||"请更新集成后重试").slice(0,100);
     } finally {
       if(seq===this._chargeSeq){this._chargeLoading=false;this._renderHead();this.requestUpdate();}
@@ -691,7 +748,7 @@ class LeapmotorEnergyCard extends LitElement {
   protected render(): TemplateResult {
     return html`
       <div class="card">
-        <div class="energyTop"><div class="energyModes ${this._mode}"><i class="modeIndicator" aria-hidden="true"></i><button class=${this._mode==="drive"?"on":""} aria-pressed=${this._mode==="drive"} @click=${()=>this._selectMode("drive")}>里程与耗能</button><button class=${this._mode==="charge"?"on":""} aria-pressed=${this._mode==="charge"} @click=${()=>this._selectMode("charge")}>充电与电费</button></div><button class="refresh" title="重新读取">${unsafeSVG(ipIcon("redo", 16))}</button></div>
+        <div class="energyTop"><div class="energyModes ${this._mode}"><i class="modeIndicator" aria-hidden="true"></i><button class=${this._mode==="drive"?"on":""} aria-pressed=${this._mode==="drive"} @click=${()=>this._selectMode("drive")}>里程与耗能</button><button class=${this._mode==="charge"?"on":""} aria-pressed=${this._mode==="charge"} @click=${()=>this._selectMode("charge")}>充电与电费</button></div>${!this._vehicleLocked&&this._vehicleOptions.length>1?html`<label class="lmVehiclePicker${this._vehicleRequired?" required":""}"><span>车辆</span><select aria-label="选择车辆" .value=${this._vehicleEntryId} @change=${(e:Event)=>this._onVehicleChange((e.currentTarget as HTMLSelectElement).value)}><option value="">${this._vehicleRequired?"请选择车辆":"切换车辆"}</option>${this._vehicleOptions.map(v=>html`<option value=${v.entry_id} ?disabled=${!v.available}>${v.name}${v.available?"":"（未加载）"}</option>`)}</select></label>`:nothing}<button class="refresh" title="重新读取">${unsafeSVG(ipIcon("redo", 16))}</button></div>
         ${this._summaryPanel()}
         <div class="lmsg" ?hidden=${this._mode!=="drive"}></div>
         <section class="chartSec" ?hidden=${this._mode!=="drive"}><div class="plotHeading"><b>每日趋势</b><span>滑动选择日期</span></div><div class="chartBox"></div><div class="srcNote"></div><div class="ctrls"></div>${this._data?.reev?html`<p class="billNote">逐日耗油按行车燃油量下降估算，缺样本留空；近期油耗使用云端窗口。油量变化有误差，安装前无法追溯。</p>`:nothing}</section>
@@ -1032,6 +1089,7 @@ class LeapmotorEnergyCard extends LitElement {
 
   static styles = css`
     ${unsafeCSS(interactionStyles)}
+    ${unsafeCSS(VEHICLE_PICKER_CSS)}
     :host { display: block; }
     .card {
       padding: 14px; box-sizing: border-box;

@@ -95,6 +95,7 @@ import { interactionStyles } from "../lib/motion";
 import { uiStyles } from "../lib/ui/styles";
 import { bindAppearance, unbindAppearance } from "../lib/appearance";
 import { bindScrub } from "../lib/scrub";
+import { bindVehiclePicker, loadVehicleSelection, saveVehicleSelection, vehiclePickerHtml, vehicleRequest, VEHICLE_PICKER_CSS, type VehicleOption } from "../lib/vehicle-selection";
 import { profileSvg, profileStyles } from "./trip-profile";
 
 const CARD_VERSION = CARD_VERSIONS.trips;
@@ -296,6 +297,13 @@ class LeapmotorTripsCard extends LitElement {
   _center: [number, number] | null = null; // [lat, lon](显示坐标系 = GCJ-02)
   _built = false;
   _loaded = false; // 只自动拉一次; 之后靠刷新按钮
+  private _vehicleOptions: VehicleOption[] = [];
+  private _vehicleEntryId = "";
+  private _vehicleRequired = false;
+  private _vehicleLocked = false;
+  private _vehicleInitStarted = false;
+  private _vehicleGeneration = 0;
+  private _requestSeq = 0;
   _loading = false;
   _err = "";
   _trips: Trip[] = [];
@@ -348,6 +356,7 @@ class LeapmotorTripsCard extends LitElement {
   _mapStyle: string = "auto"; // auto 随 HA 主题 | vector | satellite | dark
   _group = true;
   _themeDark: boolean | undefined = undefined;
+  private _vehiclePickerHost!: HTMLElement;
 
   // 节点引用(命令式)
   _cardEl!: HTMLElement;
@@ -461,9 +470,9 @@ class LeapmotorTripsCard extends LitElement {
     }
     this._themeDark = dark;
     // 行程是低频数据(每段结束时才变), 不必跟着 hass 的每次状态更新重拉
-    if (!this._loaded) {
-      this._loaded = true;
-      this._load();
+    if (!this._vehicleInitStarted) {
+      this._vehicleInitStarted = true;
+      void this._initVehicleSelection();
     }
   }
   get hass(): HomeAssistant | null {
@@ -476,6 +485,53 @@ class LeapmotorTripsCard extends LitElement {
   }
 
   // ── 数据 ──
+  private async _initVehicleSelection(): Promise<void> {
+    const state = await loadVehicleSelection(this._hass, "trips", this._config, this);
+    this._vehicleOptions = state.vehicles;
+    this._vehicleEntryId = state.entryId;
+    this._vehicleRequired = state.required;
+    this._vehicleLocked = state.locked;
+    this._loaded = true;
+    if (this._vehicleRequired) this._err = "请先选择要查看的车辆";
+    this._render();
+    if (!this._vehicleRequired) void this._load();
+  }
+
+  private _vehicleSelector(): Record<string, string> {
+    return vehicleRequest(this._config, this._vehicleEntryId);
+  }
+
+  private _onVehicleChange(entryId: string): void {
+    if (entryId === this._vehicleEntryId) return;
+    this._vehicleEntryId = entryId;
+    this._vehicleRequired = this._vehicleOptions.length > 1 && !entryId;
+    this._vehicleGeneration++;
+    this._requestSeq++;
+    this._overlaySeq++;
+    this._thumbSeq++;
+    this._daySeq++;
+    this._loading = false;
+    this._trips = [];
+    this._stats = null;
+    this._months = [];
+    this._store = null;
+    this._active = null;
+    this._trackCache = {};
+    this._thumbCache = {};
+    this._thumbPrep = {};
+    this._dayPrep = {};
+    this._overlayTracks = [];
+    this._thumbTasks = [];
+    this._view = "list";
+    this._selectedId = "";
+    this._selTrip = null;
+    this._sel = null;
+    this._err = this._vehicleRequired ? "请先选择要查看的车辆" : "";
+    saveVehicleSelection("trips", this._config, entryId, this);
+    this._render();
+    if (entryId) void this._load();
+  }
+
   _errText(err: unknown): string {
     const code = String((err as any)?.code || "");
     const msg = String((err as any)?.message || err || "");
@@ -496,17 +552,20 @@ class LeapmotorTripsCard extends LitElement {
 
   async _load() {
     if (!this._hass || this._loading) return;
+    if (this._vehicleRequired) return;
     if (!this._hass.callWS) {
       this._err = "";                 // 拿不到 WS: 安静留空, 不再提示"需要 beta 版集成"
       this._render();
       return;
     }
     this._loading = true;
+    const requestSeq = ++this._requestSeq;
+    const vehicleGeneration = this._vehicleGeneration;
     this._err = "";
     this._render();
     try {
       // 时间窗口: 滚动窗口(days + 锚点)或整月(month)。服务端 limit 只是安全上限(一个月最多几十段)。
-      const req: Record<string, any> = { type: "leapmotor/trips/list", limit: 500 };
+      const req: Record<string, any> = { type: "leapmotor/trips/list", limit: 500, ...this._vehicleSelector() };
       if (this._winMode === "month" && this._winMonth) {
         req.month = this._winMonth;
       } else {
@@ -514,6 +573,7 @@ class LeapmotorTripsCard extends LitElement {
         if (this._winEnd) req.end = this._winEnd;
       }
       const res: any = await this._hass.callWS(req);
+      if (requestSeq !== this._requestSeq || vehicleGeneration !== this._vehicleGeneration) return;
       this._trips = (res && res.trips) || [];
       this._stats = (res && res.stats) || null;
       this._months = (res && res.months) || [];
@@ -537,6 +597,7 @@ class LeapmotorTripsCard extends LitElement {
       if (this._view === "detail" && this._selectedId) await this._openDetail(this._selectedId, true);
       if (this._overlayN > 0) await this._loadOverlay();
     } catch (err) {
+      if (requestSeq !== this._requestSeq || vehicleGeneration !== this._vehicleGeneration) return;
       this._loading = false;
       this._err = this._errText(err);
       this._render();
@@ -546,37 +607,43 @@ class LeapmotorTripsCard extends LitElement {
   /** 取一段行程的**全量**轨迹(详情大图用), 带缓存。 */
   async _ensureTrack(id: unknown): Promise<any[]> {
     if (this._trackCache[String(id)]) return this._trackCache[String(id)];
+    const vehicleGeneration = this._vehicleGeneration;
     let pts: any[] = [];
     try {
       const res: any = await this._hass!.callWS!({
         type: "leapmotor/trips/track",
         trip_id: id,
         max_points: 0,
+        ...this._vehicleSelector(),
       });
+      if (vehicleGeneration !== this._vehicleGeneration) return [];
       pts = (res && res.points) || [];
     } catch (err) {
       pts = [];
       if (!this._err) this._err = this._errText(err);
     }
-    this._trackCache[String(id)] = pts;
+    if (vehicleGeneration === this._vehicleGeneration) this._trackCache[String(id)] = pts;
     return pts;
   }
 
   /** 取一段行程的**降采样**轨迹(缩略图用, 只 80 点), 带缓存; 失败返回空数组。 */
   async _ensureThumbTrack(id: unknown): Promise<any[]> {
     if (this._thumbCache[String(id)]) return this._thumbCache[String(id)];
+    const vehicleGeneration = this._vehicleGeneration;
     let pts: any[] = [];
     try {
       const res: any = await this._hass!.callWS!({
         type: "leapmotor/trips/track",
         trip_id: id,
         max_points: THUMB_FETCH_POINTS,
+        ...this._vehicleSelector(),
       });
+      if (vehicleGeneration !== this._vehicleGeneration) return [];
       pts = (res && res.points) || [];
     } catch (err) {
       pts = [];
     }
-    this._thumbCache[String(id)] = pts;
+    if (vehicleGeneration === this._vehicleGeneration) this._thumbCache[String(id)] = pts;
     return pts;
   }
 
@@ -670,6 +737,7 @@ class LeapmotorTripsCard extends LitElement {
     const n = this._overlayN;
     if (!n) return;
     const seq = ++this._overlaySeq;
+    const vehicleGeneration = this._vehicleGeneration;
     // 叠加锚在**当前视图的结束时刻**: 看最近 30 天 = 截至现在; 看某个月 = 截至该月末。
     // 与"列表里正好显示哪几段"无关 —— 月初看当月时, 叠加照样能取到上个月的轨迹。
     const before = this._winAnchor();
@@ -677,6 +745,7 @@ class LeapmotorTripsCard extends LitElement {
     try {
       const res: any = await this._hass.callWS({
         type: "leapmotor/trips/tracks", limit: n, max_points: 400, before,
+        ...this._vehicleSelector(),
       });
       items = (res && res.tracks) || [];
     } catch (err) {
@@ -689,7 +758,7 @@ class LeapmotorTripsCard extends LitElement {
       }
       items = null;                     // 旧版集成: 退回"逐段拉全量"(下面的兼容路径)
     }
-    if (seq !== this._overlaySeq || this._overlayN !== n) return;   // 期间开关/刷新过
+    if (seq !== this._overlaySeq || this._overlayN !== n || vehicleGeneration !== this._vehicleGeneration) return;   // 期间切车/刷新过
     const out: OverlayTrack[] = [];
     if (items) {
       for (const item of items) {
@@ -755,6 +824,7 @@ class LeapmotorTripsCard extends LitElement {
       this._built = true;
     }
     this._renderHead();
+    this._renderVehiclePicker();
     this._renderActive();
     this._renderWinbar();
     this._renderWinsum();
@@ -940,6 +1010,13 @@ class LeapmotorTripsCard extends LitElement {
     this._sumEl.textContent = parts.join(" · ");
     if (this._refreshBtn) this._refreshBtn.classList.toggle("spin", this._loading);
     this._syncCollapseBtn();
+  }
+
+  private _renderVehiclePicker(): void {
+    if (!this._vehiclePickerHost) return;
+    this._vehiclePickerHost.innerHTML = vehiclePickerHtml(
+      this._vehicleOptions, this._vehicleEntryId, this._vehicleRequired, this._vehicleLocked);
+    bindVehiclePicker(this._vehiclePickerHost, (entryId) => this._onVehicleChange(entryId));
   }
 
   /** 列表里出现过的所有日期(天)。 */
@@ -2156,7 +2233,9 @@ class LeapmotorTripsCard extends LitElement {
     const btn = this._delPopEl ? this._delPopEl.querySelector<HTMLButtonElement>(".dpOk") : null;
     if (btn) btn.disabled = true;
     try {
-      await this._hass.callWS({ type: "leapmotor/trips/delete", trip_id: id });
+      const vehicleGeneration = this._vehicleGeneration;
+      await this._hass.callWS({ type: "leapmotor/trips/delete", trip_id: id, ...this._vehicleSelector() });
+      if (vehicleGeneration !== this._vehicleGeneration) return;
       delete this._trackCache[String(id)];
       delete this._thumbCache[String(id)];
       delete this._thumbPrep[String(id)];
@@ -2343,10 +2422,11 @@ class LeapmotorTripsCard extends LitElement {
     const h = this._config!.height;
     const listH = this._config!.list_height;
     this.shadowRoot!.innerHTML = `
-      <style>${this._css(h, listH)}</style>
+      <style>${this._css(h, listH)}${VEHICLE_PICKER_CSS}</style>
       <div class="card">
         <div class="head">
           <span class="title">行程</span>
+          <div class="vehiclePickerHost"></div>
           <span class="sum sub"></span>
           <span class="spacer"></span>
           <button class="collapseAll" title="全部收起 / 展开"><ha-icon icon="mdi:unfold-less-horizontal"></ha-icon></button>
@@ -2433,6 +2513,7 @@ class LeapmotorTripsCard extends LitElement {
 
     this._cardEl = this.shadowRoot!.querySelector(".card")!;
     this._sumEl = this.shadowRoot!.querySelector(".head .sum")!;
+    this._vehiclePickerHost = this.shadowRoot!.querySelector(".vehiclePickerHost")!;
     this._refreshBtn = this.shadowRoot!.querySelector(".head .refresh")!;
     this._collapseBtn = this.shadowRoot!.querySelector(".head .collapseAll")!;
     this._activeEl = this.shadowRoot!.querySelector(".active")!;
@@ -2487,6 +2568,7 @@ class LeapmotorTripsCard extends LitElement {
       ev.stopPropagation();
       this._load();
     });
+    bindVehiclePicker(this._vehiclePickerHost, (entryId) => this._onVehicleChange(entryId));
     // 时间窗口: 分段(7/30/90 天) / 月份弹层 / 翻页箭头
     // 时间窗口: 分段(7/30/90 天) / 月份弹层 / 翻页箭头。
     // 翻页箭头在下面那行(.winsum)里, 所以两个容器都要挂同一个委托处理。

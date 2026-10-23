@@ -2128,6 +2128,55 @@ for (const name of CARDS) {
       await new Promise((r) => setTimeout(r, 40));
     } else fail(`control: 设置卡没有弹窗入口(data-act=car3dmenu)`);
 
+    // 商城目录不等实车匹配；迟到响应不覆盖手选车型。
+    {
+      const h = car3dHass(true, "");
+      const normalWS = h.callWS;
+      let finishActual;
+      h.callWS = msg => msg.type === 'leapmotor/car3d/market-pictures' && !msg.model
+        ? new Promise(resolve => { finishActual = resolve; }) : normalWS(msg);
+      const e = await mkCar3dEl(h);
+      e._loadCar2dPictures(true);
+      await new Promise(resolve => setTimeout(resolve, 30));
+      if (e._marketCatalogLoading || e._marketModels.length !== 2 || !e._marketPicturesLoading)
+        fail('control: 实车匹配未返回时商城目录仍被阻塞');
+      else ok('control: 商城目录先显示，不等待实车图片匹配');
+      e._selectCar2dModel('C16');
+      await new Promise(resolve => setTimeout(resolve, 40));
+      finishActual({ model: 'C10', year: '2026', energy: '纯电', edition: '660版', pictures: [] });
+      await new Promise(resolve => setTimeout(resolve, 25));
+      if (e._marketSelectedModel !== 'C16' || e._marketPicturesLoading || e._car3dPrefs.market2dModel !== 'C16')
+        fail('control: 迟到的实车匹配覆盖了手选商城车型');
+      else ok('control: 迟到的实车匹配不会覆盖手选车型');
+      e.remove();
+    }
+    // 用短计时器触发生产超时路径，不实际等待 30 秒。
+    {
+      const h = car3dHass(true, "");
+      const e = await mkCar3dEl(h);
+      const normalWS = h.callWS;
+      const lateReplies = [];
+      h.callWS = msg => msg.type.startsWith('leapmotor/car3d/market-')
+        ? new Promise(resolve => lateReplies.push(resolve)) : normalWS(msg);
+      const originalTimeout = globalThis.setTimeout;
+      globalThis.setTimeout = (fn, delay, ...args) => originalTimeout(fn, delay === 30000 ? 1 : delay, ...args);
+      try { e._loadCar2dPictures(true); }
+      finally { globalThis.setTimeout = originalTimeout; }
+      await new Promise(resolve => setTimeout(resolve, 25));
+      lateReplies.forEach(resolve => resolve({ models: [{ name: '迟到车型' }] }));
+      await new Promise(resolve => setTimeout(resolve, 20));
+      if (e._marketCatalogLoading || e._marketPicturesLoading || !e._marketPicturesError.includes('超时') || e._marketModels.length)
+        fail('control: 商城超时后仍在等待或迟到响应覆盖了超时状态');
+      else ok('control: 商城超时结束等待，迟到响应被忽略');
+      h.callWS = normalWS;
+      e._loadCar2dPictures(true);
+      await new Promise(resolve => setTimeout(resolve, 45));
+      if (e._marketPicturesLoading || e._marketPicturesError || e._marketModels.length !== 2)
+        fail('control: 商城超时后无法重新读取');
+      else ok('control: 商城超时后可重新读取');
+      e.remove();
+    }
+
     // 未装配: 不建 iframe、不联网; 只有下载入口; 点一下才 ensure(且只有一次)
     const el7 = await mkCar3dEl(car3dHass(false, ""));
     if(el7.shadowRoot.querySelector('.carSvg')) fail('control: 无素材时仍显示 car_svg 回退');

@@ -1,4 +1,7 @@
 import sys
+import io
+import ssl
+from threading import Barrier
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -14,6 +17,43 @@ from market_picture import (  # noqa: E402
     fetch_market_variants,
     picture_from_product,
 )
+import market_picture  # noqa: E402
+
+
+def test_market_reads_reuse_ipv4_first_transport_and_cache(monkeypatch):
+    calls = []
+
+    class Opener:
+        def open(self, url, *, timeout):
+            calls.append((url, timeout))
+            return io.BytesIO(b'{"data": {"carType": "C10"}}')
+
+    def build(context):
+        assert context.check_hostname
+        assert context.verify_mode == ssl.CERT_REQUIRED
+        return Opener()
+
+    monkeypatch.setattr(market_picture, "_build_opener", build)
+    market_picture._read.cache_clear()
+    try:
+        url = market_picture.MARKET_BASE + "/mallResourceConfig/getByCode?code=C10"
+        assert market_picture._read(url, 1) == {"data": {"carType": "C10"}}
+        assert market_picture._read(url, 1) == {"data": {"carType": "C10"}}
+        assert calls == [(url, 12)]
+    finally:
+        market_picture._read.cache_clear()
+
+
+def test_legacy_catalog_lookups_run_concurrently_and_preserve_model_order(monkeypatch):
+    ready = Barrier(len(market_picture.LEGACY_MODEL_ALIASES))
+
+    def variants(model, read, catalog):
+        ready.wait(timeout=5)
+        return ([{"id": model}] if model != "S01" else []), True
+
+    monkeypatch.setattr(market_picture, "_variants_for_model", variants)
+    result = fetch_market_catalog(read=lambda _url: {"carIntroduction": []})
+    assert [row["name"] for row in result["models"]] == ["C01", "T03", "Lafa5"]
 
 
 CAT = {"carIntroduction": [{

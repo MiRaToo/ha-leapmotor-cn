@@ -8,6 +8,7 @@ import { CARD_VERSIONS } from "../lib/version";
 import { isDark } from "../lib/theme";
 import { bindAppearance, unbindAppearance } from "../lib/appearance";
 import { uiStyles } from "../lib/ui/styles";
+import { loadVehicleSelection, saveVehicleSelection, vehicleRequest, type VehicleOption } from "../lib/vehicle-selection";
 
 const VERSION = CARD_VERSIONS.metrics;
 const PREF = "leapmotor.custom-card.v3.";
@@ -115,6 +116,9 @@ class LeapmotorMetricsCard extends LitElement {
     button{font:inherit;color:inherit;cursor:pointer;}
     .remove,.add,.done{display:grid;place-items:center;border:0;color:inherit;background:var(--lm-surface-control,var(--card-background-color,#fff));box-shadow:var(--lm-shadow-control,0 1px 5px #0002);}
     .editingBar{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin:0 0 8px;color:var(--secondary-text-color,#6b7280);font-size:10px;}
+    .vehicleBar{display:flex;align-items:center;gap:7px;margin:0 0 8px;color:var(--secondary-text-color,#6b7280);font-size:11px;}
+    .vehicleBar select{max-width:240px;min-width:130px;border:1px solid var(--divider-color,rgba(120,130,145,.24));border-radius:10px;padding:6px 9px;background:var(--lm-surface-control,var(--card-background-color,#fff));color:var(--primary-text-color,inherit);font:inherit;}
+    .vehicleHint{margin:0 0 8px;color:var(--secondary-text-color,#6b7280);font-size:11px;}
     .editingBar span{margin-right:auto;}
     .done{min-height:28px;padding:4px 10px;border-radius:999px;background:var(--lm-accent,var(--primary-color,#03a9f4));color:var(--text-primary-color,#fff);}
     .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;}
@@ -164,6 +168,12 @@ class LeapmotorMetricsCard extends LitElement {
   private _registryVin = "";
   private _registryLoading = false;
   private _registryAttemptAt = 0;
+  private _vehicleOptions: VehicleOption[] = [];
+  private _vehicleEntryId = "";
+  private _vehicleRequired = false;
+  private _vehicleLocked = false;
+  private _vehicleInitStarted = false;
+  private _selectionGeneration = 0;
   private _pointerId: number | null = null;
   private _pointerOrigin: { x: number; y: number } | null = null;
   private _activeTileId = "";
@@ -175,6 +185,12 @@ class LeapmotorMetricsCard extends LitElement {
   set hass(value: HomeAssistant | null) {
     this._hass = value;
     this.requestUpdate();
+    if (!this._vehicleInitStarted) {
+      this._vehicleInitStarted = true;
+      void this._initVehicleSelection();
+      return;
+    }
+    if (this._vehicleRequired) return;
     this._maybeLoadRegistry();
     this._maybeLoadTripStats();
     this._maybeLoadTodayEnergy();
@@ -184,6 +200,12 @@ class LeapmotorMetricsCard extends LitElement {
   setConfig(config: LovelaceCardConfig): void {
     if (!config || config.type !== "custom:leapmotor-metrics") throw new Error("需要 custom:leapmotor-metrics 配置");
     this._config = config;
+    this._vehicleInitStarted = false;
+    this._vehicleOptions = [];
+    this._vehicleEntryId = "";
+    this._vehicleRequired = false;
+    this._vehicleLocked = false;
+    this._selectionGeneration++;
     this._prefIdentity = "";
     if (this.isConnected) this._loadPreferences();
     this._tripStats = null;
@@ -193,9 +215,10 @@ class LeapmotorMetricsCard extends LitElement {
     this._registryEntityIds = null;
     this._registryVin = "";
     this._registryAttemptAt = 0;
-    this._maybeLoadRegistry();
-    this._maybeLoadTripStats();
-    this._maybeLoadTodayEnergy();
+    if (this._hass) {
+      this._vehicleInitStarted = true;
+      void this._initVehicleSelection();
+    }
   }
 
   connectedCallback(): void {
@@ -215,7 +238,10 @@ class LeapmotorMetricsCard extends LitElement {
   }
 
   private _loadPreferences(): void {
-    const device = String(this._config.device || "default").toLowerCase().replace(/[^a-z0-9_-]/g, "_");
+    const selectedVehicle = this._vehicleOptions.find(item => item.entry_id === this._vehicleEntryId);
+    const selectionKey = this._vehicleOptions.length > 1 ? (selectedVehicle?.device_id || selectedVehicle?.vin) : "";
+    const device = String(this._config.device || selectionKey || "default")
+      .toLowerCase().replace(/[^a-z0-9_-]/g, "_");
     const explicit = configIdentity(this._config);
     const cards = metricCardsInDocument();
     let identity: string;
@@ -252,24 +278,95 @@ class LeapmotorMetricsCard extends LitElement {
     this.requestUpdate();
   }
 
-  private _maybeLoadRegistry(): void {
-    const hass = this._hass;
-    if (!hass?.callWS || !this._config.device || this._registryLoading || Date.now() - this._registryAttemptAt < 300_000) return;
-    this._registryAttemptAt = Date.now();
-    this._registryLoading = true;
-    void this._loadRegistry(hass);
+  private async _initVehicleSelection(): Promise<void> {
+    const generation = this._selectionGeneration;
+    const state = await loadVehicleSelection(this._hass, "metrics", this._config, this);
+    if (generation !== this._selectionGeneration) return;
+    this._vehicleOptions = state.vehicles;
+    this._vehicleEntryId = state.entryId;
+    this._vehicleRequired = state.required;
+    this._vehicleLocked = state.locked;
+    this._selectionGeneration++;
+    this._registryEntityIds = null;
+    this._registryVin = "";
+    this._registryAttemptAt = 0;
+    this._tripStats = null;
+    this._todayEnergy = null;
+    this._tripStatsAttemptAt = 0;
+    this._todayEnergyAttemptAt = 0;
+    this._loadPreferences();
+    this.requestUpdate();
+    if (!this._vehicleRequired) {
+      this._maybeLoadRegistry();
+      this._maybeLoadTripStats();
+      this._maybeLoadTodayEnergy();
+    }
   }
 
-  private async _loadRegistry(hass: HomeAssistant): Promise<void> {
+  private _onVehicleChange(entryId: string): void {
+    if (this._vehicleLocked) return;
+    this._vehicleEntryId = entryId;
+    this._vehicleRequired = this._vehicleOptions.length > 1 && !entryId;
+    saveVehicleSelection("metrics", this._config, entryId, this);
+    this._selectionGeneration++;
+    this._registryEntityIds = null;
+    this._registryVin = "";
+    this._registryLoading = false;
+    this._registryAttemptAt = 0;
+    this._tripStats = null;
+    this._tripStatsLoading = false;
+    this._tripStatsAttemptAt = 0;
+    this._todayEnergy = null;
+    this._todayEnergyLoading = false;
+    this._todayEnergyAttemptAt = 0;
+    this._loadPreferences();
+    this.requestUpdate();
+    if (!this._vehicleRequired) {
+      this._maybeLoadRegistry();
+      this._maybeLoadTripStats();
+      this._maybeLoadTodayEnergy();
+    }
+  }
+
+  private _vehicleSelector(): Record<string, string> {
+    return vehicleRequest(this._config, this._vehicleEntryId);
+  }
+
+  private _selectedVehicle(): VehicleOption | undefined {
+    const config = this._config as Record<string, unknown>;
+    const explicitVin = String(config.vin || "").toUpperCase();
+    const explicitEntry = String(config.entry_id || this._vehicleEntryId || "");
+    const explicitDevice = String(config.device_id || "");
+    const legacyDevice = String(config.device || "");
+    const explicitEntity = String(config.entity_id || "");
+    return this._vehicleOptions.find(item => item.entry_id === explicitEntry ||
+      (explicitVin && item.vin.toUpperCase() === explicitVin) ||
+      (explicitDevice && item.device_id === explicitDevice) ||
+      (legacyDevice && (item.device_id === legacyDevice || item.tracker_entity_id === legacyDevice)) ||
+      (explicitEntity && item.tracker_entity_id === explicitEntity));
+  }
+
+  private _maybeLoadRegistry(): void {
+    const hass = this._hass;
+    if (!hass?.callWS || this._vehicleRequired || this._registryLoading ||
+        (!this._config.device && !this._config.entity_id && !this._selectedVehicle() && !this._vehicleEntryId) ||
+        Date.now() - this._registryAttemptAt < 300_000) return;
+    this._registryAttemptAt = Date.now();
+    this._registryLoading = true;
+    void this._loadRegistry(hass, this._selectionGeneration);
+  }
+
+  private async _loadRegistry(hass: HomeAssistant, generation: number): Promise<void> {
     try {
       const callWS = hass.callWS?.bind(hass);
       if (!callWS) return;
       const entries = await callWS<any[]>({ type: "config/entity_registry/list" });
       if (!Array.isArray(entries)) return;
-      const device = String(this._config.device || "");
+      const device = String(this._config.device || this._config.entity_id || "");
       const selected = entries.find((entry: any) => entry.entity_id === device);
-      let deviceId = selected?.device_id ? String(selected.device_id) : (!device.includes(".") ? device : "");
-      let vin = String(this._config.vin || this._registryVin || "");
+      const vehicle = this._selectedVehicle();
+      let deviceId = String(vehicle?.device_id || selected?.device_id || (!device.includes(".") ? device : ""));
+      let vin = String(this._config.vin || vehicle?.vin || this._registryVin || "");
       if (!vin && /^[A-HJ-NPR-Z0-9]{17}$/i.test(device)) vin = device;
       const uniqueId = String(selected?.unique_id || "");
       if (!vin) vin = uniqueId.match(/^([^_]+)_[^_]+$/)?.[1] || "";
@@ -284,37 +381,43 @@ class LeapmotorMetricsCard extends LitElement {
       }
       const owned = entries.filter((entry: any) => (deviceId && entry.device_id === deviceId) ||
         (vin && String(entry.unique_id || "").startsWith(vin + "_")));
-      if (owned.length) this._registryEntityIds = new Set(owned.map((entry: any) => String(entry.entity_id)));
-      if (vin) this._registryVin = vin;
+      if (generation === this._selectionGeneration && this._hass === hass) {
+        if (owned.length) this._registryEntityIds = new Set(owned.map((entry: any) => String(entry.entity_id)));
+        if (vin) this._registryVin = vin;
+      }
     } catch { /* 注册表不可读时仍可按实体名前缀显示本车状态 */ }
     finally {
-      this._registryLoading = false;
-      this.requestUpdate();
-      this._maybeLoadTripStats();
-      this._maybeLoadTodayEnergy();
+      if (generation === this._selectionGeneration) {
+        this._registryLoading = false;
+        this.requestUpdate();
+        this._maybeLoadTripStats();
+        this._maybeLoadTodayEnergy();
+      }
     }
   }
 
   private _maybeLoadTripStats(): void {
     const hass = this._hass;
-    if (!hass?.callWS || this._tripStatsLoading || (this._config.device && this._registryLoading) ||
+    if (!hass?.callWS || this._vehicleRequired || this._tripStatsLoading ||
+        ((this._config.device || this._vehicleEntryId) && this._registryLoading) ||
         Date.now() - this._tripStatsAttemptAt < 300_000) return;
     this._tripStatsAttemptAt = Date.now();
     this._tripStatsLoading = true;
-    void this._loadTripStats(hass);
+    void this._loadTripStats(hass, this._selectionGeneration);
   }
 
-  private async _loadTripStats(hass: HomeAssistant): Promise<void> {
+  private async _loadTripStats(hass: HomeAssistant, generation: number): Promise<void> {
     try {
       const callWS = hass.callWS?.bind(hass);
       if (!callWS) return;
-      const device = String(this._config.device || "");
-      const vin = String(this._config.vin || this._registryVin ||
-        (/^[A-HJ-NPR-Z0-9]{17}$/i.test(device) ? device : ""));
-      const result = await callWS<any>({ type: "leapmotor/trips/list", limit: 1, ...(vin ? { vin } : {}) });
-      if (this._hass === hass) this._tripStats = result?.stats || null;
+      const result = await callWS<any>({ type: "leapmotor/trips/list", limit: 1, ...this._vehicleSelector() });
+      const expectedVin = this._config.vin || this._selectedVehicle()?.vin || this._registryVin;
+      if (generation === this._selectionGeneration && this._hass === hass &&
+          (!expectedVin || !result?.vin || String(result.vin).toUpperCase() === String(expectedVin).toUpperCase())) {
+        this._tripStats = result?.stats || null;
+      }
     } catch { /* 没有行程命令的旧版集成仍能展示可用实体 */ }
-    finally { this._tripStatsLoading = false; this.requestUpdate(); }
+    finally { if (generation === this._selectionGeneration) { this._tripStatsLoading = false; this.requestUpdate(); } }
   }
 
   private _needsTodayEnergy(): boolean {
@@ -325,28 +428,34 @@ class LeapmotorMetricsCard extends LitElement {
   private _maybeLoadTodayEnergy(): void {
     const hass = this._hass;
     if (!this._needsTodayEnergy() || !hass?.callWS || this._todayEnergyLoading ||
-        (this._config.device && this._registryLoading) || Date.now() - this._todayEnergyAttemptAt < 300_000) return;
+        this._vehicleRequired || ((this._config.device || this._vehicleEntryId) && this._registryLoading) ||
+        Date.now() - this._todayEnergyAttemptAt < 300_000) return;
     this._todayEnergyAttemptAt = Date.now();
     this._todayEnergyLoading = true;
-    void this._loadTodayEnergy(hass);
+    void this._loadTodayEnergy(hass, this._selectionGeneration);
   }
 
-  private async _loadTodayEnergy(hass: HomeAssistant): Promise<void> {
+  private async _loadTodayEnergy(hass: HomeAssistant, generation: number): Promise<void> {
     try {
       const callWS = hass.callWS?.bind(hass);
       if (!callWS) return;
-      const device = String(this._config.device || "");
-      const vin = String(this._config.vin || this._registryVin ||
-        (/^[A-HJ-NPR-Z0-9]{17}$/i.test(device) ? device : ""));
-      const result = await callWS<any>({ type: "leapmotor/energy/daily", days: 1, ...(vin ? { vin } : {}) });
-      if (this._hass === hass) this._todayEnergy = Array.isArray(result?.days) ? result.days[0] || null : null;
+      const result = await callWS<any>({ type: "leapmotor/energy/daily", days: 1, ...this._vehicleSelector() });
+      const expectedVin = this._config.vin || this._selectedVehicle()?.vin || this._registryVin;
+      if (generation === this._selectionGeneration && this._hass === hass &&
+          (!expectedVin || !result?.vin || String(result.vin).toUpperCase() === String(expectedVin).toUpperCase())) {
+        this._todayEnergy = Array.isArray(result?.days) ? result.days[0] || null : null;
+      }
     } catch { /* 行程统计或 HA 实体仍可作为回退数据源 */ }
-    finally { this._todayEnergyLoading = false; this.requestUpdate(); }
+    finally { if (generation === this._selectionGeneration) { this._todayEnergyLoading = false; this.requestUpdate(); } }
   }
 
   private _sensorPrefix(): string {
     const states = this._hass?.states || {};
-    const configured = String(this._config.device || "");
+    if (this._vehicleRequired) return "";
+    if (this._vehicleOptions.length === 1 && !this._vehicleEntryId && !this._vehicleOptions[0].available) return "";
+    const device = String(this._config.device || this._config.entity_id || "");
+    const configured = device.includes(".") ? device : String(
+      this._selectedVehicle()?.vin || this._config.vin || device);
     const ids = this._registryEntityIds ? [...this._registryEntityIds] : Object.keys(states);
     let chosen = configured && states[configured] ? configured : "";
     if (!chosen && configured.includes(".")) {
@@ -354,7 +463,12 @@ class LeapmotorMetricsCard extends LitElement {
       const prefix = objectId.replace(/_(?:jin_7tian_li_cheng|mileage_7d|dian_liang|battery|xu_hang|range)$/i, "_");
       if (prefix !== objectId) return configured.slice(0, configured.indexOf(".")) + "." + prefix;
     }
-    if (!chosen && configured) chosen = ids.find(id => id.startsWith(configured) || id.endsWith("_" + configured)) || "";
+    if (!chosen && configured) chosen = ids.find(id => {
+      const dot = id.indexOf(".");
+      const objectId = dot >= 0 ? id.slice(dot + 1) : id;
+      return objectId.startsWith(configured + "_") || id.endsWith("_" + configured);
+    }) || "";
+    if (!chosen && this._vehicleOptions.length > 1) return "";
     if (!chosen) chosen = ids.find(id => id.startsWith("sensor.") && (id.endsWith("_dian_liang") || id.endsWith("_battery"))) || "";
     if (!chosen) return "";
     const suffix = chosen.match(/^(.*)_(?:jin_7tian_li_cheng|mileage_7d|dian_liang|battery|xu_hang|range)$/i);
@@ -635,7 +749,11 @@ class LeapmotorMetricsCard extends LitElement {
   protected render(): TemplateResult {
     const available = this._available();
     const shown = this._selected.map(id => this._selectedMetric(id)).filter((m): m is MetricDef => !!m);
-    return html`<main class="card">${this._editing ? html`<div class="editingBar"><span>拖动子卡可调整顺序</span><button class="done" @click=${() => this._finishEdit()}>完成</button></div>` : nothing}<section class="grid" aria-label="自定义卡">${shown.map(m => this._tile(m))}${this._editing ? html`<button class="add" aria-label="新增数据" title="新增数据" @click=${() => { this._picker = true; this.requestUpdate(); }}><ha-icon icon="mdi:plus"></ha-icon></button>` : shown.length ? nothing : html`<button class="add" @click=${() => { this._editing = true; this._picker = true; this.requestUpdate(); }}><ha-icon icon="mdi:plus"></ha-icon></button>`}</section></main>${this._pickerView(available)}`;
+    const selected = this._selectedVehicle();
+    const picker = this._vehicleOptions.length > 1 && !this._vehicleLocked
+      ? html`<label class="vehicleBar"><span>车辆</span><select .value=${this._vehicleEntryId} @change=${(event: Event) => this._onVehicleChange((event.currentTarget as HTMLSelectElement).value)}><option value="">${this._vehicleRequired ? "请选择车辆" : "切换车辆"}</option>${this._vehicleOptions.map(vehicle => html`<option value=${vehicle.entry_id} ?disabled=${!vehicle.available}>${vehicle.name || `${vehicle.car_type || "零跑"} · ${vehicle.vin.slice(-6)}`}${vehicle.ownership === "shared" ? " · 共享" : vehicle.ownership === "owner" ? " · 自有" : ""}${vehicle.available ? "" : "（未加载）"}</option>`)}</select></label>`
+      : nothing;
+    return html`<main class="card">${picker}${this._vehicleRequired ? html`<p class="vehicleHint">当前账号配置了多辆车，请先选择这张卡片要显示的车辆。</p>` : nothing}${!this._vehicleRequired && selected && !selected.available ? html`<p class="vehicleHint">所选车辆尚未加载，请检查集成状态。</p>` : nothing}${this._editing ? html`<div class="editingBar"><span>拖动子卡可调整顺序</span><button class="done" @click=${() => this._finishEdit()}>完成</button></div>` : nothing}${this._vehicleRequired ? nothing : html`<section class="grid" aria-label="自定义卡">${shown.map(m => this._tile(m))}${this._editing ? html`<button class="add" aria-label="新增数据" title="新增数据" @click=${() => { this._picker = true; this.requestUpdate(); }}><ha-icon icon="mdi:plus"></ha-icon></button>` : shown.length ? nothing : html`<button class="add" @click=${() => { this._editing = true; this._picker = true; this.requestUpdate(); }}><ha-icon icon="mdi:plus"></ha-icon></button>`}</section>`}</main>${this._pickerView(available)}`;
   }
 }
 

@@ -5,10 +5,16 @@ its product APIs. We use the current V4 feed first, then the legacy product
 feed for older model years and models omitted from the home-page carousel.
 """
 from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
 import re
+import ssl
 import time
 from urllib.parse import urlsplit, parse_qs, urlencode
-from urllib.request import urlopen
+
+if __package__:
+    from .api import _build_opener
+else:  # Standalone diagnostics/tests can load this HA-independent module.
+    from api import _build_opener
 
 CATALOG_URL = "https://ueapp.oss-cn-hangzhou.aliyuncs.com/nativeApp/loveCar/love_car_default_header.txt"
 MARKET_BASE = "https://carod-center.leapmotor.cn"
@@ -37,7 +43,10 @@ KNOWN_BEV_MODELS = {"A05", "A10", "B01", "B10", "T03", "LAFA5"}
 
 @lru_cache(maxsize=256)
 def _read(url, bucket):
-    with urlopen(url, timeout=12) as response:
+    # Reuse the client's IPv4-first dialing without changing global DNS/socket
+    # behavior. Two unreachable AAAA records otherwise cost 12 seconds each.
+    opener = _build_opener(ssl.create_default_context())
+    with opener.open(url, timeout=12) as response:
         import json
         return json.loads(response.read(4_000_000))
 
@@ -369,10 +378,15 @@ def fetch_market_catalog(read=None):
         catalog = {}
     models = catalogue_models(catalog)
     seen = {item["name"].casefold() for item in models}
-    for name in LEGACY_MODEL_ALIASES:
-        if name.casefold() in seen:
-            continue
-        variants, _ = _variants_for_model(name, read, catalog)
+    missing = [name for name in LEGACY_MODEL_ALIASES if name.casefold() not in seen]
+    # These public aliases are independent. Keep the result order stable while
+    # ensuring one unavailable legacy provider does not delay every other model.
+    def lookup(name):
+        return _variants_for_model(name, read, catalog)[0]
+
+    with ThreadPoolExecutor(max_workers=max(1, len(missing))) as executor:
+        results = list(executor.map(lookup, missing))
+    for name, variants in zip(missing, results):
         if variants:
             models.append({"name": name, "code": name})
             seen.add(name.casefold())

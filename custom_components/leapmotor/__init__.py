@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 from homeassistant.config_entries import ConfigEntry
@@ -32,12 +33,12 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 # 前端模块: 把 www/ 下的六张卡片注册成全局卡片(用户无需手动放 www/ 或配资源)。
 # CARD_VERSION 与各自 JS 文件头里的同名常量保持一致(改 JS 记得一起升, 好让浏览器拿到新文件)。
-CARD_VERSION = "1.6.20"           # leapmotor-map.js
-TRIPS_CARD_VERSION = "1.6.27"     # leapmotor-trips.js
-CONTROL_CARD_VERSION = "1.9.75"   # leapmotor-control.js
-ENERGY_CARD_VERSION = "1.4.15"    # leapmotor-energy.js
-LASTWEEK_CARD_VERSION = "1.1.21"  # leapmotor-lastweek.js
-METRICS_CARD_VERSION = "1.0.8"    # leapmotor-metrics.js
+CARD_VERSION = "1.6.21"           # leapmotor-map.js
+TRIPS_CARD_VERSION = "1.6.28"     # leapmotor-trips.js
+CONTROL_CARD_VERSION = "1.9.77"   # leapmotor-control.js
+ENERGY_CARD_VERSION = "1.4.16"    # leapmotor-energy.js
+LASTWEEK_CARD_VERSION = "1.1.22"  # leapmotor-lastweek.js
+METRICS_CARD_VERSION = "1.0.9"    # leapmotor-metrics.js
 _CARDS = (
     ("leapmotor-map.js", CARD_VERSION),
     ("leapmotor-trips.js", TRIPS_CARD_VERSION),
@@ -47,6 +48,8 @@ _CARDS = (
     ("leapmotor-metrics.js", METRICS_CARD_VERSION),
 )
 _FRONTEND_KEY = "_frontend_registered"
+_SYNC_ARCHIVE_KEY = "_sync_archive_v1"
+_SYNC_ARCHIVE_STOP_KEY = "_sync_archive_stop_v1"
 
 # ── 卡片"可启动窗口"投递 ──────────────────────────────
 # 症状: 卡片"经常"显示「配置错误 / Custom element doesn't exist」, 刷新后又正常。
@@ -224,6 +227,50 @@ async def _ensure_lovelace_resource(hass: HomeAssistant, url: str) -> None:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = LeapmotorCoordinator(hass, entry)
+    # Shared independent archive; its own single worker serializes every SQLite operation.
+    data = hass.data.setdefault(DOMAIN, {})
+    archive = data.get(_SYNC_ARCHIVE_KEY)
+    if archive is None:
+        from .sync_archive import SyncArchive
+        archive = SyncArchive(hass.config.path(".storage", "leapmotor_sync_v1.sqlite"))
+        data[_SYNC_ARCHIVE_KEY] = archive
+        try:
+            await hass.async_add_executor_job(archive.run, "open")
+        except Exception as err:  # archive is optional to HA operation
+            archive.error = type(err).__name__
+            log.warning("原始同步档案未就绪(车况与控车继续): %s", type(err).__name__)
+    if not data.get(_SYNC_ARCHIVE_STOP_KEY):
+        from homeassistant.core import Event
+        async def _close_sync_archive(_event: Event) -> None:
+            try:
+                active_ids = {item.sync_vehicle_id for item in data.values()
+                              if getattr(item, "sync_archive", None) is archive
+                              and getattr(item, "sync_vehicle_id", "")}
+                await hass.async_add_executor_job(archive.run, "add_stop_events", active_ids)
+            except Exception as err:  # noqa: BLE001
+                log.warning("记录同步停止事实失败: %s", type(err).__name__)
+            try:
+                await hass.async_add_executor_job(archive.run, "close")
+                await hass.async_add_executor_job(archive.shutdown)
+            except Exception as err:  # noqa: BLE001
+                log.warning("关闭原始同步档案失败: %s", type(err).__name__)
+        hass.bus.async_listen_once("homeassistant_stop", _close_sync_archive)
+        data[_SYNC_ARCHIVE_STOP_KEY] = True
+    coordinator.sync_archive = archive
+    if archive.ready:
+        try:
+            coordinator.sync_vehicle_id = await hass.async_add_executor_job(
+                archive.run, "ensure_vehicle", coordinator.vin,
+                str(entry.data.get("car_nickname") or ""), entry.entry_id, "")
+        except Exception as err:  # archive is optional to HA operation
+            archive.ready = False
+            archive.error = type(err).__name__
+            log.warning("原始同步车辆登记失败(车况与控车继续): %s", type(err).__name__)
+    if archive.ready:
+        try:
+            await hass.async_add_executor_job(archive.run,"add_capture_event",coordinator.sync_vehicle_id,
+                {"event":"collector_started","occurred_at_ms":int(time.time()*1000),"origin":"leapmotor_cloud","request_result":"collector ready","sampling_interval_seconds":int(coordinator.update_interval.total_seconds()) if coordinator.update_interval else DEFAULT_POLL_SECONDS})
+        except Exception as err: log.warning("同步采集启动事实写入失败: %s",type(err).__name__)
     # 先亮出上次的里程/能耗/配置/照片地址快照: HA 重启后这些"变化慢"的传感器不该有一段时间
     # 是 unknown(首轮是轻量刷新, 重数据要到下一轮才拉; 见 light_first_refresh)。
     await coordinator.async_load_heavy()
@@ -273,12 +320,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                              timezone=hass.config.time_zone)
     await charges.async_load()
     coordinator.charges = charges
+    if archive.ready:
+        migration = hass.async_create_background_task(
+            _async_import_sync_history(hass, coordinator), "leapmotor raw history migration")
+        entry.async_on_unload(migration.cancel)
     from .fuel_daily import FuelDayRecorder
     fuel_days = FuelDayRecorder(hass, coordinator.vin, hass.config.time_zone)
     await fuel_days.async_load()
     coordinator.fuel_days = fuel_days
     if coordinator.state is not None:
         charges.process(coordinator.state)
+        await coordinator._sync_associate_live_record("charge", time.time())
     _register_ws_api(hass)
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
@@ -293,6 +345,39 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return True
 
 
+async def _async_import_sync_history(hass: HomeAssistant, coordinator) -> None:
+    """Import retained history without delaying existing entities or changing old Stores."""
+    from .trips import COORDS_VERSION
+    archive, vid = coordinator.sync_archive, coordinator.sync_vehicle_id
+    recorder, charges = coordinator.trips, coordinator.charges
+    try:
+        await hass.async_add_executor_job(archive.run, "set_migration_status", vid, "pending")
+        active = recorder.active
+        history = ([active] if active else []) + list(recorder.trips)
+        for trip in history:
+            if trip is active:
+                track = list(recorder._points)
+            else:
+                track = await recorder.track(trip.id, 0) if trip.point_count and not trip.track_dropped else []
+            await hass.async_add_executor_job(archive.run, "import_legacy", vid, "trip", trip.id, track,
+                {"started_at":trip.started_at or None,"ended_at":trip.ended_at or None,
+                 "recording":trip is active,"partial":trip.frozen or trip.approx_time,
+                 "track_dropped":trip.track_dropped,"coordinate_version":COORDS_VERSION})
+        for session in list(charges.sessions):
+            samples, socs = session.get("power_samples", []), session.get("soc_samples", [])
+            points = [[row[0], socs[i] if i<len(socs) else None] for i,row in enumerate(samples)]
+            await hass.async_add_executor_job(archive.run, "import_legacy", vid, "charge",
+                str(session.get("id") or ""), points,
+                {"started_at":session.get("started_at"),"ended_at":session.get("ended_at"),"partial":session.get("partial")})
+        await hass.async_add_executor_job(archive.run, "set_migration_status", vid, "complete")
+    except Exception as err:
+        try:
+            await hass.async_add_executor_job(archive.run, "set_migration_status", vid, "partial")
+        except Exception:
+            pass
+        log.warning("旧历史同步迁移未完成(保留旧记录并下次重试): %s", type(err).__name__)
+
+
 def _register_ws_api(hass: HomeAssistant) -> None:
     """注册给前端卡片用的 WebSocket 命令(幂等)。"""
     try:
@@ -305,5 +390,18 @@ def _register_ws_api(hass: HomeAssistant) -> None:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if ok:
+        coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+        if coordinator is not None:
+            archive = getattr(coordinator, "sync_archive", None)
+            if archive is not None and archive.ready:
+                try:
+                    await hass.async_add_executor_job(
+                        archive.run, "add_capture_event", coordinator.sync_vehicle_id,
+                        {"event":"collector_stopped", "occurred_at_ms":int(time.time()*1000),
+                         "origin":"leapmotor_cloud", "request_result":"entry unloaded"})
+                except Exception as err:
+                    log.warning("同步采集卸载事实写入失败: %s", type(err).__name__)
+            from .account_runtime import detach
+            detach(coordinator)
         hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     return ok

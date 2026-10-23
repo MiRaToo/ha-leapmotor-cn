@@ -1607,7 +1607,7 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
     if (this._car3dDev !== dev) this._car3d = null; // 换了辆车: 旧车的现状作废
     this._car3dDev = dev;
     this._car3dLoading = true;
-    hass.callWS<Car3dInfo>({ type: CAR3D_INFO_WS }).then((info) => {
+    hass.callWS<Car3dInfo>({ type: CAR3D_INFO_WS, ...((this._device || this._picked) ? { device_id: this._device || this._picked } : {}) }).then((info) => {
       this._car3dLoading = false;
       this._car3d = info && typeof info === "object" ? info : null;
       if (this._car3d && this._car3d.ready === true) this._car3dErr = "";
@@ -1616,6 +1616,22 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
       this._car3dLoading = false;
       this._car3dDev = null; // 允许以后再试(节流见上)
       this._car3dRetryAt = Date.now() + 30000;
+    });
+  }
+
+  private _callMarketWS<T>(message: Record<string, unknown>): Promise<T> {
+    const hass = this._hass;
+    const callWS = hass?.callWS?.bind(hass);
+    if (!callWS) return Promise.reject(new Error("尚未连接 Home Assistant"));
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("商城读取超时，请重新读取")), 30000);
+      Promise.resolve().then(() => callWS<T>(message)).then((value) => {
+        clearTimeout(timer);
+        resolve(value);
+      }, (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      });
     });
   }
 
@@ -1634,10 +1650,20 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
     this._marketModels = [];
     this._marketVariants = [];
     this._marketActual = null;
-    this._marketSelectionReq += 1;
+    const request = ++this._marketSelectionReq;
     this._scheduleRender();
-    const catalogRequest = hass.callWS<{ models?: Car3dMarketModel[]; reason?: string }>(
-      { type: CAR3D_MARKET_CATALOG_WS });
+    const catalogRequest = this._callMarketWS<{ models?: Car3dMarketModel[]; reason?: string }>(
+      { type: CAR3D_MARKET_CATALOG_WS }).then((catalog) => {
+      if (this._car3dPrefsStoreKey() === prefsKey && request === this._marketSelectionReq) {
+        // The public catalogue can be used before the slower actual-car match.
+        this._marketCatalogLoading = false;
+        this._marketModels = Array.isArray(catalog?.models)
+          ? catalog.models.filter((item) => item && typeof item.name === "string" && item.name.trim())
+          : [];
+        this._render();
+      }
+      return catalog;
+    });
     const actualRequest: Promise<{
       pictures?: Car3dMarketPicture[];
       actual_color?: string;
@@ -1647,9 +1673,9 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
       edition?: string;
       model_id?: string;
       error?: string;
-    }> = device ? hass.callWS({ type: CAR3D_MARKET_PICTURES_WS, device_id: device }) : Promise.resolve({});
+    }> = device ? this._callMarketWS({ type: CAR3D_MARKET_PICTURES_WS, device_id: device }) : Promise.resolve({});
     Promise.allSettled([catalogRequest, actualRequest]).then(([catalogReply, actualReply]) => {
-      if (this._car3dPrefsStoreKey() !== prefsKey) return;
+      if (this._car3dPrefsStoreKey() !== prefsKey || request !== this._marketSelectionReq) return;
       this._marketCatalogLoading = false;
       const catalog = catalogReply.status === "fulfilled" ? catalogReply.value : null;
       this._marketModels = Array.isArray(catalog?.models)
@@ -1665,7 +1691,9 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
       this._marketPicturesLoading = false;
 
       if (!this._marketModels.length) {
-        this._marketPicturesError = String(catalog?.reason || "商城车型目录暂时无法读取");
+        const error = catalogReply.status === "rejected" && catalogReply.reason instanceof Error
+          ? catalogReply.reason.message : "";
+        this._marketPicturesError = String(catalog?.reason || error || "商城车型目录暂时无法读取");
         if (!this._marketPictures.length && actual?.error) this._marketPicturesError = String(actual.error);
         this._render();
         return;
@@ -1677,7 +1705,7 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
       this._render();
       this._loadCar2dVariants(model.name);
     }).catch((err: unknown) => {
-      if (this._car3dPrefsStoreKey() !== prefsKey) return;
+      if (this._car3dPrefsStoreKey() !== prefsKey || request !== this._marketSelectionReq) return;
       this._marketCatalogLoading = false;
       this._marketPicturesLoading = false;
       this._marketPicturesError = String(err instanceof Error ? err.message : "商城车型暂时无法读取");
@@ -1708,7 +1736,7 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
     this._marketPicturesLoading = true;
     this._marketPicturesError = "";
     this._render();
-    hass.callWS<{ variants?: Car3dMarketVariant[]; reason?: string }>(
+    this._callMarketWS<{ variants?: Car3dMarketVariant[]; reason?: string }>(
       { type: CAR3D_MARKET_VARIANTS_WS, model }).then((result) => {
       if (this._car3dPrefsStoreKey() !== prefsKey || request !== this._marketSelectionReq) return;
       this._marketVariantsLoading = false;
@@ -1809,7 +1837,7 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
     this._marketPictures = [];
     this._marketPicturesError = "";
     this._render();
-    hass.callWS<{ variants?: Car3dMarketVariant[]; reason?: string }>({
+    this._callMarketWS<{ variants?: Car3dMarketVariant[]; reason?: string }>({
       type: CAR3D_MARKET_VARIANTS_WS,
       model,
       year,
@@ -1887,10 +1915,11 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
     this._car3dPrefs.market2dEdition = variant.edition;
     this._saveCar3dPrefs();
     this._render();
-    hass.callWS<{
+    this._callMarketWS<{
       pictures?: Car3dMarketPicture[];
       actual_color?: string;
       error?: string;
+      reason?: string;
     }>({
       type: CAR3D_MARKET_PICTURES_WS,
       ...((this._device || this._picked) ? { device_id: this._device || this._picked } : {}),
@@ -1904,7 +1933,7 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
       this._marketPicturesLoading = false;
       const pictures = this._safeMarketPictures(result?.pictures);
       this._marketPictures = pictures;
-      this._marketPicturesError = pictures.length ? "" : String(result?.error || "该配置没有商城颜色图片");
+      this._marketPicturesError = pictures.length ? "" : String(result?.error || result?.reason || "该配置没有商城颜色图片");
       const actualSame = this._marketActual?.model.toLocaleLowerCase() === model.toLocaleLowerCase()
         && this._marketActual?.year === variant.year && this._marketActual?.energy === variant.energy
         && this._marketActual?.edition === variant.edition;
@@ -1938,7 +1967,7 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
     this._car3dViewErr = "";
     this._render();
     hass.callWS<{ state?: string; started?: boolean; error?: string; info?: Car3dInfo }>(
-      { type: CAR3D_ENSURE_WS })
+      { type: CAR3D_ENSURE_WS, ...((this._device || this._picked) ? { device_id: this._device || this._picked } : {}) })
       .then((res) => {
         if (res && res.info) {
           this._car3d = res.info;
@@ -1981,7 +2010,7 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
         this._car3dBusy = false;
         return;
       }
-      hass.callWS<Car3dInfo>({ type: CAR3D_INFO_WS }).then((info) => {
+      hass.callWS<Car3dInfo>({ type: CAR3D_INFO_WS, ...((this._device || this._picked) ? { device_id: this._device || this._picked } : {}) }).then((info) => {
         this._car3d = info && typeof info === "object" ? info : null;
         this._car3dDev = this._device || this._picked || this._car3dDev;
         const st = String((info && info.state) || "");

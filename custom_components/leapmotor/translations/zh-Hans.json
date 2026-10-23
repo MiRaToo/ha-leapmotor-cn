@@ -3,9 +3,17 @@
     "step": {
       "user": {
         "title": "零跑汽车登录",
-        "description": "请使用【子账号】手机号 —— 零跑云单账号单会话, 用主账号会把手机上的官方 App 顶下线。\n\n之后会收到一条短信验证码。",
+        "description": "可使用已接入的账号添加另一辆车，也可输入手机号接收短信验证码。新登录请使用【子账号】手机号。",
         "data": {
-          "phone": "子账号手机号"
+          "phone": "子账号手机号",
+          "existing_account": "使用已接入的账号"
+        }
+      },
+      "vehicle": {
+        "title": "选择车辆",
+        "description": "每次添加一辆车。已接入的车辆不会重复添加。",
+        "data": {
+          "vin": "车辆"
         }
       },
       "code": {
@@ -25,6 +33,14 @@
       "sms_failed": "发送验证码失败, 请查看日志",
       "car_login_failed": "车端 token 交换失败, 请查看日志",
       "no_vehicle": "该账号名下没有可用车辆 —— 请确认子账号已被共享车辆",
+      "no_new_vehicle": "该账号下没有尚未接入的车辆",
+      "choose_account": "请选择一个已接入账号，或输入新的手机号",
+      "phone_required": "请输入手机号",
+      "account_unavailable": "所选账号已不可用，请重新选择",
+      "vehicle_unavailable": "所选车辆当前不可用，请重新获取列表",
+      "reauth_vehicle_missing": "账号认证成功，但原车辆不在账号列表中；未改变原车辆绑定",
+      "reauth_account_mismatch": "重新认证的账号与该车辆原账号不一致，未更新配置",
+      "reauth_vehicle_mismatch": "重新认证不能更改原车辆绑定",
       "unknown": "未知错误",
       "reauth_failed": "重新登录失败, 请重新发起"
     },

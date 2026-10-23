@@ -92,7 +92,7 @@ def token_expiry(token: str) -> int:
 
 
 class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """一个 coordinator 管一辆车(当前只支持账号下第一辆)。"""
+    """一个 coordinator 固定管理一辆车。"""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.entry = entry
@@ -114,13 +114,18 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._trips_usage_at = 0.0       # 上次统计"行程存储占用"的时刻(见 _refresh_car_data)
         self._apply_options()
         self.client = LeapmotorClient(self.session)
-        self.vin: str = entry.data.get("vin") or self.session.car_vin
+        self.vin: str = str(entry.data.get("vin") or self.session.car_vin or "")
+        if self.vin:
+            self.session.car_vin = self.vin
+            self.session.car_type = str(entry.data.get("car_type") or self.session.car_type or "")
         self.vehicle: Vehicle | None = None
         self.parking_url: str = ""
         self.car_picture_url: str = ""
         self._car_picture_refresh_at = 0.0
         self._car_picture_lock = asyncio.Lock()
         self.state: CarState | None = None      # 最近一帧车况(见 api.CarState)
+        self.sync_archive = None
+        self.sync_vehicle_id = ""
         self.last_result: str = ""
         # 会话/轮询出的问题(空 = 正常)。账号 token 只有约 6 小时, 过期后需要重新认证
         self.session_problem: str = ""
@@ -187,6 +192,10 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         super().__init__(
             hass, log, name=f"{DOMAIN} {self.vin}", update_interval=timedelta_seconds(poll)
         )
+        # DataUpdateCoordinator installs `self.hass`; account_runtime.attach uses it
+        # to register this VIN-bound coordinator in the shared account context.
+        from .account_runtime import attach
+        attach(self)
 
     def _apply_options(self) -> None:
         # 行程记录: 电池可用容量会影响耗电/能耗的折算, 选项一改就跟着改。
@@ -302,12 +311,31 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         self._apply_options()
         t0 = time.monotonic()
+        archive=getattr(self,"sync_archive",None)
+        if archive is not None and not archive.ready and time.monotonic()>=getattr(self,"_archive_retry_at",0):
+            self._archive_retry_at=time.monotonic()+60
+            try:
+                await self.hass.async_add_executor_job(archive.run,"recover")
+                self.sync_vehicle_id = await self.hass.async_add_executor_job(
+                    archive.run, "ensure_vehicle", self.vin,
+                    str(self.entry.data.get("car_nickname") or ""), self.entry.entry_id, "")
+            except Exception as err:  # archive remains optional to HA operation
+                archive.error=type(err).__name__
+                archive.ready=False
         try:
             try:
                 result = await self._collect()
             except ConfigEntryAuthFailed:
                 raise
             except Exception as err:  # noqa: BLE001
+                sync_archive = getattr(self, "sync_archive", None)
+                if sync_archive is not None and sync_archive.ready:
+                    try:
+                        await self.hass.async_add_executor_job(sync_archive.run,"add_capture_event",
+                            getattr(self,"sync_vehicle_id",""),{"event":"poll_failed","occurred_at_ms":int(time.time()*1000),
+                            "origin":"leapmotor_cloud","request_result":"failure","status":type(err).__name__,
+                            "sampling_interval_seconds":int(self.update_interval.total_seconds()) if self.update_interval else None})
+                    except Exception: pass
                 if is_auth_error(getattr(self, "_last_resp", None)):
                     self.session_problem = "账号会话已过期, 需要重新登录(发送短信验证码即可)"
                     raise ConfigEntryAuthFailed(self.session_problem) from err
@@ -326,13 +354,15 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _collect(self, account_retried: bool = False) -> dict[str, Any]:
         self._last_resp = None
-        if await self.hass.async_add_executor_job(self._renew_if_needed):
-            self._persist()          # 必须在事件循环线程里写
+        from .account_runtime import async_renew, async_refresh_account
+
+        await async_renew(self)
         # 车辆信息(VIN/授权指令/能力)是**静态的**, 存一次就够 —— 没必要每轮都去拉,
         # 而拉列表用的是账号 token(6 小时就过期)。少依赖它 = 会话过期后还能多干活。
         if self.vehicle is not None:
             await self._refresh_car_data()
             return self._build_result()
+        list_revision = self._auth_revision
         try:
             vehicles = await self.hass.async_add_executor_job(self.client.get_vehicle_list)
         except Exception as err:  # noqa: BLE001
@@ -340,22 +370,20 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             expired = token_expiry(self.session.car_token) < time.time() + 60
             if expired:
                 log.warning("车端 token 已过期, 立即强制续期(跳过节流)")
-                self._last_renew = 0.0
-                if await self.hass.async_add_executor_job(self._renew_if_needed):
-                    self._persist()
+                if await async_renew(self, force=True, observed_revision=list_revision):
                     vehicles = await self.hass.async_add_executor_job(self.client.get_vehicle_list)
                 else:
                     raise
             else:
                 raise
         for v in vehicles:
-            if not self.vin or v.vin == self.vin:
+            if self.vin and str(v.vin).upper() == self.vin.upper():
                 self.vehicle = v
                 break
-        if self.vehicle is None and vehicles:
-            self.vehicle = vehicles[0]
-            self.vin = self.vehicle.vin
         if self.vehicle is None:
+            if vehicles:
+                self.session_problem = "已绑定车辆当前不在账号车辆列表中；保留原 VIN 和历史数据"
+                raise RuntimeError(f"账号车辆列表中找不到已绑定 VIN {self.vin[-6:]}")
             # 列表为空时**回原接口看一次原因** —— 账号会话失效就是在这里暴露的
             # (get_vehicle_list 只返回列表, 把错误码吞掉了)
             raw = await self.hass.async_add_executor_job(
@@ -364,8 +392,8 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if is_auth_error(raw):
                 # ★ 账号 token 过期**不再等于必须短信重登**: 先用 refreshToken 免短信续期
                 #   (实测 `getnewtoken` code=200; 哪怕 token 已过期也能救回)
-                if not account_retried and self._account_refresh_if_needed(force=True):
-                    self._persist()
+                if not account_retried and await async_refresh_account(
+                        self, force=True, observed_revision=list_revision):
                     return await self._collect(account_retried=True)
                 if self._car_token_alive():
                     # 账号会话死了, 但**车端 token 还能用** —— 车况/控车都走车端接口,
@@ -384,7 +412,6 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if isinstance(raw, dict) else "账号下没有可用车辆")
         self.session_problem = ""
         self.car_state_problem = ""
-        self._last_renew = 0.0
         await self._refresh_car_data()      # 内部会重算轮询档位
         return self._build_result()
 
@@ -422,6 +449,7 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         state = None
         why = "未知原因"
         for attempt in (1, 2):
+            request_revision = self._auth_revision
             code = None
             try:
                 state = await self.hass.async_add_executor_job(
@@ -440,9 +468,8 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if is_signature_error({"code": code}):
                     log.warning("车况拉取为空(%s), 换一次车端 token 后重试", why)
                     try:
-                        if await self.hass.async_add_executor_job(
-                                functools.partial(self._renew_if_needed, force=True)):
-                            self._persist()
+                        from .account_runtime import async_renew
+                        await async_renew(self, force=True, observed_revision=request_revision)
                     except Exception as err:  # noqa: BLE001
                         log.warning("重试前换 token 异常: %s", err)
                 else:
@@ -465,7 +492,47 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         if is_rate_limited({"code": compatibility.resp_code}):
                             self._enter_rate_limit("T03 车况兼容接口返回风控/限流提示")
                             compatibility_limited = True
+        sync_archive = getattr(self, "sync_archive", None)
+        # A failed poll must never associate an earlier observation with a new frame.
+        self._sync_last_observation_id = ""
+        if (state is not None and any(
+                reported and str(reported).strip().upper() != str(self.vin).strip().upper()
+                for reported in (getattr(state, "vin", ""), getattr(state, "source_vin", "")))):
+            if sync_archive is not None and sync_archive.ready:
+                try:
+                    await self.hass.async_add_executor_job(sync_archive.run,
+                        "add_capture_event", getattr(self,"sync_vehicle_id",""),
+                        {"event":"poll_failed","occurred_at_ms":int(time.time()*1000),
+                         "origin":"leapmotor_cloud","status":"rejected","business_code":"vehicle_conflict"})
+                except Exception as err:  # noqa: BLE001
+                    log.warning("记录脱敏车辆冲突事实失败: %s", type(err).__name__)
+            state = None
+            why = "响应 VIN 与绑定车辆不符"
         if state is not None and state.raw:
+            # Archive the native allowlisted payload before business normalization/recording.
+            # Archive errors are fail-open: regular HA state and controls continue normally.
+            if sync_archive is not None and sync_archive.ready:
+                try:
+                    native_vin = str(getattr(state, "source_vin", "") or getattr(state, "vin", "") or "").strip().upper()
+                    if native_vin and native_vin != str(self.vin).strip().upper():
+                        raise ValueError("vehicle_conflict")
+                    timestamps = dict(getattr(state, "source_timestamps", {}) or {})
+                    self._sync_last_observation_id = await self.hass.async_add_executor_job(
+                        sync_archive.run, "ingest", getattr(self,"sync_vehicle_id",""),
+                        getattr(state, "raw_layout", "signal_map"),
+                        getattr(state, "native_raw", state.raw), timestamps,
+                        int(time.time() * 1000), getattr(state, "coordinate_system", "unknown"),
+                        int(self.update_interval.total_seconds()) if self.update_interval else None)
+                except Exception as err:  # noqa: BLE001
+                    if isinstance(err, ValueError) and str(err) == "vehicle_conflict":
+                        try:
+                            await self.hass.async_add_executor_job(sync_archive.run, "add_capture_event",
+                                getattr(self,"sync_vehicle_id",""),{"event":"poll_failed","occurred_at_ms":int(time.time()*1000),"origin":"leapmotor_cloud","status":"rejected","business_code":"vehicle_conflict"})
+                        except Exception: pass
+                    else:
+                        sync_archive.error = type(err).__name__
+                        sync_archive.ready = False
+                        log.warning("原始同步档案写入失败(不影响车况): %s", type(err).__name__)
             self.state = state
             self.car_state_problem = ""
             self._note_reev()
@@ -476,7 +543,9 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     log.warning("行车耗油记录处理失败: %s",type(err).__name__)
             if getattr(self, "charges", None) is not None:
                 try:
+                    before = self._sync_group_marker("charge")
                     self.charges.process(state, now=now)
+                    await self._sync_associate_live_record("charge", now, before)
                 except Exception as err:  # noqa: BLE001
                     log.warning("驻车充电记录处理失败: %s", type(err).__name__)
             # 车况拉到了 = 会话是活的: 顺手清掉历史会话提醒(老版本留下的"快到期"通知,
@@ -485,6 +554,16 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         else:
             self.car_state_problem = f"车况未取到({why})"
             log.warning("本轮没取到车况, 沿用上一份数据: %s", why)
+            if sync_archive is not None and sync_archive.ready:
+                try:
+                    await self.hass.async_add_executor_job(
+                        sync_archive.run, "add_capture_event", getattr(self, "sync_vehicle_id", ""),
+                        {"event":"poll_failed", "occurred_at_ms":int(time.time()*1000),
+                         "origin":"leapmotor_cloud", "request_result":"no_valid_frame",
+                         "business_code":getattr(state, "resp_code", None),
+                         "sampling_interval_seconds":int(self.update_interval.total_seconds()) if self.update_interval else None})
+                except Exception as err:
+                    log.warning("同步采集失败事实写入失败: %s", type(err).__name__)
 
         # ── 新泊车事件 → 打开照片重试窗口(照片此刻刚拍, 可能还没上传完)──
         cur_state = self.state.vehicle_state if self.state else None
@@ -522,7 +601,9 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # ── 行程记录: 把这一帧喂给记录器(状态机/记账/轨迹都在里面)──
         if self.trips is not None and self.state is not None:
             try:
+                before = self._sync_group_marker("trip")
                 self.trips.process(self.state, now=now)
+                await self._sync_associate_live_record("trip", now, before)
             except Exception as err:  # noqa: BLE001
                 log.warning("行程记录处理异常: %s", err)
             # 存储占用统计: 给"行程统计"传感器的属性用(内部 60 秒缓存, 这里 5 分钟刷一次即可)
@@ -535,8 +616,65 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # ── 轮询档位: 每轮都要重算(以前只在首轮算, 导致"行驶中提速"从未生效)──
         if getattr(self, "charges", None) is not None:
+            before = self._sync_group_marker("charge")
             self.charges.expire(now)
+            if before != self._sync_group_marker("charge"):
+                await self._sync_associate_live_record("charge", now, before)
         self._adapt_poll_interval()
+
+    def _sync_group_marker(self, kind: str) -> tuple[str | None, str | None]:
+        recorder = getattr(self, "trips" if kind == "trip" else "charges", None)
+        if recorder is None:
+            return None, None
+        active = getattr(recorder, "_active" if kind == "trip" else "active", None)
+        completed = getattr(recorder, "trips" if kind == "trip" else "sessions", [])
+        identity = (lambda item: item.id) if kind == "trip" else (lambda item: item.get("id"))
+        return identity(active) if active else None, identity(completed[-1]) if completed else None
+
+    async def _sync_associate_live_record(self, kind: str, now: float, before=None) -> None:
+        """Publish actual recorder transitions; never guess membership by a time window."""
+        archive = getattr(self, "sync_archive", None)
+        if archive is None or not archive.ready:
+            return
+        oid = getattr(self, "_sync_last_observation_id", "") or None
+        recorder = getattr(self, "trips" if kind == "trip" else "charges", None)
+        if recorder is None:
+            return
+        active = getattr(recorder, "_active" if kind == "trip" else "active", None)
+        completed = getattr(recorder, "trips" if kind == "trip" else "sessions", [])
+        identity = (lambda item: str(item.id)) if kind == "trip" else (lambda item: str(item.get("id") or ""))
+        groups = [(active, True)] if active is not None and oid else []
+        if before is not None:
+            previous_active, previous_tail = before
+            for item in reversed(completed):
+                rid = identity(item)
+                if rid == previous_tail:
+                    break
+                groups.append((item, False))
+            # A recorder may replace the active session while completing an old one.
+            if previous_active and all(identity(item) != previous_active for item, _ in groups):
+                item = next((item for item in reversed(completed) if identity(item) == previous_active), None)
+                if item is not None and previous_active != previous_tail:
+                    groups.append((item, False))
+        for item, recording in groups:
+            if kind == "trip":
+                started, ended = item.started_at, item.ended_at
+                partial = item.frozen or item.approx_time
+            else:
+                started, ended = item.get("started_at"), item.get("ended_at")
+                partial = item.get("partial", False)
+            phase = "recording" if recording else "partial" if partial else "completed"
+            try:
+                await self.hass.async_add_executor_job(
+                    archive.run, "associate_observation", getattr(self, "sync_vehicle_id", ""),
+                    kind, identity(item), oid, phase,
+                    int(float(started)*1000) if started else None,
+                    int(float(ended)*1000) if ended else None)
+            except Exception as err:  # archive failure does not affect HA recording/control
+                archive.error = type(err).__name__
+                archive.ready = False
+                log.warning("同步分组关联失败(保留车况与记录): %s", type(err).__name__)
+                break
 
     async def _refresh_heavy(self) -> None:
         """里程 / 能耗 / 配置 —— 变化慢, 只按需拉(见 `_refresh_car_data` 的说明)。
@@ -670,9 +808,22 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _enter_rate_limit(self, why: str) -> None:
         """命中限流/风控 -> 退避一段时间(期间用慢档), 并写在诊断属性里。"""
         now = time.time()
-        if now < self._rate_limited_until:
+        context = getattr(self, "_auth_context", None)
+        if context is not None:
+            until = max(context.rate_limited_until, now + RATE_LIMIT_COOLDOWN_SECONDS)
+            context.rate_limited_until = until
+            peers = tuple(context.coordinators)
+        else:
+            until = max(self._rate_limited_until, now + RATE_LIMIT_COOLDOWN_SECONDS)
+            peers = (self,)
+        if now < self._rate_limited_until and all(peer._rate_limited_until >= until for peer in peers):
             return
-        self._rate_limited_until = now + RATE_LIMIT_COOLDOWN_SECONDS
+        for peer in peers:
+            peer._rate_limited_until = until
+            if peer is not self:
+                peer.car_state_problem = (f"同一账号疑似被限流/风控, 已退避 "
+                                          f"{RATE_LIMIT_COOLDOWN_SECONDS // 60} 分钟")
+                peer._adapt_poll_interval()
         self.car_state_problem = (f"疑似被限流/风控, 已退避 "
                                   f"{RATE_LIMIT_COOLDOWN_SECONDS // 60} 分钟({why})")
         log.warning("疑似被限流/风控 -> 轮询退避 %d 秒: %s", RATE_LIMIT_COOLDOWN_SECONDS, why)
@@ -862,6 +1013,7 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._expiry_warned = True
         self._notices_cleared = False        # 发出提醒后, 等健康周期再清一遍(届时复位标记)
         try:
+            from . import account_runtime
             await self.hass.services.async_call(
                 "persistent_notification", "create",
                 {
@@ -872,7 +1024,8 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "请到 设置 → 设备与服务 → 零跑 点「重新认证」, 收一条短信填进去即可"
                         "(不需要删除集成)。"
                     ),
-                    "notification_id": f"{DOMAIN}_session_expired",
+                    "notification_id": account_runtime.notification_id(
+                        self.entry.data, self.entry.entry_id),
                 },
                 blocking=False,
             )
@@ -905,12 +1058,28 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 {"notification_id": f"{DOMAIN}_session_expiry"},
                 blocking=False,
             )
-            if not self.session_problem:          # 会话真健康才撤"需重新认证"提醒
+            context = getattr(self, "_auth_context", None)
+            peers_unhealthy = bool(context and any(
+                peer is not self and peer.session_problem
+                for peer in tuple(context.coordinators)))
+            if not self.session_problem and not peers_unhealthy:  # 同认证上下文所有车辆恢复后才撤提醒
+                from .account_runtime import context_key, notification_id
                 await self.hass.services.async_call(
                     "persistent_notification", "dismiss",
-                    {"notification_id": f"{DOMAIN}_session_expired"},
+                    {"notification_id": notification_id(
+                        self.entry.data, self.entry.entry_id)},
                     blocking=False,
                 )
+                accounts = {
+                    context_key(entry.data, entry.entry_id)
+                    for entry in self.hass.config_entries.async_entries(DOMAIN)
+                }
+                if len(accounts) <= 1:
+                    await self.hass.services.async_call(
+                        "persistent_notification", "dismiss",
+                        {"notification_id": f"{DOMAIN}_session_expired"},
+                        blocking=False,
+                    )
                 if self._expiry_warned:
                     self._expiry_warned = False   # 会话已恢复: 将来真出问题时还能再提醒
                     log.info("会话已恢复健康: 已清理会话提醒, 后续失败仍会重新提醒")
@@ -1178,13 +1347,17 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _persist(self) -> None:
         """把刷新后的会话写回 config entry(HA 会持久化)。
 
-        ⚠️ 这里**重建** data 字典(以会话字段为底), 所以任何不是会话字段的键都必须
-        显式带过来 —— 漏一个就会在每次 token 续期(约 2 小时)时被悄悄抹掉。
-        `reev`(增程判定记忆)就属于这类, 曾经差点被漏掉。
+        以原条目数据为底再合并当前会话，保留新旧版本的未知字段、车辆选项和记录器记忆；
+        会话里的 car_vin/car_type 则始终写回本协调器固定绑定的那辆车。
         """
-        data = asdict(self.session)
+        data = dict(self.entry.data)
+        data.update(asdict(self.session))
         data["vin"] = self.vin
-        data["car_type"] = self.entry.data.get("car_type", "")
+        data["car_vin"] = self.vin
+        data["car_type"] = (self.vehicle.car_type if self.vehicle else
+                             self.entry.data.get("car_type", ""))
+        if self.vehicle and getattr(self.vehicle, "source", "unknown") != "unknown":
+            data["vehicle_source"] = self.vehicle.source
         data["car_nickname"] = self.entry.data.get("car_nickname", "")
         data["phone"] = self.entry.data.get("phone", "")
         # 手动选了「纯电」时顺手把增程记忆清掉 —— 否则切回「自动」会把那次误判捡回来。
@@ -1251,6 +1424,7 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         每个方法内部都会: 先校验操作密码 → 再带 oppwd 下发(state 内容随指令而异)。
         """
         fn = getattr(self.client, method)
+        request_revision = self._auth_revision
         try:
             resp = await self.hass.async_add_executor_job(functools.partial(fn, **kwargs))
         except Exception as err:  # noqa: BLE001
@@ -1265,10 +1439,9 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         method, resp.get("code"))
             renewed = False
             try:
-                if await self.hass.async_add_executor_job(
-                        functools.partial(self._renew_if_needed, force=True)):
-                    self._persist()
-                    renewed = True
+                from .account_runtime import async_renew
+                renewed = await async_renew(
+                    self, force=True, observed_revision=request_revision)
             except Exception as err:  # noqa: BLE001
                 log.warning("重试前换 token 异常: %s", err)
             if not renewed:

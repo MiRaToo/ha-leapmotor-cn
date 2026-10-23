@@ -1,10 +1,11 @@
 """T03 的发布版兼容边界：不联网，执行真实解析、签名、选路和协调器重试。"""
 import ast
-import asyncio
 import functools
 import hashlib
 import hmac
 import logging
+import sys
+import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,15 @@ VIN = "LFZT03TEST0000001"
 REGION = "https://appgateway-region.leapmotor.com"
 FRAME = {"code": 0, "data": {"vin": VIN, "collectTimeMs": 1_800_000_000_000,
                                 "signalMap": {"soc": 62, "totalMileage": 73489}}}
+
+
+def run_immediate(coro):
+    """All I/O in these offline coordinator tests completes in the executor stub."""
+    try:
+        coro.send(None)
+    except StopIteration as result:
+        return result.value
+    raise AssertionError("unexpected asynchronous suspension")
 
 
 def client(car_type="T03", answer=None, route=None):
@@ -243,7 +253,16 @@ def coordinator_runtime(cli):
     cls = ast.ClassDef(name="Runtime", bases=[], keywords=[], decorator_list=[], body=[method])
     module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
     namespace = {"time": api.time, "functools": functools, "log": logging.getLogger(__name__),
-                 "is_rate_limited": api.is_rate_limited, "is_signature_error": api.is_signature_error}
+                 "is_rate_limited": api.is_rate_limited, "is_signature_error": api.is_signature_error,
+                 "__package__": "_t03_coordinator_test"}
+    runtime = types.ModuleType("_t03_coordinator_test.account_runtime")
+    async def renew(coordinator, **kwargs):
+        renewed = coordinator._renew_if_needed(force=kwargs.get("force", False))
+        if renewed:
+            coordinator._persist()
+        return renewed
+    runtime.async_renew = renew
+    sys.modules[runtime.__name__] = runtime
     exec(compile(module, str(source), "exec"), namespace)
     coord = namespace["Runtime"]()
     async def execute(fn, *args):
@@ -252,6 +271,7 @@ def coordinator_runtime(cli):
         pass
     coord.hass = SimpleNamespace(async_add_executor_job=execute)
     coord.client, coord.session, coord.vin = cli, cli.session, VIN
+    coord._auth_revision = 0
     coord.state = api.parse_car_state({"code": 0, "data": {"signalMap": {"1204": 51}}})
     coord.light_first_refresh, coord.trips, coord._prev_vehicle_state = True, None, None
     coord.events = []
@@ -267,7 +287,7 @@ def coordinator_runtime(cli):
 def test_coordinator_completes_original_signature_recovery_before_t03_probe():
     cli = client(answer=lambda _m, url, _b, _f: FRAME if url.startswith(REGION) else {"code": 302010205})
     coord = coordinator_runtime(cli)
-    asyncio.run(coord._refresh_car_data())
+    run_immediate(coord._refresh_car_data())
     assert coord.events == ["renew", "persist"]
     assert [call[0] for call in cli.calls] == ["POST", "POST", "route", "POST"]
     assert coord.state.soc == 62 and coord.car_state_problem == ""
@@ -277,7 +297,7 @@ def test_coordinator_completes_original_signature_recovery_before_t03_probe():
 def test_other_models_keep_retry_count_and_previous_frame(model):
     cli = client(model, answer=lambda *_: {"code": 302010205})
     coord = coordinator_runtime(cli)
-    asyncio.run(coord._refresh_car_data())
+    run_immediate(coord._refresh_car_data())
     assert coord.events == ["renew", "persist"]
     assert len(cli.calls) == 2 and coord.state.soc == 51
     assert "302010205" in coord.car_state_problem
@@ -291,7 +311,7 @@ def test_t03_probe_failure_preserves_previous_frame_and_rate_backoff():
         coord.events.append("heavy")
     coord._refresh_heavy = heavy
     coord._photo_due = lambda *_: coord.events.append("photo") or False
-    asyncio.run(coord._refresh_car_data())
+    run_immediate(coord._refresh_car_data())
     assert coord.state.soc == 51 and coord.events == ["limited"]
     assert len(cli.calls) == 4
 
@@ -302,6 +322,6 @@ def test_t03_probe_transport_failure_does_not_interrupt_polling():
         raise TimeoutError("unavailable")
     cli.global_call = failed_route
     coord = coordinator_runtime(cli)
-    asyncio.run(coord._refresh_car_data())
+    run_immediate(coord._refresh_car_data())
     assert coord.state.soc == 51 and "车况未取到" in coord.car_state_problem
     assert cli.try_t03_car_state(VIN, 100) is None

@@ -243,6 +243,7 @@ class Vehicle:
     nick_name: str = ""
     plate_number: str = ""
     series_name: str = ""
+    source: str = "unknown"          # owner / shared / unknown, 来自车辆列表数组
     abilities: list = field(default_factory=list)
     raw: dict = field(default_factory=dict)
 
@@ -883,6 +884,11 @@ class CarState:
     collect_time: int = 0                    # 服务端采集时间(epoch ms)
     signals: dict[str, float] = field(default_factory=dict)   # 名称 → 值(已按表翻译)
     raw: dict[str, Any] = field(default_factory=dict)         # 原始 signalMap(保留原键)
+    native_raw: dict[str, Any] = field(default_factory=dict)  # 同步档案允许字段的原键/原值
+    raw_layout: str = "signal_map"
+    source_timestamps: dict[str, Any] = field(default_factory=dict)
+    source_vin: str = ""
+    coordinate_system: str = "unknown"
     # 响应里的业务码(0=成功)。解析函数**不会**因非 0 抛异常(它只回空对象),
     # 所以调用方要拿这个码去判断"是限流/风控还是普通失败"(见 is_rate_limited)。
     resp_code: int | None = None
@@ -1127,11 +1133,21 @@ def parse_car_state(payload: dict) -> CarState:
         resp_code = int(payload.get("code")) if isinstance(payload, dict) else None
     except (TypeError, ValueError):
         resp_code = None
+    native_allow = {"2", "3", "3724", "3725", "2190", "2191", "100003", "1204", "1318", "1319", "1010", "1177", "1178", "1149", "1197", "47", "1258", "bcmKeyPositionOn3", "1944",
+                    "sts", "collectTime", "collectTimeMs", "longitude", "latitude", "soc",
+                    "totalMileage", "speed", "gearStatus", "batteryVoltage", "batteryCurrent",
+                    "chargeState", "vehicleState", "plugStatus", "dcInputFastCharge"}
     st = CarState(
         vin=str(data.get("vin") or ""),
         collect_time=int(data.get("collectTime") or 0),
         signals=signals,
         raw={str(k): v for k, v in raw.items()},
+        native_raw={str(k): v for k, v in raw.items() if str(k) in native_allow},
+        raw_layout="signal_map",
+        source_timestamps={**{k: data[k] for k in ("collectTime", "collectTimeMs", "sts") if k in data},
+                           **{f"signalMap.{k}": raw[k] for k in ("collectTime", "collectTimeMs", "sts") if k in raw}},
+        source_vin=str(raw.get("vin") or data.get("vin") or ""),
+        coordinate_system="gcj02",
         resp_code=resp_code,
     )
     return st
@@ -1202,12 +1218,18 @@ def parse_t03_car_state(payload: Any, vin: str) -> CarState:
     if code != 0:
         return CarState(resp_code=code)
     data = payload.get("data")
-    if not isinstance(data, dict) or data.get("vin", vin) != vin:
+    if not isinstance(data, dict):
         return CarState(resp_code=code)
-    source = next((data[key] for key in ("signalMap", "signal")
-                   if isinstance(data.get(key), dict) and data[key]), data)
+    source_vin=str(data.get("vin") or "")
+    source_key = next((key for key in ("signalMap", "signal")
+                       if isinstance(data.get(key), dict) and data[key]), None)
+    source = data[source_key] if source_key else data
     if not isinstance(source, dict):
         return CarState(resp_code=code)
+    for reported_vin in (data.get("vin"), source.get("vin")):
+        if reported_vin and str(reported_vin).strip().upper() != str(vin).strip().upper():
+            return CarState(vin=str(reported_vin), source_vin=str(reported_vin), resp_code=code)
+    source_vin = str(source.get("vin") or source_vin)
     named = any(name in source for names in _T03_NAMED_SIGNALS.values() for name in names)
     raw: dict[str, float] = {}
     for sid in (*SIGNAL_IDS, "3724", "3725", "2190", "2191"):
@@ -1233,8 +1255,24 @@ def parse_t03_car_state(payload: Any, vin: str) -> CarState:
     reported = _t03_timestamp(source.get("sts"), collected)
     if reported:
         raw["sts"] = reported
-    return parse_car_state({"code": 0, "data": {"vin": vin, "collectTime": collected,
+    if source_vin and source_vin.strip().upper()!=str(vin).strip().upper():
+        return CarState(vin=source_vin,source_vin=source_vin,resp_code=code)
+    parsed = parse_car_state({"code": 0, "data": {"vin": vin, "collectTime": collected,
                                                   "signalMap": raw}})
+    # Retain original T03 keys/values before the numeric aliases above are normalized.
+    native_allow = {"2", "3", "3724", "3725", "2190", "2191", "100003", "1204", "1318", "1319", "1010", "1177", "1178", "1149", "1197", "47", "1258", "bcmKeyPositionOn3", "1944",
+                    "sts", "collectTime", "collectTimeMs", "longitude", "latitude", "soc",
+                    "totalMileage", "speed", "gearStatus", "batteryVoltage", "batteryCurrent",
+                    "chargeState", "vehicleState", "plugStatus", "dcInputFastCharge"}
+    parsed.native_raw = {str(k): v for k, v in source.items() if str(k) in native_allow}
+    parsed.raw_layout = ("named_signal" if named else "signal_map") if source_key else ("named_data" if named else "signal_map")
+    parsed.source_timestamps = {
+        **{f"data.{k}": data[k] for k in ("collectTime", "collectTimeMs", "sts") if k in data},
+        **{f"source.{k}": source[k] for k in ("collectTime", "collectTimeMs", "sts") if k in source},
+    }
+    parsed.source_vin=source_vin or vin
+    parsed.coordinate_system="gcj02"
+    return parsed
 
 
 @dataclass
@@ -1255,6 +1293,7 @@ class Session:
     sign_param: dict = field(default_factory=dict)      # {"r2":..,"r3":..}
     encrypt_param: dict = field(default_factory=dict)   # {"r2":..,"r3":..}
     user_id: str = ""
+    account_id: str = ""          # 登录响应中的账号 ID;与车端交换回写的 user_id 分开保存
     device_id: str = ""
     account_token_expires_at: int = 0   # 账号 token 的到期时刻(epoch 秒;0=未知)
     operate_pwd: str = ""               # 操作密码(PIN); 敏感指令需要
@@ -1268,6 +1307,11 @@ class Session:
     car_type: str = ""
     version: str = APP_VERSION
     sub_version: str = APP_SUBVERSION
+
+    def __post_init__(self) -> None:
+        # 旧配置只有 user_id;升级时保留它作为原先账号 ID 的兼容回退。
+        if not self.account_id and self.user_id:
+            self.account_id = self.user_id
 
     @property
     def hkdf_key(self) -> bytes:
@@ -1498,11 +1542,14 @@ class LeapmotorClient:
             self.session.hkdf_key, sort_and_concat(merged).encode("utf-8"), hashlib.sha256
         ).hexdigest()
 
-    def build_headers(self, payload: dict[str, Any] | None = None) -> dict[str, str]:
+    def build_headers(self, payload: dict[str, Any] | None = None, *,
+                      account_scope: bool = False) -> dict[str, str]:
         payload = dict(payload or {})
         headers = self._signed_headers()
         sig = self.sign(payload, signed_headers=headers)
         headers.update(self._extra_headers())
+        if account_scope and self.session.account_id:
+            headers["userId"] = str(self.session.account_id)
         headers["sign"] = sig
         headers["digest"] = sig
         return headers
@@ -1562,7 +1609,7 @@ class LeapmotorClient:
         url = f"{GLOBAL_BASE}{GLOBAL_PREFIX}{path.lstrip('/')}"
         if params:
             url += ("&" if "?" in url else "?") + urlencode(params)
-        return self._http("GET", url, self.build_headers(params))
+        return self._http("GET", url, self.build_headers(params, account_scope=True))
 
     # ---- 账号 / 登录 ----
     def _account_headers(self) -> dict[str, str]:
@@ -1642,7 +1689,7 @@ class LeapmotorClient:
             s.refresh_token = str(vo["refreshToken"])
         uid = vo.get("accountId") or vo.get("userId") or vo.get("id")
         if uid not in (None, ""):
-            s.user_id = str(uid)
+            s.account_id = s.user_id = str(uid)
         return resp
 
     def refresh_account_token(self, phone: str | None = None) -> dict:
@@ -1678,14 +1725,15 @@ class LeapmotorClient:
         if not s.refresh_token:
             raise RuntimeError("缺少 refresh_token: 先 login() 或以会话材料载入")
         ph = phone or s.phone
-        if not s.user_id or not ph:
+        account_id = s.account_id or s.user_id
+        if not account_id or not ph:
             raise RuntimeError("缺少 accountId / 手机号, 无法构造账号刷新请求")
         params = {
             "timespan": str(int(time.time() * 1000)),
             "nonce": str(random.randint(10000, 10000000)),
             "deviceID": s.device_id or new_device_id(),
             "refreshtoken": s.refresh_token,     # 只进签名串, 不进 query
-            "accountId": s.user_id,
+            "accountId": account_id,
             "accountNumber": rsa_encrypt_b64url(ph),
         }
         params["signStr"] = md5_mid16("".join(v for _, v in sorted(params.items())))
@@ -1704,6 +1752,8 @@ class LeapmotorClient:
         data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
         if resp.get("code") in (0, 200) and data.get("token"):
             s.token = str(data["token"])
+            if data.get("accountId") not in (None, ""):
+                s.account_id = str(data["accountId"])
             if data.get("refreshToken"):         # 实测服务端返回同一个 refreshToken
                 s.refresh_token = str(data["refreshToken"])
             try:
@@ -1782,10 +1832,11 @@ class LeapmotorClient:
         :param tries: 签名变体最多试几次(大小写/带不带签名);正常情况第 1 次就成。
         """
         s = self.session
-        if not s.token or not s.user_id:
+        account_id = s.account_id or s.user_id
+        if not s.token or not account_id:
             raise RuntimeError("需要先完成账号登录(缺少 token 或 userId)")
         body = {
-            "identifier": str(s.user_id),
+            "identifier": str(account_id),
             "security": s.token,
             "identifierType": "1",
         }
@@ -2631,21 +2682,31 @@ def _extract_vehicles(resp: dict) -> list[Vehicle]:
     data = resp.get("data")
     if not isinstance(data, dict):
         return out
-    items: list[dict] = []
+    items: list[tuple[dict, str]] = []
     for key in ("sharedcars", "bindcars", "cars", "list", "vehicleList"):
         v = data.get(key)
         if isinstance(v, list):
-            items.extend(x for x in v if isinstance(x, dict))
+            source = "shared" if key == "sharedcars" else "owner" if key == "bindcars" else "unknown"
+            items.extend((x, source) for x in v if isinstance(x, dict))
     if not items and isinstance(data.get("vin"), str):
-        items.append(data)
-    for item in items:
+        items.append((data, "unknown"))
+    for item, source in items:
+        vin = item.get("vin") or item.get("carVin") or item.get("carvin") or ""
+        existing = (next((vehicle for vehicle in out
+                          if str(vehicle.vin).upper() == str(vin).upper()), None)
+                    if vin else None)
+        if existing is not None:
+            if source == "owner":
+                existing.source = source
+            continue
         out.append(Vehicle(
-            vin=item.get("vin") or item.get("carVin") or item.get("carvin") or "",
+            vin=vin,
             car_id=str(item.get("carId") or item.get("id") or ""),
             car_type=item.get("carType") or item.get("carTypeCode") or item.get("series") or "",
             nick_name=item.get("nickName") or item.get("vinNickname") or item.get("name") or "",
             plate_number=item.get("plateNumber") or item.get("plateNo") or "",
             series_name=item.get("seriesName") or "",
+            source=source,
             abilities=list(item.get("abilities") or item.get("ability") or []),
             raw=item,
         ))

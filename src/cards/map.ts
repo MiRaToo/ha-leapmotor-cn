@@ -62,6 +62,7 @@ import { carMarker } from "../lib/car-marker";
 import { interactionStyles } from "../lib/motion";
 import { uiStyles } from "../lib/ui/styles";
 import { bindAppearance, unbindAppearance } from "../lib/appearance";
+import { bindVehiclePicker, loadVehicleSelection, saveVehicleSelection, vehiclePickerHtml, VEHICLE_PICKER_CSS, type VehicleOption } from "../lib/vehicle-selection";
 import { relTime } from "../lib/format";
 
 const CARD_VERSION = CARD_VERSIONS.map;
@@ -121,6 +122,11 @@ class LeapmotorMapCard extends LitElement {
   private _zoneItems: ZoneItem[] = [];
   private _zoneAnchor: "center" | "car" | null = null;
   private _ro: ResizeObserver | null = null;
+  private _vehicleOptions: VehicleOption[] = [];
+  private _vehicleEntryId = "";
+  private _vehicleRequired = false;
+  private _vehicleLocked = false;
+  private _vehicleInitStarted = false;
 
   // ── 静态骨架节点(由 lit 模板渲染后 @query 取得) ──
   private _wrap: HTMLElement | null = null;
@@ -138,11 +144,12 @@ class LeapmotorMapCard extends LitElement {
   private _subEl: HTMLElement | null = null;
   private _followBtn: HTMLElement | null = null;
   private _styleBtn: HTMLElement | null = null;
+  private _vehiclePickerHost: HTMLElement | null = null;
   private _bound = false;
 
   /** 从卡片选择器添加时, 自动填好车辆位置实体(用户不用自己找)。 */
   static getStubConfig(hass: HomeAssistant) {
-    return { entity: pickTracker(hass) || "", zoom: 16, height: 320, map_style: "auto" };
+    return { entity: "", zoom: 16, height: 320, map_style: "auto" };
   }
 
   setConfig(config: LovelaceCardConfig) {
@@ -229,7 +236,22 @@ class LeapmotorMapCard extends LitElement {
     this._themeDark = dark;
     if (!this._config) return;
     if (!this._config.entity) {
-      const guess = pickTracker(hass);
+      if (!this._vehicleInitStarted) {
+        this._vehicleInitStarted = true;
+        void this._initVehicleSelection();
+        return;
+      }
+      if (this._vehicleRequired) {
+        this._renderHint("配置了多辆车，请先选择要显示的位置");
+        return;
+      }
+      const vehicle = this._vehicleOptions.find(item => item.entry_id === this._vehicleEntryId) ||
+        (this._vehicleOptions.length === 1 ? this._vehicleOptions[0] : undefined);
+      if (vehicle && !vehicle.available) {
+        this._renderHint("所选车辆尚未加载，请检查集成状态");
+        return;
+      }
+      const guess = vehicle?.tracker_entity_id || (this._vehicleOptions.length <= 1 ? pickTracker(hass) : "");
       if (guess) {
         this._config.entity = guess; // 自动识别, 用户什么都不用填
         this._follow = this._config.follow !== false;
@@ -268,6 +290,39 @@ class LeapmotorMapCard extends LitElement {
   // undefined(原型上只挂了 setter), 任何读它的代码(含测试/HA 侧包装)都拿不到状态。
   get hass(): HomeAssistant | null {
     return this._hass;
+  }
+
+  private async _initVehicleSelection(): Promise<void> {
+    const state = await loadVehicleSelection(this._hass, "map", this._config, this);
+    this._vehicleOptions = state.vehicles;
+    this._vehicleEntryId = state.entryId;
+    this._vehicleRequired = state.required;
+    this._vehicleLocked = state.locked;
+    if (this._vehicleRequired) this._renderHint("配置了多辆车，请先选择要显示的位置");
+    else if (this._hass) this.hass = this._hass;
+  }
+
+  private _onVehicleChange(entryId: string): void {
+    this._vehicleEntryId = entryId;
+    this._vehicleRequired = this._vehicleOptions.length > 1 && !entryId;
+    saveVehicleSelection("map", this._config, entryId, this);
+    this._tiles.forEach(img => img.remove());
+    this._tiles.clear();
+    this._center = null;
+    this._built = false;
+    if (!this._config) return;
+    const vehicle = this._vehicleOptions.find(item => item.entry_id === entryId);
+    this._config.entity = vehicle?.tracker_entity_id || "";
+    if (this._vehicleRequired) this._renderHint("请选择要显示车辆位置的车辆");
+    else if (this._config.entity && this._hass) this.hass = this._hass;
+    else this._renderHint("找不到所选车辆的位置实体，请等集成加载后重试");
+  }
+
+  private _renderVehiclePicker(): void {
+    if (!this._vehiclePickerHost) return;
+    this._vehiclePickerHost.innerHTML = vehiclePickerHtml(
+      this._vehicleOptions, this._vehicleEntryId, this._vehicleRequired, this._vehicleLocked);
+    bindVehiclePicker(this._vehiclePickerHost, entryId => this._onVehicleChange(entryId));
   }
 
   /** 开关"管理区域"面板: 列出卡片/HA 里用界面建的区域, 可定位与删除。 */
@@ -563,6 +618,7 @@ class LeapmotorMapCard extends LitElement {
       this._renderZones();
       this._renderMarker();
       this._renderInfo();
+      this._renderVehiclePicker();
       if (this._hint != null) this._renderHint(this._hint);
     }
   }
@@ -584,6 +640,7 @@ class LeapmotorMapCard extends LitElement {
     this._subEl = q(".bar .sub");
     this._followBtn = q('button[data-a="follow"]');
     this._styleBtn = q('button[data-a="style"]');
+    this._vehiclePickerHost = q(".vehiclePickerHost");
   }
 
   private _render() {
@@ -594,6 +651,7 @@ class LeapmotorMapCard extends LitElement {
       this._built = true;
     }
     if (this._hintEl) this._hintEl.style.display = "none";
+    this._renderVehiclePicker();
     this._renderTiles();
     this._renderZones();
     this._renderMarker();
@@ -611,6 +669,7 @@ class LeapmotorMapCard extends LitElement {
       this._hintEl.textContent = text;
       this._hintEl.style.display = "block";
     }
+    this._renderVehiclePicker();
   }
 
   /** 第一帧后一次性装配: 取节点引用 + 绑定事件 + 起 ResizeObserver。 */
@@ -678,7 +737,8 @@ class LeapmotorMapCard extends LitElement {
     this._wrap!.addEventListener("pointerdown", (ev) => {
       // 落在按钮/面板上的指针事件必须放行 —— 一旦在这里 setPointerCapture,
       // 后续 pointerup 会被地图抢走, 按钮的 click 就永远不会触发
-      if ((ev.target as Element).closest(".btns") || (ev.target as Element).closest(".panel")) return;
+      if ((ev.target as Element).closest(".btns") || (ev.target as Element).closest(".panel") ||
+          (ev.target as Element).closest(".vehiclePickerHost")) return;
       this._wrap!.setPointerCapture(ev.pointerId);
       start = { x: ev.clientX, y: ev.clientY, center: [...this._center!] as [number, number] };
       this._dragging = false;
@@ -993,7 +1053,7 @@ class LeapmotorMapCard extends LitElement {
           <div class="row"><button data-z="close">关闭</button></div>
         </div>
         <div class="hint"></div>
-        <div class="bar"><span class="name"></span><span class="sub"></span></div>
+        <div class="bar"><div class="vehiclePickerHost"></div><span class="name"></span><span class="sub"></span></div>
       </div>
     `;
   }
@@ -1005,6 +1065,7 @@ class LeapmotorMapCard extends LitElement {
 
   static styles: CSSResult[] = [
     css`${unsafeCSS(interactionStyles)}`,
+    css`${unsafeCSS(VEHICLE_PICKER_CSS)}`,
     css`
       :host {
         display: block;
@@ -1087,6 +1148,7 @@ class LeapmotorMapCard extends LitElement {
         font-weight: 600;
         font-size: 11px;
       }
+      .bar .vehiclePickerHost { pointer-events: auto; margin-right: auto; }
       .bar .sub {
         opacity: 0.75;
       }

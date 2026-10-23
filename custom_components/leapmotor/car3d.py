@@ -109,6 +109,35 @@ def root(hass: HomeAssistant) -> Path:
     return Path(hass.config.path(DIR_NAME))
 
 
+def _vin_fingerprint(vin: object) -> str:
+    if __package__:
+        from .diag_redact import vin_fingerprint
+    else:  # Keep the offline module tests usable when they import car3d directly.
+        from diag_redact import vin_fingerprint
+    return vin_fingerprint(vin)
+
+
+def profile_root(hass: HomeAssistant, coord: Any) -> Path:
+    """按 VIN 隔离车模；将单车旧目录无损认领到原车。"""
+    from .const import DOMAIN
+
+    legacy = root(hass)
+    vin = str(getattr(coord, "vin", "") or "")
+    fingerprint = _vin_fingerprint(vin)
+    if not fingerprint:
+        return legacy
+    manifest = read_manifest(legacy)
+    owner = str(manifest.get("vin_fingerprint") or "")
+    entries = hass.config_entries.async_entries(DOMAIN)
+    if owner == fingerprint:
+        return legacy
+    if not owner and len(entries) == 1:
+        # 单车升级时把现有离线资源标记为该车；后续再添加车辆也不会误共享。
+        write_manifest(legacy, {**manifest, "vin_fingerprint": fingerprint})
+        return legacy
+    return legacy / "vehicles" / fingerprint
+
+
 def wrapper_src() -> Path:
     """包装页与星空贴纸的**源**目录(集成自带, 装配时复制进落盘目录)。"""
     return Path(__file__).parent / "www" / "car3d"
@@ -768,6 +797,7 @@ def assemble_sync(client: Any, vin: str, base: Path,
     colors = colors_of(base, car_type, year, car_type_code)
     write_manifest(base, {
         "asset_version": ASSET_VERSION,
+        "vin_fingerprint": _vin_fingerprint(vin),
         "key3d_params": param_note,
         "fetched_at": time.time(),
         "model": {"car_type": car_type, "year": year,
@@ -787,16 +817,22 @@ def assemble_sync(client: Any, vin: str, base: Path,
 
 # ── HA 层: 状态机 + 后台任务(卡片轮询 info, 需要时点一下 ensure) ──────
 STATE_KEY = "_car3d"
+PROFILES_KEY = "_car3d_profiles"
 _EMPTY_STATE: dict = {"state": "idle", "error": "", "detail": "", "last_try": 0.0, "task": None}
 
 
-def _state(hass: HomeAssistant) -> dict:
-    return (hass.data.setdefault(_domain(), {})).setdefault(STATE_KEY, dict(_EMPTY_STATE))
+def _state(hass: HomeAssistant, coord: Any = None) -> dict:
+    data = hass.data.setdefault(_domain(), {})
+    if coord is None:
+        return data.setdefault(STATE_KEY, dict(_EMPTY_STATE))
+    key = _vin_fingerprint(str(getattr(coord, "vin", "") or "")) or str(
+        getattr(getattr(coord, "entry", None), "entry_id", "unknown"))
+    return data.setdefault(PROFILES_KEY, {}).setdefault(key, dict(_EMPTY_STATE))
 
 
 async def async_info(hass: HomeAssistant, coord: Any = None) -> dict:
     """给卡片的现状(不联网): 素材是否就绪 + 车型参数 + 车型色表 + 用户选项。"""
-    base = root(hass)
+    base = profile_root(hass, coord) if coord is not None else root(hass)
     st = await hass.async_add_executor_job(status, base)
     if st["model"] and not st["colors"]:
         st["colors"] = await hass.async_add_executor_job(
@@ -805,8 +841,10 @@ async def async_info(hass: HomeAssistant, coord: Any = None) -> dict:
     st["ready"] = bool(st["viewer"] and st["model"])
     opts = dict(getattr(getattr(coord, "entry", None), "options", {}) or {})
     st["options"] = {k: opts.get(k) for k in ("car3d_color", "car3d_bg", "car3d_image")}
-    st["base_url"] = f"/leapmotor-card/{URL_DIR}/view.html"
-    state = _state(hass)
+    relative = base.relative_to(root(hass)).as_posix()
+    suffix = f"{relative}/" if relative != "." else ""
+    st["base_url"] = f"/leapmotor-card/{URL_DIR}/{suffix}view.html"
+    state = _state(hass, coord)
     st["state"] = state["state"]
     st["error"] = state["error"]
     st["detail"] = state.get("detail") or ""
@@ -822,10 +860,10 @@ async def async_info(hass: HomeAssistant, coord: Any = None) -> dict:
 
 async def async_ensure(hass: HomeAssistant, coord: Any, *, force: bool = False) -> dict:
     """确保素材就绪: 需要就起一个后台装配任务, 立刻返回当前状态(卡片再轮询 info)。"""
-    state = _state(hass)
+    state = _state(hass, coord)
     if state["state"] == "downloading":
         return {"state": "downloading", "started": False}
-    base = root(hass)
+    base = profile_root(hass, coord)
     if not force:
         if await hass.async_add_executor_job(ready, base):
             return {"state": "ready", "started": False}
@@ -874,3 +912,4 @@ async def async_reset(hass: HomeAssistant) -> None:
     data = hass.data.get(_domain())
     if isinstance(data, dict):
         data.pop(STATE_KEY, None)
+        data.pop(PROFILES_KEY, None)

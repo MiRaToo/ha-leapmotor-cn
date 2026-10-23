@@ -27,6 +27,8 @@ FILES = [
     "car3d.py", "amap.py",
     # 诊断导出 + 脱敏(diag_redact 不引 HA, 便于离线单测)
     "diagnostics.py", "diag_redact.py",
+    # 多账号 / 多车辆: 账号共享运行时与车辆选择解析
+    "account_runtime.py", "vehicle_selector.py", "sync_archive.py",
     # 素材采集与 3D 探针服务
     "asset_services.py",
     "manifest.json", "strings.json",

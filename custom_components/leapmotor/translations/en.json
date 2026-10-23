@@ -3,9 +3,17 @@
     "step": {
       "user": {
         "title": "Leapmotor (China) login",
-        "description": "Use a SECONDARY account — Leapmotor allows only one active session per account, so using your main account will sign out the official app on your phone.",
+        "description": "Choose an existing account to add another vehicle, or enter a phone number to receive an SMS code. Use a SECONDARY account for a new login.",
         "data": {
-          "phone": "Phone number"
+          "phone": "Phone number",
+          "existing_account": "Use an existing account"
+        }
+      },
+      "vehicle": {
+        "title": "Select a vehicle",
+        "description": "Add one vehicle at a time. Vehicles already configured are excluded.",
+        "data": {
+          "vin": "Vehicle"
         }
       },
       "code": {
@@ -25,6 +33,14 @@
       "sms_failed": "Failed to request SMS code, see logs",
       "car_login_failed": "Vehicle token exchange failed, see logs",
       "no_vehicle": "No vehicle on this account — make sure the car is shared with the secondary account",
+      "no_new_vehicle": "This account has no vehicles that are not already configured",
+      "choose_account": "Choose an existing account or enter a new phone number",
+      "phone_required": "Enter a phone number",
+      "account_unavailable": "The selected account is no longer available",
+      "vehicle_unavailable": "The selected vehicle is unavailable; reload the list",
+      "reauth_vehicle_missing": "Authentication succeeded, but the original vehicle is missing from the account; its binding was preserved",
+      "reauth_account_mismatch": "The reauthenticated account does not match this vehicle's original account",
+      "reauth_vehicle_mismatch": "Reauthentication cannot change the vehicle binding",
       "unknown": "Unknown error"
     },
     "abort": {
