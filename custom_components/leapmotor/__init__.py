@@ -11,7 +11,14 @@
 from __future__ import annotations
 
 import logging
-import time
+# ⚠️ 必须用别名: 本包有 time.py(HA 的 time 平台)。首次 forward setup 导入平台模块后,
+# Python 会把子模块挂到**包对象**上 —— 那正是 __init__.py 的全局命名空间, 于是原先
+# `import time` 绑定的标准库 time 会被 `custom_components.leapmotor.time` 顶掉; 之后
+# 本文件里任何 `time.time()` 都抛 `AttributeError: module
+# 'custom_components.leapmotor.time' has no attribute 'time'`。真机复现(issue #8):
+# 重载时 setup 在 `_sync_associate_live_record(..., time.time())` 处失败, 卸载时日志
+# 出现「同步采集卸载事实写入失败: AttributeError」。
+import time as _time
 from pathlib import Path
 
 from homeassistant.config_entries import ConfigEntry
@@ -269,8 +276,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if archive.ready:
         try:
             await hass.async_add_executor_job(archive.run,"add_capture_event",coordinator.sync_vehicle_id,
-                {"event":"collector_started","occurred_at_ms":int(time.time()*1000),"origin":"leapmotor_cloud","request_result":"collector ready","sampling_interval_seconds":int(coordinator.update_interval.total_seconds()) if coordinator.update_interval else DEFAULT_POLL_SECONDS})
-        except Exception as err: log.warning("同步采集启动事实写入失败: %s",type(err).__name__)
+                {"event":"collector_started","occurred_at_ms":int(_time.time()*1000),"origin":"leapmotor_cloud","request_result":"collector ready","sampling_interval_seconds":int(coordinator.update_interval.total_seconds()) if coordinator.update_interval else DEFAULT_POLL_SECONDS})
+        except Exception as err: log.warning("同步采集启动事实写入失败: %s: %s", type(err).__name__, err)
     # 先亮出上次的里程/能耗/配置/照片地址快照: HA 重启后这些"变化慢"的传感器不该有一段时间
     # 是 unknown(首轮是轻量刷新, 重数据要到下一轮才拉; 见 light_first_refresh)。
     await coordinator.async_load_heavy()
@@ -321,16 +328,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await charges.async_load()
     coordinator.charges = charges
     if archive.ready:
-        migration = hass.async_create_background_task(
-            _async_import_sync_history(hass, coordinator), "leapmotor raw history migration")
-        entry.async_on_unload(migration.cancel)
+        # ⚠️ 用**条目级**后台任务: 卸载时 HA 会自动取消并等待它, 不要自己注册
+        # `entry.async_on_unload(migration.cancel)` —— 那个回调的契约是
+        # `Callable[[], Coroutine | None]`, 而 `asyncio.Task.cancel()` 返回 bool(任务仍
+        # pending 时是 True)。HA 的 `_async_process_on_unload` 把回调返回值直接交给
+        # create_task → `TypeError: a coroutine was expected, got True` → 条目被打成
+        # 不可恢复的 FAILED_UNLOAD, 只能重启 HA(issue #8 的主症状)。
+        entry.async_create_background_task(
+            hass, _async_import_sync_history(hass, coordinator),
+            "leapmotor raw history migration")
     from .fuel_daily import FuelDayRecorder
     fuel_days = FuelDayRecorder(hass, coordinator.vin, hass.config.time_zone)
     await fuel_days.async_load()
     coordinator.fuel_days = fuel_days
     if coordinator.state is not None:
         charges.process(coordinator.state)
-        await coordinator._sync_associate_live_record("charge", time.time())
+        await coordinator._sync_associate_live_record("charge", _time.time())
     _register_ws_api(hass)
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
@@ -397,10 +410,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 try:
                     await hass.async_add_executor_job(
                         archive.run, "add_capture_event", coordinator.sync_vehicle_id,
-                        {"event":"collector_stopped", "occurred_at_ms":int(time.time()*1000),
+                        {"event":"collector_stopped", "occurred_at_ms":int(_time.time()*1000),
                          "origin":"leapmotor_cloud", "request_result":"entry unloaded"})
                 except Exception as err:
-                    log.warning("同步采集卸载事实写入失败: %s", type(err).__name__)
+                    log.warning("同步采集卸载事实写入失败: %s: %s", type(err).__name__, err)
             from .account_runtime import detach
             detach(coordinator)
         hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
