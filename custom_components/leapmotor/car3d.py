@@ -24,6 +24,7 @@ import time
 import zipfile
 from io import BytesIO
 from pathlib import Path
+from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:                     # 只为类型标注: 本模块的核心逻辑要能离线单测(见 tests/)
@@ -99,6 +100,7 @@ MODEL_PARAM_FIELDS = ("carType", "year", "carTypeCode", "colorCode", "roofColor"
                       "seat", "sdkVersion", "theme", "alias")
 VIEWER_MARK = "index.js"              # 查看器包落盘的标志文件
 MANIFEST_NAME = "manifest.json"
+_MANIFEST_LOCK = RLock()
 THROTTLE_SECONDS = 3                  # 两个素材包之间的请求间隔
 COOLDOWN_SECONDS = 900                # 装配失败后的冷却时间(期间不再自动尝试)
 
@@ -117,24 +119,26 @@ def _vin_fingerprint(vin: object) -> str:
     return vin_fingerprint(vin)
 
 
-def profile_root(hass: HomeAssistant, coord: Any) -> Path:
-    """按 VIN 隔离车模；将单车旧目录无损认领到原车。"""
-    from .const import DOMAIN
-
+async def async_profile_root(hass: HomeAssistant, coord: Any = None) -> Path:
+    """按 VIN 定位车模目录，在 executor 检查旧目录归属。"""
     legacy = root(hass)
-    vin = str(getattr(coord, "vin", "") or "")
-    fingerprint = _vin_fingerprint(vin)
+    fingerprint = _vin_fingerprint(getattr(coord, "vin", None))
     if not fingerprint:
         return legacy
-    manifest = read_manifest(legacy)
-    owner = str(manifest.get("vin_fingerprint") or "")
-    entries = hass.config_entries.async_entries(DOMAIN)
-    if owner == fingerprint:
-        return legacy
-    if not owner and len(entries) == 1:
-        # 单车升级时把现有离线资源标记为该车；后续再添加车辆也不会误共享。
-        write_manifest(legacy, {**manifest, "vin_fingerprint": fingerprint})
-        return legacy
+    single_entry = len(hass.config_entries.async_entries(_domain())) == 1
+    return await hass.async_add_executor_job(_profile_root_sync, legacy, fingerprint, single_entry)
+
+
+def _profile_root_sync(legacy: Path, fingerprint: str, single_entry: bool) -> Path:
+    with _MANIFEST_LOCK:
+        manifest = read_manifest(legacy)
+        owner = str(manifest.get("vin_fingerprint") or "")
+        if owner == fingerprint:
+            return legacy
+        if not owner and single_entry:
+            # 单车升级时认领旧目录，后续加入的车辆使用各自的目录。
+            write_manifest(legacy, {**manifest, "vin_fingerprint": fingerprint})
+            return legacy
     return legacy / "vehicles" / fingerprint
 
 
@@ -171,16 +175,18 @@ def model_ready(base: Path, car_type: str, year: Any, car_type_code: str = "") -
 
 def read_manifest(base: Path) -> dict:
     try:
-        return json.loads((base / MANIFEST_NAME).read_text(encoding="utf-8"))
+        with _MANIFEST_LOCK:
+            return json.loads((base / MANIFEST_NAME).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
 
 
 def write_manifest(base: Path, data: dict) -> None:
     try:
-        base.mkdir(parents=True, exist_ok=True)
-        (base / MANIFEST_NAME).write_text(
-            json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        with _MANIFEST_LOCK:
+            base.mkdir(parents=True, exist_ok=True)
+            (base / MANIFEST_NAME).write_text(
+                json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     except OSError as err:
         log.warning("写 3D 素材清单失败: %s", err)
 
@@ -832,7 +838,7 @@ def _state(hass: HomeAssistant, coord: Any = None) -> dict:
 
 async def async_info(hass: HomeAssistant, coord: Any = None) -> dict:
     """给卡片的现状(不联网): 素材是否就绪 + 车型参数 + 车型色表 + 用户选项。"""
-    base = profile_root(hass, coord) if coord is not None else root(hass)
+    base = await async_profile_root(hass, coord)
     st = await hass.async_add_executor_job(status, base)
     if st["model"] and not st["colors"]:
         st["colors"] = await hass.async_add_executor_job(
@@ -863,9 +869,12 @@ async def async_ensure(hass: HomeAssistant, coord: Any, *, force: bool = False) 
     state = _state(hass, coord)
     if state["state"] == "downloading":
         return {"state": "downloading", "started": False}
-    base = profile_root(hass, coord)
+    base = await async_profile_root(hass, coord)
+    is_ready = not force and await hass.async_add_executor_job(ready, base)
+    if state["state"] == "downloading":
+        return {"state": "downloading", "started": False}
     if not force:
-        if await hass.async_add_executor_job(ready, base):
+        if is_ready:
             return {"state": "ready", "started": False}
         now = time.time()
         if state["last_try"] and now - state["last_try"] < COOLDOWN_SECONDS:

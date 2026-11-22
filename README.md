@@ -9,14 +9,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/MiRaToo/ha-leapmotor-cn/releases/latest"><img alt="发布版 v0.3.5" src="https://img.shields.io/badge/%E7%A8%B3%E5%AE%9A%E7%89%88-v0.3.5-brightgreen.svg"></a>
+  <a href="https://github.com/MiRaToo/ha-leapmotor-cn/releases/latest"><img alt="发布版 v0.3.6" src="https://img.shields.io/badge/%E7%A8%B3%E5%AE%9A%E7%89%88-v0.3.6-brightgreen.svg"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-AGPL--3.0-blue"></a>
   <img alt="Home Assistant" src="https://img.shields.io/badge/Home%20Assistant-2024.11%2B-41BDF5?logo=homeassistant&logoColor=white">
 </p>
 
 这是一个非官方的 Home Assistant 自定义集成。集成通过零跑云端接口登录，提供车辆实体、行程与能耗记录，以及六张可直接加入 Lovelace 仪表盘的卡片。项目与零跑汽车及其关联公司无隶属、合作或背书关系。
 
-当前版本：**v0.3.5**。
+当前版本为 **v0.3.6**。
 
 代码托管：[GitHub](https://github.com/MiRaToo/ha-leapmotor-cn) · [GitCode 同步仓库](https://gitcode.com/MiraRato/ha-leapmotor-cn)。日常更新以 GitHub 为准，GitCode 通过仓库镜像自动同步代码、分支和标签。
 

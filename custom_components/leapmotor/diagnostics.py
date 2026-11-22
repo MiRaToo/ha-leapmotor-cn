@@ -12,6 +12,7 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.loader import async_get_integration
 
 from . import _CARDS, CARD_VERSION, CONTROL_CARD_VERSION, ENERGY_CARD_VERSION, \
     LASTWEEK_CARD_VERSION, TRIPS_CARD_VERSION, car3d
@@ -57,7 +58,7 @@ async def async_get_config_entry_diagnostics(
     # "3dkey 响应异常"/"不是 zip"这两类都是云端响应形状问题, 本地无法复现)。
     car3d_info: dict[str, Any] = {}
     try:
-        base = car3d.profile_root(hass, coord) if coord else car3d.root(hass)
+        base = await car3d.async_profile_root(hass, coord)
         car3d_info = await hass.async_add_executor_job(car3d.status, base)
         car3d_info.pop("dir", None)                    # 本机路径对排查没用
         car3d_info.pop("colors", None)                 # 色表很长, 与故障无关
@@ -68,9 +69,10 @@ async def async_get_config_entry_diagnostics(
     except Exception as err:  # noqa: BLE001  诊断本身绝不能因为子系统异常而失败
         car3d_info = {"status_error": str(err)[:120]}
 
+    integration = await async_get_integration(hass, DOMAIN)
     diag: dict[str, Any] = {
         "integration": {
-            "version": _manifest_version(),
+            "version": str(integration.version or ""),
             "entry_version": getattr(entry, "version", None),
             "entry_data": redact_entry_data(dict(entry.data or {})),
             "vin_fingerprint": vin_fingerprint(
@@ -126,14 +128,3 @@ def _entity_ids(hass: HomeAssistant, entry: ConfigEntry) -> list[str]:
         )
     except Exception:  # noqa: BLE001
         return []
-
-
-def _manifest_version() -> str:
-    """读本集成的 manifest 版本(诊断里要能看出"车主跑的是哪个构建")。"""
-    try:
-        import json
-        from pathlib import Path
-        p = Path(__file__).with_name("manifest.json")
-        return str(json.loads(p.read_text(encoding="utf-8")).get("version") or "")
-    except Exception:  # noqa: BLE001
-        return ""

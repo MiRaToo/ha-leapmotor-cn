@@ -16,21 +16,23 @@
 """
 from __future__ import annotations
 
-import asyncio
 import json
+import logging
 import ssl
+import tempfile
 import time
 import urllib.request
 import zipfile
 from io import BytesIO
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from urllib.parse import urlencode
-import logging
 
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
+from homeassistant.loader import async_get_integration
 import voluptuous as vol
 
 from . import api as _api
@@ -46,6 +48,7 @@ ASSETS_DIRNAME = "leapmotor-assets"
 RISK_KEYWORDS = ("1023", "频繁", "风控")
 # 请求之间的最小间隔(秒): 探针实测 3 秒足够稳, 且不会触发风控
 THROTTLE_S = 3.0
+_FINALIZE_LOCK = Lock()
 
 
 def _coordinator(hass: HomeAssistant, selectors: dict[str, Any]) -> Any:
@@ -88,9 +91,8 @@ def _save_zip_meta(raw: bytes) -> dict:
 
 
 def _collect_sync(client: Any, vin: str, dest: Path, want_h5: bool) -> dict:
-    """阻塞式采集(在 executor 里跑):取 key → 下载各素材包 → 落盘 + manifest。"""
-    dest.mkdir(parents=True, exist_ok=True)
-    out: dict[str, Any] = {"dir": str(dest), "files": [], "keys": {}}
+    """取 key 并将各素材包下载到临时目录。"""
+    out: dict[str, Any] = {"files": [], "keys": {}}
     steps: list[tuple[str, str]] = []   # (标签, key)
 
     # ① 3D key:给车型参数 + h5Key + srcKey
@@ -148,56 +150,58 @@ def _collect_sync(client: Any, vin: str, dest: Path, want_h5: bool) -> dict:
     return out
 
 
-async def _handle_collect(call: ServiceCall) -> dict:
-    hass: HomeAssistant = call.hass
+async def _handle_collect(hass: HomeAssistant, call: ServiceCall) -> dict:
     coord = _coordinator(hass, dict(call.data))
     vin = str(getattr(coord, "vin", "") or "")
     if not vin:
         raise HomeAssistantError("读不到 VIN, 无法采集")
 
     client = coord.client
-    st = getattr(coord, "state", None)
     car_type = str(getattr(coord.session, "car_type", "") or "")
     sub_version = str((coord.entry.data or {}).get("sub_version") or "")
 
     dest_root = Path(hass.config.path(ASSETS_DIRNAME)) / "vehicles" / vin_fingerprint(vin)
-    # 目录名先占位, 拿到 modelParam 后再定(车型_年份)
-    res = await hass.async_add_executor_job(
-        _collect_sync, client, vin, dest_root / f"_tmp_{car_type or 'unknown'}",
+    return await hass.async_add_executor_job(
+        _collect_assets_sync, client, vin, dest_root, car_type, sub_version,
         bool(call.data.get("include_h5", False)),
     )
-    mp = res.get("modelParam") or {}
-    folder = f"{mp.get('carType') or car_type or 'unknown'}_{mp.get('year') or 'na'}"
-    final = dest_root / folder
-    # 改名到 车型_年份(已存在则合并)
-    tmp = Path(res["dir"])
-    if tmp != final:
-        final.mkdir(parents=True, exist_ok=True)
-        for f in tmp.iterdir():
-            f.replace(final / f.name)
-        try:
-            tmp.rmdir()
-        except OSError:
-            pass
 
-    manifest = {
-        "car_type": car_type,
-        "modelParam": mp,
-        "vin_fingerprint": vin_fingerprint(vin),
-        "sub_version": sub_version,
-        "keys": res.get("keys"),
-        "files": res.get("files"),
-        "collected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "note": "云端素材版权归零跑; 本目录仅本地留档, 不随仓库分发。",
-    }
-    (final / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def _collect_assets_sync(
+    client: Any, vin: str, dest_root: Path, car_type: str, sub_version: str, want_h5: bool
+) -> dict:
+    """下载素材并将文件和清单合并到车型目录，在 executor 中运行。"""
+    dest_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=dest_root, prefix="_tmp_") as temp_dir:
+        tmp = Path(temp_dir)
+        res = _collect_sync(client, vin, tmp, want_h5)
+        mp = res.get("modelParam") or {}
+        folder = f"{mp.get('carType') or car_type or 'unknown'}_{mp.get('year') or 'na'}"
+        final = dest_root / folder
+        manifest = {
+            "car_type": car_type,
+            "modelParam": mp,
+            "vin_fingerprint": vin_fingerprint(vin),
+            "sub_version": sub_version,
+            "keys": res["keys"],
+            "files": res["files"],
+            "collected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "note": "云端素材版权归零跑; 本目录仅本地留档, 不随仓库分发。",
+        }
+        manifest_path = tmp / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        with _FINALIZE_LOCK:
+            final.mkdir(parents=True, exist_ok=True)
+            for file in tmp.iterdir():
+                if file != manifest_path:
+                    file.replace(final / file.name)
+            manifest_path.replace(final / manifest_path.name)
 
     log.info("素材采集完成 → %s(%d 个文件)", final, len(res.get("files") or []))
     return {"dir": str(final), **manifest}
 
 
-async def _handle_car3d_probe(call: ServiceCall) -> dict:
+async def _handle_car3d_probe(hass: HomeAssistant, call: ServiceCall) -> dict:
     """3D 素材**深度探针**(只读)。
 
     3D 素材的两类失败只在个别车型上出现("3dkey 响应异常" / "file is not a zip"),
@@ -205,7 +209,6 @@ async def _handle_car3d_probe(call: ServiceCall) -> dict:
     3d/key 的完整响应、两个素材包的状态码/内容类型/字节数/头部、以及 2D 外观图接口。
     报告落到 `config/leapmotor-assets/car3d-diag/`(不写 VIN、不写完整 key), 可直接转发。
     """
-    hass: HomeAssistant = call.hass
     coord = _coordinator(hass, dict(call.data))
     vin = str(getattr(coord, "vin", "") or "")
     if not vin:
@@ -213,10 +216,11 @@ async def _handle_car3d_probe(call: ServiceCall) -> dict:
 
     state = getattr(coord, "state", None)
     signals = dict(getattr(state, "signals", None) or {})
-    base = car3d.profile_root(hass, coord)
+    base = await car3d.async_profile_root(hass, coord)
     st = car3d._state(hass, coord)
+    integration = await async_get_integration(hass, DOMAIN)
     extra = car3d.probe_extra(
-        integration_version=_manifest_version(),
+        integration_version=str(integration.version or ""),
         car_type=str((coord.entry.data or {}).get("car_type") or ""),
         sub_version=str((coord.entry.data or {}).get("sub_version") or ""),
         vin_fingerprint=vin_fingerprint(vin),
@@ -238,20 +242,12 @@ async def _handle_car3d_probe(call: ServiceCall) -> dict:
     return {"dir": str(dest), **report}
 
 
-def _manifest_version() -> str:
-    try:
-        p = Path(__file__).with_name("manifest.json")
-        return str(json.loads(p.read_text(encoding="utf-8")).get("version") or "")
-    except Exception:  # noqa: BLE001
-        return ""
-
-
 async def async_register_asset_services(hass: HomeAssistant) -> None:
     """注册素材采集与诊断服务(幂等)。"""
     if not hass.services.has_service(DOMAIN, "collect_assets"):
 
         async def _svc(call: ServiceCall) -> dict:
-            return await _handle_collect(call)
+            return await _handle_collect(hass, call)
 
         hass.services.async_register(
             DOMAIN,
@@ -269,7 +265,7 @@ async def async_register_asset_services(hass: HomeAssistant) -> None:
     if not hass.services.has_service(DOMAIN, "car3d_probe"):
 
         async def _probe(call: ServiceCall) -> dict:
-            return await _handle_car3d_probe(call)
+            return await _handle_car3d_probe(hass, call)
 
         hass.services.async_register(
             DOMAIN,

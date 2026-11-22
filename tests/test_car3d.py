@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import gzip
 import os
@@ -16,6 +17,8 @@ import pathlib
 import sys
 import zipfile
 from io import BytesIO
+from threading import get_ident
+from types import SimpleNamespace
 
 import pytest
 
@@ -83,6 +86,51 @@ def wrapper_src(tmp_path: pathlib.Path) -> pathlib.Path:
 @pytest.fixture()
 def base(tmp_path: pathlib.Path) -> pathlib.Path:
     return tmp_path / "car3d"
+
+
+def test_profile_root_claims_legacy_assets_in_executor(base, monkeypatch):
+    car3d.write_manifest(base, {"colors": [{"tsp": 7}]})
+    read_manifest = car3d.read_manifest
+    write_manifest = car3d.write_manifest
+    loop_thread = get_ident()
+    entries = [object()]
+
+    def read_in_executor(path):
+        assert get_ident() != loop_thread
+        return read_manifest(path)
+
+    def write_in_executor(path, data):
+        assert get_ident() != loop_thread
+        write_manifest(path, data)
+
+    def configured_entries(domain):
+        assert get_ident() == loop_thread
+        assert domain == "leapmotor"
+        return entries
+
+    monkeypatch.setattr(car3d, "read_manifest", read_in_executor)
+    monkeypatch.setattr(car3d, "write_manifest", write_in_executor)
+    monkeypatch.setattr(car3d, "_domain", lambda: "leapmotor")
+    hass = SimpleNamespace(
+        config=SimpleNamespace(path=lambda _: str(base)),
+        config_entries=SimpleNamespace(async_entries=configured_entries),
+        async_add_executor_job=asyncio.to_thread,
+    )
+
+    async def resolve_profiles():
+        owner = SimpleNamespace(vin=VIN)
+        second_car = SimpleNamespace(vin="LXXXTESTVIN000002")
+        assert await car3d.async_profile_root(hass, owner) == base
+        entries.append(object())
+        assert await car3d.async_profile_root(hass, owner) == base
+        assert await car3d.async_profile_root(hass, second_car) == (
+            base / "vehicles" / car3d._vin_fingerprint(second_car.vin)
+        )
+
+    asyncio.run(resolve_profiles())
+    assert read_manifest(base) == {
+        "colors": [{"tsp": 7}], "vin_fingerprint": car3d._vin_fingerprint(VIN),
+    }
 
 
 def test_static_compression_preserves_sources_and_refreshes_changed_viewer(base, wrapper_src):
