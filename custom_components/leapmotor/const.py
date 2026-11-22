@@ -47,6 +47,16 @@ DEFAULT_CAR3D_BG = "auto"
 
 # ── 能源类型: 燃油数据显不显示(判定见 api.resolve_reev; 实测有纯电车会报假油量) ──
 CONF_ENERGY_TYPE = "energy_type"          # auto(按车端信号自动判定) / bev(纯电) / reev(增程)
+
+# ── 官方充电记录作用域(App 1.23.05「充电记录」) ──
+# off   = 只用当前账号(子账号看不到车主充电记录 → 官方数据为空, 本地估算兜底)
+# owner = 子账号(车辆共享)用车辆列表里的车主 accountId 交换一份**只读**车端 token,
+#         用于读取车主账号才能看到的官方充电记录。仅限本人车辆/本人账号使用。
+CONF_OFFICIAL_CHARGE_SCOPE = "official_charge_scope"
+OFFICIAL_SCOPE_OFF = "off"
+OFFICIAL_SCOPE_OWNER = "owner"
+OFFICIAL_CHARGE_SCOPES = [OFFICIAL_SCOPE_OFF, OFFICIAL_SCOPE_OWNER]
+DEFAULT_OFFICIAL_CHARGE_SCOPE = OFFICIAL_SCOPE_OFF
 ENERGY_AUTO = "auto"
 ENERGY_BEV = "bev"
 ENERGY_REEV = "reev"

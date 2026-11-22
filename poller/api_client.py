@@ -94,6 +94,8 @@ EP_MILEAGE_DETAIL = "v3/api/drivingrecord/mileage/energy/detail"          # 总�
 EP_ENERGY_RANK = "v3/api/drivingrecord/getLastNweeks100kmECAndRank"       # 百公里能耗+排名
 EP_PLUG_ENERGY = "v3/api/drivingrecord/getPlugInLastNweeks100kmEC"        # 电耗/油耗
 EP_LASTWEEK_EC = "v3/api/drivingrecord/getLastweekEC"                     # 上周能耗拆分(驱动/空调/其它)
+EP_CHARGE_DETAIL = "charge/daily/detail/page"           # POST JSON 充电逐笔明细(分页, 仅近三个月)
+EP_CHARGE_YEAR_STAT = "charge/statistic/year"           # POST JSON 年度充电统计
 EP_CAR_PICTURE = "v3/api/carpicture/key"                 # 车辆外观图(返回 OSS 地址)
 EP_CHASSIS_QUERY = "v3/api/chassis/query"                # 底盘/驻车照片(返回 OSS 地址)
 
@@ -1840,6 +1842,49 @@ class LeapmotorClient:
             headers["digest"] = headers["sign"]
         return self._http("POST", url, headers, body, form=False)
 
+    def car_login_as(self, account_id: str | int, tries: int = 4) -> dict:
+        """**按指定账号 ID 交换车端 token**(写回当前会话)。
+
+        与 `car_login()` 完全相同的请求/签名, 只把 body 的 `identifier` 换成传入的
+        账号 ID。用于把「只读数据源」与主会话隔离: 调用方应先在**会话副本**上调用本
+        方法, 再用得到的独立 client 读数据, 不要污染主会话(token/密钥会变)。
+
+        实测(2026-11-21): 车辆共享给子账号时, 车辆列表 raw 里的 `userid` 是**车主**
+        账号 ID。子账号用自己的账号 token 以该 accountId 交换, 会拿到车主作用域的车端
+        JWT, 官方充电记录等「车主可见」的只读数据即可读取。这是云端未公开的作用域
+        行为, 可能随版本失效; 仅限本人所有车辆/账号使用, 且只能用于只读数据。
+        """
+        s = self.session
+        if not s.token:
+            raise RuntimeError("需要先完成账号登录(缺少账号 token)")
+        body = {
+            "identifier": str(account_id),
+            "security": s.token,
+            "identifierType": "1",
+        }
+        variants = [(True, True), (True, False), (False, False)][:max(1, tries)]
+        last: dict = {}
+        for with_sign, upper in variants:
+            resp = self._exchange_once(body, with_sign=with_sign, upper=upper)
+            last = resp
+            data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+            if data.get("accessToken"):
+                s.car_token = str(data.get("accessToken") or s.car_token)
+                s.car_refresh_token = str(data.get("refreshToken") or s.car_refresh_token)
+                if isinstance(data.get("signParam"), dict):
+                    s.sign_param = data["signParam"]
+                if isinstance(data.get("encryptParam"), dict):
+                    s.encrypt_param = data["encryptParam"]
+                uid = data.get("accountId")
+                if uid not in (None, ""):
+                    s.user_id = str(uid)
+                s.hkdf_key_hex = ""          # 会话更新, 旧密钥作废
+                s.seal_key()
+                return resp
+            if resp.get("code") not in SIGNATURE_ERROR_CODES:
+                break
+        return last
+
     def car_login(self, tries: int = 4) -> dict:
         """**车端登录**: 用账号 token 换取车端 JWT 与签名密钥材料。
 
@@ -1872,37 +1917,10 @@ class LeapmotorClient:
         account_id = s.account_id or s.user_id
         if not s.token or not account_id:
             raise RuntimeError("需要先完成账号登录(缺少 token 或 userId)")
-        body = {
-            "identifier": str(account_id),
-            "security": s.token,
-            "identifierType": "1",
-        }
-        # 变体顺序: 抓包形态(大写) → 小写 → 不带签名。命中即停, 失败也不无限重试。
-        variants = [(True, True), (True, False), (False, False)][:max(1, tries)]
-        sig_err = SIGNATURE_ERROR_CODES
-        last: dict = {}
-        for with_sign, upper in variants:
-            resp = self._exchange_once(body, with_sign=with_sign, upper=upper)
-            last = resp
-            data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
-            if data.get("accessToken"):
-                s.car_token = str(data.get("accessToken") or s.car_token)
-                s.car_refresh_token = str(data.get("refreshToken") or s.car_refresh_token)
-                if isinstance(data.get("signParam"), dict):
-                    s.sign_param = data["signParam"]
-                if isinstance(data.get("encryptParam"), dict):
-                    s.encrypt_param = data["encryptParam"]
-                uid = data.get("accountId")
-                if uid not in (None, ""):
-                    s.user_id = str(uid)
-                s.hkdf_key_hex = ""          # 会话更新, 旧密钥作废
-                s.seal_key()
-                log.info("车端交换成功(签名=%s, 大小写=%s)",
-                         "SHA256" if with_sign else "无", "大写" if upper else "小写")
-                return resp
-            if resp.get("code") not in sig_err:
-                break                        # 不是签名问题(如 token 失效)→ 别浪费请求
-        return last
+        resp = self.car_login_as(account_id, tries=tries)
+        if (resp.get("data") or {}).get("accessToken"):
+            log.info("车端交换成功(账号 %s)", str(account_id)[-6:])
+        return resp
 
     def refresh_car_token(self) -> dict:
         """**车端 token 刷新**: 用 refreshToken 换新的 accessToken/refreshToken。
@@ -2433,6 +2451,85 @@ class LeapmotorClient:
     def get_plug_energy(self, vin: str = "") -> dict:
         """电耗/油耗(百公里): GET getPlugInLastNweeks100kmEC → ec100km / oc100km。"""
         return self.car_call(EP_PLUG_ENERGY, {"carvin": vin or self.session.car_vin})
+
+    # ---- 官方充电记录(App 1.23.05 新增) ----
+    def get_charge_records(self, vin: str = "", *, start_time: str, end_time: str,
+                           timezone: str = "UTC+8", page_size: int = 100,
+                           max_pages: int = 10) -> dict:
+        """充电逐笔明细(官方「充入电量」数据源)。
+
+        实测 `POST /carownerservice/charge/daily/detail/page`(JSON body, 参与签名):
+            {"vin": ..., "timeZone": "UTC+8", "startTime": "2026-09-01",
+             "endTime": "2026-11-21", "pageNum": 1, "pageSize": 100}
+        → {"code":0,"result":0,"data":{"pageNum":1,"pageSize":100,"total":11,
+           "list":[{"chargeGunStartTs":1793541608000,"chargeGunEndTs":1793573963000,
+                    "chargeEarliestTs":...,"chargeLatestTs":...,
+                    "chargeType":"SLOW"|"QUICK","chargeInEnergy":56.11,
+                    "chargeStartLongitude":"...","chargeStartLatitude":"...",
+                    "zone":"UTC+8"}, …]}}
+        - 服务端只保留近三个月左右; 更早的区间会返回空列表。
+        - CN 侧 `chargeType` 是 **"SLOW"/"QUICK" 字符串**(海外旧版是 "1"/"2"),
+          映射为本地 `ac`/`dc`; `chargeInEnergy` 单位 kWh(即 App 显示的「度」)。
+        - `totalPage` 实测恒为 0, 分页用 `total` 与返回条数判断。
+        返回原始响应(dict); 解析/归一化见 official_charge.py。
+        """
+        vin = vin or self.session.car_vin
+        params = {
+            "vin": vin, "timeZone": timezone,
+            "startTime": start_time, "endTime": end_time,
+            "pageNum": 1, "pageSize": max(1, int(page_size)),
+        }
+        first = self.car_call(EP_CHARGE_DETAIL, dict(params), method="POST")
+        total = None
+        data = first.get("data") if isinstance(first, dict) else None
+        if isinstance(data, dict):
+            rows = list(data.get("list") or [])
+            try:
+                total = int(data.get("total") or 0)
+            except (TypeError, ValueError):
+                total = None
+        else:
+            rows = []
+        if not rows or total is None or len(rows) >= total:
+            return first
+        merged = dict(first)
+        merged_data = dict(data or {})
+        merged_data["list"] = rows
+        page = 2
+        while page <= max_pages and len(rows) < total:
+            params["pageNum"] = page
+            resp = self.car_call(EP_CHARGE_DETAIL, dict(params), method="POST")
+            page_data = resp.get("data") if isinstance(resp, dict) else None
+            chunk = list((page_data or {}).get("list") or [])
+            if not chunk:
+                break
+            rows.extend(chunk)
+            page += 1
+        merged_data["list"] = rows
+        merged_data["total"] = max(total or 0, len(rows))
+        merged["data"] = merged_data
+        return merged
+
+    def get_charge_year_stat(self, vin: str = "", year: int | None = None,
+                             timezone: str = "UTC+8") -> dict:
+        """年度充电统计(累计充入电量/次数/快充占比 + 逐月电量)。
+
+        实测 `POST /carownerservice/charge/statistic/year`(JSON body):
+            {"vin": ..., "year": 2026}   # timeZone 可选, 服务端会忽略
+        → {"code":0,"result":0,"data":{
+             "totalChargeCounts":35,"totalChargeInEnergy":1612.0,
+             "fastChargePercent":82.9,
+             "chargeStatisList":[{"vin":"...","statisDay":"2026-11-01 00:00:00",
+                                  "accountId":"...","chargeInEnergy":67.07},…]}}
+        - `year` 必填; 无数据年份返回 0/0/0 且 `chargeStatisList` 为 null。
+        - `chargeStatisList` 是按月聚合(`statisDay` 为该月 1 日), 只有月电量。
+        - 该接口只能看到「车主账号」的充电记录; 子账号实测返回空(见 PRIVATE 文档)。
+        """
+        if year is None:
+            year = int(datetime.now().year)
+        return self.car_call(EP_CHARGE_YEAR_STAT,
+                             {"vin": vin or self.session.car_vin, "year": int(year)},
+                             method="POST")
 
     def get_lastweek_ec(self, vin: str = "", begintime: int | None = None,
                         endtime: int | None = None) -> dict:

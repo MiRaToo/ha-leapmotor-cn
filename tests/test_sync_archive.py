@@ -145,10 +145,12 @@ def test_group_completion_with_reused_sample_and_native_restart_import(tmp_path)
     a,vid,_=archive(tmp_path)
     point=a.ingest(vid,"signal_map",{"1204":40},{"collectTime":1},1)
     a.associate_observation(vid,"charge","one",point,"recording",1)
+    recording_membership=a.membership_page(vid,"charge","one")["membership_revision"]
     cursor=a.bootstrap(vid)["cursor"]
     a.associate_observation(vid,"charge","one",point,"completed",1,2)
     row=a.records_page(vid)["records"][0]
     assert row["phase"]=="completed" and row["revision"]==2
+    assert a.membership_page(vid,"charge","one")["membership_revision"]==recording_membership
     assert len(a.observations(vid,record_id="one",kind="charge")["points"])==1
     assert a.import_legacy(vid,"charge","one",[[1,40]],{})==0
     assert len(a.observations(vid)["points"])==1
@@ -275,4 +277,83 @@ def test_ha_stop_only_marks_currently_loaded_vehicle_collectors(tmp_path):
     assert [i["data"]["event"] for i in a.bootstrap(va)["items"]]==["collector_stopped"]
     assert a.bootstrap(vb)["items"]==[]
     a.close(); a.shutdown()
+
+
+def test_membership_revisions_are_immutable_paginated_and_coverage_explicit(tmp_path):
+    a,va,vb=archive(tmp_path)
+    a.put_record(va,"trip","membership",{"phase":"completed","revision":1})
+    initial=a.membership_page(va,"trip","membership")
+    assert initial["membership_revision"]==1 and initial["coverage"]=="unavailable"
+    assert initial["observation_count"]==0 and initial["observation_ids"]==[]
+
+    ids=[a.ingest(va,"signal_map",{"1204":i},{"sts":i+1},i+1)
+         for i in range(205)]
+    revision=a.replace_record_membership(va,"trip","membership",ids,"complete")
+    assert revision=={"membership_revision":2,"coverage":"complete","observation_count":205}
+    first=a.membership_page(va,"trip","membership",2,None,100)
+    second=a.membership_page(va,"trip","membership",None,first["next_page_token"],100)
+    third=a.membership_page(va,"trip","membership",None,second["next_page_token"],100)
+    assert len(first["observation_ids"])==100 and len(second["observation_ids"])==100
+    assert len(third["observation_ids"])==5 and third["has_more"] is False
+    assert first["observation_ids"]+second["observation_ids"]+third["observation_ids"]==ids
+    assert first["snapshot_id"]==second["snapshot_id"]==third["snapshot_id"]
+
+    extra=a.ingest(va,"signal_map",{"1204":205},{"sts":206},206)
+    a.replace_record_membership(va,"trip","membership",[*ids,extra],"complete")
+    old_ids=[]; old_token=None
+    while True:
+        old_page=a.membership_page(va,"trip","membership",2,old_token,200)
+        old_ids.extend(old_page["observation_ids"])
+        if not old_page["has_more"]: break
+        old_token=old_page["next_page_token"]
+    current=a.membership_page(va,"trip","membership",None,None,200)
+    current_tail=a.membership_page(va,"trip","membership",None,current["next_page_token"],200)
+    assert old_ids==ids and current["observation_count"]==206
+    assert current["membership_revision"]==3 and len(current_tail["observation_ids"])==6
+    assert current_tail["observation_ids"][-1]==extra
+    with pytest.raises(ValueError,match="not_found|invalid_cursor"):
+        a.membership_page(vb,"trip","membership",2,first["next_page_token"],100)
+    a.close(); a.shutdown()
+
+
+def test_membership_partial_association_and_observation_delete_advance_revision(tmp_path):
+    a,vid,_=archive(tmp_path)
+    a.put_record(vid,"trip","partial",{"phase":"recording","revision":1})
+    first=a.ingest(vid,"signal_map",{"1204":1},{"sts":1},1)
+    second=a.ingest(vid,"signal_map",{"1204":2},{"sts":2},2)
+    a.associate_observation(vid,"trip","partial",first,"recording",1)
+    partial=a.membership_page(vid,"trip","partial")
+    assert partial["coverage"]=="partial" and partial["observation_ids"]==[first]
+    a.associate_observation(vid,"trip","partial",second,"recording",1)
+    old_revision=partial["membership_revision"]
+    a.delete_entity(vid,"observation",first)
+    current=a.membership_page(vid,"trip","partial")
+    old=a.membership_page(vid,"trip","partial",old_revision)
+    assert current["membership_revision"]>old_revision
+    assert current["observation_ids"]==[second]
+    assert old["observation_ids"]==[first]
+    record=a.records_page(vid)["records"][0]
+    assert record["membership_revision"]==current["membership_revision"]
+    assert record["membership_coverage"]=="partial"
+    a.close(); a.shutdown()
+
+
+def test_existing_links_are_backfilled_as_conservative_partial_membership(tmp_path):
+    path=tmp_path/"membership-backfill.sqlite"
+    a=SyncArchive(path); a.open(); vid=a.ensure_vehicle("VIN-BACKFILL")
+    point=a.ingest(vid,"signal_map",{"1204":1},{"sts":1},1)
+    a.put_record(vid,"trip","old",{"phase":"completed","revision":1})
+    a.associate_observation(vid,"trip","old",point,"completed",1,2)
+    a._c().execute("DELETE FROM record_membership_items")
+    a._c().execute("DELETE FROM record_memberships")
+    a._c().commit(); a.close(); a.shutdown()
+    b=SyncArchive(path); b.open()
+    page=b.membership_page(vid,"trip","old")
+    assert page["membership_revision"]==1 and page["coverage"]=="partial"
+    assert page["observation_ids"]==[point]
+    migrated=b.records_page(vid)["records"][0]
+    assert migrated["membership_revision"]==1
+    assert migrated["membership_coverage"]=="partial"
+    assert migrated["observation_count"]==1
+    b.close(); b.shutdown()
 

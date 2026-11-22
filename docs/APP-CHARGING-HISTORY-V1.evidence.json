@@ -1,0 +1,53 @@
+{
+  "package": "A5",
+  "status": "code-complete-offline-verified",
+  "chargeHistoryIndexTests": {
+    "tests": 8,
+    "passed": 8,
+    "failed": 0
+  },
+  "chargingRecorderRegression": {
+    "tests": 32,
+    "passed": 32,
+    "failed": 0
+  },
+  "chargingWebSocketContractTests": {
+    "tests": 3,
+    "passed": 3,
+    "failed": 0
+  },
+  "dailyEnergyV1Regression": {
+    "tests": 20,
+    "passed": 20,
+    "failed": 0
+  },
+  "legacyDailyEnergyRegression": {
+    "tests": 11,
+    "passed": 11,
+    "failed": 0
+  },
+  "syncArchiveRegression": {
+    "tests": 20,
+    "passed": 20,
+    "failed": 0
+  },
+  "syncWebSocketRegression": {
+    "tests": 6,
+    "passed": 6,
+    "failed": 0
+  },
+  "pythonSyntaxCompile": true,
+  "independentStoreNamespace": true,
+  "stableDatasetEpochAndChangeSequence": true,
+  "immutableSnapshotPagination": true,
+  "coveragePartialBeforeIndexStart": true,
+  "legacy400RowsPromotedAsComplete": false,
+  "unknownEnergyFabricatedAsZero": false,
+  "deletionTombstone": true,
+  "energyAndMoneyBasis": true,
+  "rawSamplesCopied": false,
+  "legacyHistoryCommandChanged": false,
+  "realHomeAssistant": false,
+  "realDataCompared": false,
+  "deviceTested": false
+}

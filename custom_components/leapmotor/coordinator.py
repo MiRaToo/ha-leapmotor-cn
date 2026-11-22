@@ -7,6 +7,7 @@ import base64
 import functools
 import json
 import logging
+import math
 import time
 from dataclasses import asdict
 from typing import Any
@@ -69,10 +70,15 @@ from .const import (
 )
 from .energy_daily import (
     compose_days,
+    compose_days_v1,
+    day_windows_v1,
     ENERGY_FETCH_BUDGET_HEAVY,
     ENERGY_FETCH_BUDGET_WS,
     EnergyDayStore,
     parse_getec_day,
+    parse_getec_day_v1,
+    trip_rows_by_windows_v1,
+    valid_iana_timezone,
 )
 
 # 账号 token 续期窗口: 到期前 30 分钟就用 refreshToken 免短信续一次(实测可用)
@@ -105,6 +111,15 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #    第 79 行一调用就 AttributeError, 整个集成 setup_error。
         self.trips = None                # 行程记录器(见 trips.py, 由 __init__.py 挂上)
         self.energy_days = None          # 官方逐日能耗缓存(见 energy_daily.py, 由 __init__.py 挂上)
+        self.daily_energy_v1 = None
+        self._daily_energy_v1_lock = asyncio.Lock()
+        self.charge_history_index = None
+        self.official_charges = None       # 官方充电记录缓存(见 official_charge.py)
+        self._official_charge_lock = asyncio.Lock()
+        # 只读作用域客户端(车主账号): 仅用于读官方充电记录, 与主会话完全隔离
+        self._official_scope_client = None
+        self._official_scope_expiry = 0.0
+        self._official_scope_error = ""
         self.charges = None              # 驻车充电账本，仅吃本轮成功取得的原始帧
         # 是不是增程车: 带记忆的判定(只升不降, 见 api.resolve_reev)。持久化在 config entry
         # 的 `data["reev"]` 里 —— 上次判定过就直接沿用, 不必等这一帧再"看到油"。
@@ -345,12 +360,116 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     return {**self.data, "session_problem": self.session_problem}
                 raise UpdateFailed(str(err)) from err
         finally:
+            # 官方充电记录(App 1.23.05): 低频只读同步, 失败不影响本轮轮询。
+            official = getattr(self, "official_charges", None)
+            if official is not None and self.charges is not None:
+                try:
+                    if official.due():
+                        self.hass.async_create_task(self.async_sync_official_charges())
+                except Exception:  # noqa: BLE001 - 同步调度失败不应影响车况轮询
+                    pass
             # 诊断用: 请求本身约 0.2 秒; 这里常年几十秒说明网络层在等超时/重试(不是 HA 线程池)
             self.last_cycle_seconds = time.monotonic() - t0
             if self.last_cycle_seconds > 60:
                 log.warning("本轮轮询耗时 %.0f 秒(请求本身约 0.2 秒; 多半在等网络超时/重试)",
                             self.last_cycle_seconds)
         return result
+
+    # ---- 官方充电记录: 只读作用域(车主账号) ----
+    def official_scope_enabled(self) -> bool:
+        """选项是否允许用车主账号(只读)读取官方充电记录。"""
+        from .const import CONF_OFFICIAL_CHARGE_SCOPE, OFFICIAL_SCOPE_OWNER
+
+        return str(self.entry.options.get(CONF_OFFICIAL_CHARGE_SCOPE) or "") == OFFICIAL_SCOPE_OWNER
+
+    def _official_owner_account_id(self) -> str:
+        """本车车主账号 ID(车辆列表 raw.userid); 与当前账号相同则返回空。"""
+        from .official_charge import vehicle_owner_account_id
+
+        owner = vehicle_owner_account_id(getattr(self, "vehicle", None))
+        mine = str(self.session.account_id or self.session.user_id or "")
+        return "" if not owner or owner == mine else owner
+
+    async def _async_official_read_client(self):
+        """返回 (client, scope); scope 为空表示用主会话。
+
+        只在选项允许 + 车辆是共享车(车主账号≠当前账号)时才交换只读 scope 客户端。
+        交换失败返回主会话 + 空 scope(读不到就用本地估算, 不报错)。
+        """
+        from .official_charge import make_owner_scope_client
+
+        owner = self._official_owner_account_id()
+        if owner and self.official_scope_enabled():
+            reuse = (self._official_scope_client is not None
+                     and self._official_scope_expiry > time.time() + 300)
+            if reuse:
+                return self._official_scope_client, "owner"
+            scoped, resp = await self.hass.async_add_executor_job(
+                make_owner_scope_client, self.client, owner)
+            if scoped is not None:
+                self._official_scope_client = scoped
+                self._official_scope_expiry = time.time() + 7000  # 车端 JWT 约 2 小时
+                self._official_scope_error = ""
+                log.info("官方充电记录: 已切换到车主账号只读作用域(%s)", str(owner)[-6:])
+                return scoped, "owner"
+            self._official_scope_error = str((resp or {}).get("message") or "交换失败")[:80]
+            log.debug("车主账号只读作用域交换失败(继续用当前账号): %s", self._official_scope_error)
+        return self.client, ""
+
+    # ---- 官方充电记录(App 1.23.05; 低频只读, 只补充电账本) ----
+    async def async_sync_official_charges(self, *, force: bool = False) -> dict[str, Any]:
+        """同步官方充电逐笔明细与年度统计, 并把官方充入电量并入本地充电账本。
+
+        - 只读云端, 失败不抛异常(返回 error 字段), 不影响轮询。
+        - 首次调用或距上次成功超过 `SYNC_MIN_INTERVAL_SECONDS` 才真正请求。
+        - 官方明细只覆盖近三个月; 更早的历史仍以本地记录/估算为准。
+        """
+        from .official_charge import fetch_snapshot
+
+        store = getattr(self, "official_charges", None)
+        recorder = getattr(self, "charges", None)
+        if store is None or recorder is None:
+            return {"skipped": "not_ready"}
+        async with self._official_charge_lock:
+            now = time.time()
+            if not force and not store.due(now):
+                return {"skipped": "not_due", "fetched_at": store.fetched_at}
+            # 选项要求用车主账号读取时, 必须等车辆列表加载完(拿到 raw.userid)再同步;
+            # 否则按当前账号请求会拿到"空但成功", 把好数据误判成没充电。
+            if self.official_scope_enabled() and self.vehicle is None:
+                return {"skipped": "vehicle_pending"}
+            client, scope = await self._async_official_read_client()
+            try:
+                snapshot = await self.hass.async_add_executor_job(
+                    fetch_snapshot, client, self.vin)
+            except Exception as err:  # noqa: BLE001
+                store.last_error = f"同步失败: {type(err).__name__}"
+                store._save()
+                return {"error": store.last_error}
+            records = store.apply_snapshot(snapshot)
+            if store.available:
+                matches = store.match(recorder.sessions)
+                changed = recorder.apply_official(matches)
+            else:
+                # 当前作用域看不到官方数据(子账号且未启用 owner 作用域): 清掉可能残留的绑定,
+                # 避免把上一个账号/上一次同步的车主私密数据展示给现在的账号。
+                matches = {}
+                changed = recorder.clear_official()
+            if snapshot.get("error"):
+                # 部分失败时 30 分钟后再试, 不要等满同步周期。
+                from .official_charge import SYNC_MIN_INTERVAL_SECONDS
+                store.fetched_at = now - (SYNC_MIN_INTERVAL_SECONDS - 1800)
+                store._save()
+            log.debug("官方充电记录同步: 明细 %d 条, 匹配本地 %d 条(变更 %d), error=%s",
+                      len(records), len(matches), changed, snapshot.get("error"))
+            return {
+                "records": len(records),
+                "matched": len(matches),
+                "changed": changed,
+                "error": snapshot.get("error"),
+                "available": store.available,
+                "scope": scope,
+            }
 
     async def _collect(self, account_retried: bool = False) -> dict[str, Any]:
         self._last_resp = None
@@ -727,7 +846,12 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # ── 官方逐日能耗(getEC): 缓慢补拉缺的日子 ──
         # 刚升级时缓存是空的, 卡片按需路径会补大头; 这里每轮重数据周期再补几天兜底,
         # 保证"不点卡片也能把历史补齐"。失败的日有 1 小时重试间隔, 不会死磕。
-        if self.energy_days is not None:
+        if getattr(self, "daily_energy_v1", None) is not None:
+            try:
+                await self.ensure_energy_days_v1(7, budget=ENERGY_FETCH_BUDGET_HEAVY)
+            except Exception:  # noqa: BLE001
+                log.debug("daily energy v1 background refresh failed", exc_info=True)
+        elif self.energy_days is not None:
             try:
                 await self.ensure_energy_days(7, budget=ENERGY_FETCH_BUDGET_HEAVY)
             except Exception as err:  # noqa: BLE001
@@ -1271,6 +1395,115 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return {"days": out, "source": source, "pending": pending,
                 "coverage_from": cov}
 
+    def daily_energy_v1_available(self) -> bool:
+        """Whether every local prerequisite for advertising daily-energy v1 exists."""
+        store = getattr(self, "daily_energy_v1", None)
+        archive = getattr(self, "sync_archive", None)
+        return bool(
+            store is not None
+            and getattr(self, "trips", None) is not None
+            and valid_iana_timezone(getattr(getattr(self, "hass", None).config, "time_zone", None))
+            and str(getattr(store, "vin", "") or "").strip().upper()
+                == str(getattr(self, "vin", "") or "").strip().upper()
+            and getattr(archive, "ready", False)
+            and str(getattr(self, "sync_vehicle_id", "") or "").strip()
+        )
+
+    def charge_history_v1_available(self) -> bool:
+        """Whether the persistent charge index and archive identity are ready."""
+        index = getattr(self, "charge_history_index", None)
+        archive = getattr(self, "sync_archive", None)
+        return bool(
+            index is not None
+            and str(getattr(index, "vin", "") or "").strip().upper()
+                == str(getattr(self, "vin", "") or "").strip().upper()
+            and getattr(archive, "ready", False)
+            and str(getattr(self, "sync_vehicle_id", "") or "").strip()
+        )
+
+    async def ensure_energy_days_v1(self, days: int = 7, *, budget: int = ENERGY_FETCH_BUDGET_WS) -> dict:
+        """Strict daily-energy v1 path. One per-coordinator lock covers plan, network and save."""
+        store = self.daily_energy_v1
+        zone = valid_iana_timezone(getattr(self.hass.config, "time_zone", None))
+        if store is None or zone is None:
+            raise RuntimeError("daily_energy_unavailable")
+        if (not isinstance(days, int) or isinstance(days, bool)
+                or days < 1 or days > 31 or not isinstance(budget, int)
+                or isinstance(budget, bool) or budget < 1 or budget > 31):
+            raise ValueError("invalid_format")
+        async with self._daily_energy_v1_lock:
+            started_at = int(time.time())
+            windows = day_windows_v1(days, zone, started_at)
+            todo = store.plan(windows, zone, started_at, budget)
+            for day, begin, end in todo:
+                try:
+                    response = await self.hass.async_add_executor_job(
+                        self.client.get_lastweek_ec, self.vin, begin, end)
+                except Exception:  # noqa: BLE001
+                    store.miss(day, started_at)
+                    continue
+                if is_rate_limited(response if isinstance(response, dict) else None):
+                    self._enter_rate_limit("daily energy getEC rate limited")
+                    store.miss(day, started_at)
+                    break
+                parsed = parse_getec_day_v1(response)
+                if isinstance(parsed, dict):
+                    store.record(day, parsed, zone, begin, end, started_at)
+                else:
+                    # code100 and malformed/partial payloads are never official zero.
+                    store.miss(day, started_at)
+            # A network call may cross local midnight. Cache rows fetched under the old
+            # window remain useful only with their exact proof bounds; regenerate today's
+            # response window after all waits complete.
+            generated_at = int(time.time())
+            current_windows = day_windows_v1(days, zone, generated_at)
+            return self.energy_days_v1_view(days, now=generated_at, windows=current_windows)
+
+    def energy_days_v1_view(self, days: int = 7, *, now: float | None = None,
+                            windows: list[tuple[str, int, int]] | None = None) -> dict:
+        store = self.daily_energy_v1
+        zone = valid_iana_timezone(getattr(self.hass.config, "time_zone", None))
+        if store is None or zone is None:
+            raise RuntimeError("daily_energy_unavailable")
+        stamp = int(time.time() if now is None else now)
+        win = windows or day_windows_v1(days, zone, stamp)
+        if len(win) != days:
+            raise ValueError("invalid_format")
+        trip_rows = (trip_rows_by_windows_v1(list(self.trips.trips), win, zone)
+                     if self.trips is not None else {})
+        cloud_km = self._cloud_mileage_by_day()
+        km_by_day: dict[str, float] = {}
+        km_sources: dict[str, str] = {}
+        for day, _begin, _end in win:
+            trip_row = trip_rows.get(day) or {}
+            if trip_row.get("km") is not None:
+                km_by_day[day] = float(trip_row["km"])
+                km_sources[day] = "trip"
+            elif cloud_km.get(day) is not None:
+                km_by_day[day] = float(cloud_km[day])
+                km_sources[day] = "official"
+        official = {}
+        official_status = {}
+        today = win[-1][0]
+        for day, begin, end in win:
+            state = store.state(day, zone, begin, end, today=day == today, now=stamp)
+            if state:
+                official[day], official_status[day] = state
+        rows = compose_days_v1(win, official, km_by_day, km_sources, trip_rows,
+                               now=stamp, today=today,
+                               official_status=official_status)
+        known = [row for row in rows if row["km"] is not None or row["kwh"] is not None]
+        sources = {row[source] for row in rows
+                   for source in ("km_src", "kwh_src") if row[source] is not None}
+        source = ("mixed" if len(sources) > 1
+                  else "official" if "official" in sources
+                  else "trip" if "trip" in sources
+                  else "official")
+        return {"daily_energy_version": 1, "time_zone": zone, "generated_at": stamp,
+                "days": rows, "source": source,
+                "pending": sum(1 for row in rows if row["km_status"] == "pending" or row["kwh_status"] == "pending"),
+                "coverage_from": known[0]["day"] if known else None}
+
     def _cloud_mileage_by_day(self) -> dict[str, float]:
         """「近7天里程」传感器那份逐日里程(day → km); 拿不到就空 dict。"""
         mileage = ((self.data or {}).get("mileage") or {})
@@ -1284,9 +1517,12 @@ class LeapmotorCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             km = x.get("accumulatedMileage")
             if day and km is not None:
                 try:
-                    out[day] = float(km)
-                except (TypeError, ValueError):
+                    value = float(km)
+                except (TypeError, ValueError, OverflowError):
                     pass
+                else:
+                    if math.isfinite(value) and value >= 0:
+                        out[day] = value
         return out
 
     def set_charge_plan_cache(self, key: str, value) -> None:

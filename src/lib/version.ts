@@ -7,7 +7,7 @@ export const CARD_VERSIONS = {
   map: "1.6.21",
   trips: "1.6.28",
   control: "1.9.77",
-  energy: "1.4.16",
+  energy: "1.4.17",
   lastweek: "1.1.22",
   metrics: "1.0.9",
 } as const;

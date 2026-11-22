@@ -29,6 +29,9 @@
 | [开发指南](DEVELOPMENT.md) | 代码结构、实体与指令扩展、构建、测试和调试 |
 | [云 API 协议](PROTOCOL.md) | 已确认的接口、签名、信号与指令约定 |
 | [HA / App 原始数据同步协议 v1](APP-DATA-SYNC-V1.md) | 逐条同步、完整采样、车辆隔离、游标与旧数据边界；待 App 联调 |
+| [App 逐日能耗 v1](APP-DAILY-ENERGY-V1.md) | `leapmotor/energy/daily` 的 v1 契约与能力声明 |
+| [App 充电历史 v1](APP-CHARGING-HISTORY-V1.md) | `leapmotor/charging/records/v1` 的分页、游标与幂等约定 |
+| [App 数据同步 membership v1](APP-DATA-SYNC-MEMBERSHIP-V1.md) | 多车隔离、成员加入/离开与车辆列表契约 |
 
 ## 文档维护约定
 

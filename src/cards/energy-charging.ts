@@ -14,6 +14,10 @@ export interface Tariff {
 export interface ChargeDay {
   day: string; kwh: number; grid_kwh: number; peak_kwh: number; valley_kwh: number;
   cost: number | null; consumed_kwh?: number | null;
+  /** 官方充电记录口径的当日电量(App 1.23.05); 缺省表示本机估算。 */
+  official_kwh?: number | null;
+  /** 当日电量来源: official=官方记录, estimated=本机估算, mixed=两者都有。 */
+  kwh_src?: "official" | "estimated" | "mixed" | null;
 }
 export interface ChargeSession {
   id: string; started_at: number; ended_at?: number; last_at: number;
@@ -25,6 +29,10 @@ export interface ChargeSession {
   /** SOC values aligned by index with power_samples; null means the vehicle omitted that frame. */
   soc_samples?:(number|null)[];
   price_override?:{mode:'unit'|'total';value:number}|null;
+  /** 官方「充入电量」(kWh); 有值时 kwh 已按官方口径显示。 */
+  official_energy_kwh?: number | null;
+  /** 电量口径: official=官方记录, estimated=本机估算。 */
+  energy_basis?: "official" | "estimated" | "mixed" | null;
 }
 export type ChargePowerSample = [number,number|null];
 export function sessionSocSamples(s:ChargeSession): (number|null)[] {
@@ -38,8 +46,17 @@ export interface ChargeData {
   vin?: string; days: ChargeDay[]; sessions: ChargeSession[]; tariff: Tariff;
   active: boolean; revision: number; timezone: string;
   summary: { kwh: number; grid_kwh: number; cost: number | null; count: number };
+  /** 官方年度充电统计(App 1.23.05); 账号看不到车主记录时为 null。 */
+  official_year_stats?: { year?: number; kwh?: number | null; sessions?: number | null;
+    fast_charge_percent?: number | null; updated_at?: number | null } | null;
+  official?: unknown;
 }
 export const decimal = (n: number | null | undefined, digits = 1) => n == null || !Number.isFinite(n) ? "—" : n.toLocaleString("zh-CN", {minimumFractionDigits:digits,maximumFractionDigits:digits});
+/** 官方「充入电量」优先; 没有官方值时返回 null, 由调用方回退到本机估算。 */
+const officialKwhOf=(s:ChargeSession):number|null=>{
+  if(s.official_energy_kwh!=null&&Number.isFinite(s.official_energy_kwh))return s.official_energy_kwh;
+  return s.energy_basis==="official"&&s.kwh!=null&&Number.isFinite(s.kwh)?s.kwh:null;
+};
 const clock = (ts: number, zone: string, date = true) => new Intl.DateTimeFormat("zh-CN", {
   timeZone: zone, ...(date ? {month:"numeric",day:"numeric"} as const : {}),hour:"2-digit",minute:"2-digit",hour12:false,
 }).format(new Date(ts*1000));
@@ -104,7 +121,7 @@ export function chargePanel(data: ChargeData | null, error: string, selected: nu
     {key:'cost',label:'电费',unit:'元',color:'#6c86e8',values:days.map(d=>d.cost),axis:costAxis}].filter(v=>plot.series.includes(v.key));
   const y=(v:number,axis:{max:number})=>bottom-v/axis.max*height;
   const pick=days[selected];
-  const tip=pick?html`<div class="chargeTip on" style=${`--tip-x:${x(selected)/width*100}%`} aria-live="polite"><b>${pick.day}</b>${series.map(v=>html`<span><i style=${'background:'+v.color}></i>${v.label} ${decimal(v.values[selected],2)} ${v.unit}</span>`)}</div>`:nothing;
+  const tip=pick?html`<div class="chargeTip on" style=${`--tip-x:${x(selected)/width*100}%`} aria-live="polite"><b>${pick.day}</b>${series.map(v=>html`<span><i style=${'background:'+v.color}></i>${v.label} ${decimal(v.values[selected],2)} ${v.unit}</span>`)}${pick.kwh_src==="official"?html`<span>电量来源：官方</span>`:nothing}</div>`:nothing;
   const graph=html`<div class="chargeChart"><svg viewBox=${`0 0 ${width} 176`} preserveAspectRatio="none" class="chargeSvg" role="img" aria-label="逐日充电与行驶耗电趋势图">
     ${(series.some(s=>s.key!=='cost')?axis:costAxis).ticks.map(t=>svg`<line x1="32" x2=${width-18} y1=${y(t,series.some(s=>s.key!=='cost')?axis:costAxis)} y2=${y(t,series.some(s=>s.key!=='cost')?axis:costAxis)} class="gridline"/><text x="26" y=${y(t,series.some(s=>s.key!=='cost')?axis:costAxis)+3} text-anchor="end" class="axisTxt">${fmtTick(t)}</text>`)}
     ${series.some(s=>s.key==='cost')&&series.length>1?costAxis.ticks.map(t=>svg`<text x=${width-14} y=${y(t,costAxis)+3} class="axisTxt" fill="#6c86e8">${fmtTick(t)}</text>`):nothing}
@@ -113,7 +130,9 @@ export function chargePanel(data: ChargeData | null, error: string, selected: nu
     ${days.map((d,i)=>svg`<g role="button" tabindex="0" aria-pressed=${selected===i} aria-label=${d.day+' 查看详情'} @click=${(e:MouseEvent)=>{if(e.detail===0)choose(i)}} @keydown=${(e:KeyboardEvent)=>{if(['Enter',' ','ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();choose(Math.max(0,Math.min(count-1,i+(e.key==='ArrowLeft'?-1:e.key==='ArrowRight'?1:0))))}}}><rect class="chartHit" x=${32+i*step} y="28" width=${step} height=${height}/>${(count-1-i)%Math.max(1,Math.ceil(count/Math.max(2,Math.floor((width-50)/34))))===0?svg`<text x=${x(i)} y="170" text-anchor="middle" class="axisTxt">${d.day.slice(5).replace('-','/')}</text>`:nothing}</g>`)}
     </svg>${tip}</div>`;
   const metric=(label:string,value:string,unit="")=>html`<div class="chargeDataMetric"><span>${label}</span><b>${value}${unit?html`<i>${unit}</i>`:nothing}</b></div>`;
-  return html`<section class="chargePlot"><div class="plotHeading"><b>充电与行驶耗电</b><span>${[series.some(s=>s.key!=='cost')?'kWh':'',series.some(s=>s.key==='cost')?'元':''].filter(Boolean).join(' · ')} / 日</span></div>${graph}<div class="chargeCtrls"><div class="chargeSeries">${[['charge','充电','#40b49d'],['used','行驶耗电','#e6a15a'],['cost','电费','#6c86e8']].map(([key,label,color])=>html`<button aria-pressed=${plot.series.includes(key)} class=${plot.series.includes(key)?'on':''} @click=${()=>plot.toggle(key)}><i style=${'background:'+color}></i>${label}</button>`)}</div><div class="chargeRange">${rangeTools}<button class="chartSwitch" @click=${()=>plot.switchChart()}>${plot.chart==='bar'?'柱状':'折线'}</button></div></div></section><section class="chargeRecords"><div class="plotHeading"><b>充电记录</b><span>${data.summary.count} 次${data.active?" · 正在充电":""}</span>${recordTools}</div>${data.sessions.length?data.sessions.map(s=>{const mins=Math.max(0,(s.last_at-s.started_at)/60),soc=s.soc_start==null&&s.soc_end==null?"—":`${decimal(s.soc_start,0)}% → ${decimal(s.soc_end,0)}%`,costLabel=s.price_override?.mode==="total"?"实付费用":s.cost==null?"费用":"估算费用";return html`<details class="chargeRecord"><summary><span class="chargeWhen"><b>${clock(s.started_at,data.timezone)}</b><small>${s.active?"正在充电":clock(s.ended_at||s.last_at,data.timezone,false)}${s.partial?" · 部分记录":""} · ${chargeType(s.charge_type)}</small></span><span class="chargeAmount"><b>${decimal(s.kwh,2)}<small> kWh</small></b><small>${s.cost==null?"未设电价":(s.price_override?.mode==="total"?"实付 ¥":"约 ¥")+decimal(s.cost,2)}</small></span><ha-icon class="chargeChevron" icon="mdi:chevron-down"></ha-icon></summary><div class="chargeDetail">${powerChart(s,data.timezone,sessionSelected[s.id]??-1,chooseSession)}<section class="chargeDataCard"><header class="chargeDataHead"><div><b>充电详情</b><small>${clock(s.started_at,data.timezone)} — ${s.active?"进行中 · "+clock(s.last_at,data.timezone):clock(s.ended_at||s.last_at,data.timezone)}</small></div><span class="chargeTypeTag">${s.active?"正在充电":s.partial?"部分记录":"已结束"}</span></header><div class="chargeDataGrid">${metric("充电类型",chargeType(s.charge_type))}${metric("观测时长",decimal(mins,0),"分钟")}${metric("电量变化",soc)}${metric("电池侧充电",decimal(s.kwh,2),"kWh")}${metric("估算取电",decimal(s.grid_kwh,2),"kWh")}${metric(costLabel,s.cost==null?"—":"¥"+decimal(s.cost,2))}${metric("平均功率",decimal(s.average_kw),"kW")}${metric("峰值功率",decimal(s.peak_kw),"kW")}</div><div class="chargeDataNotes"><span>${s.sources.includes("soc")?"含 SOC 与电池容量折算":s.sources.length?"按充电功率采样估算":"暂无可用电量样本"}</span>${s.reason?html`<span>结束原因：${s.reason}</span>`:nothing}${s.partial?html`<span class="partialNote">存在中断或缺失采样，本次记录可能不完整</span>`:nothing}${s.price_override?html`<span>${s.price_override.mode==="total"?"本次实付总额":"本次独立电价"} · ${s.price_override.mode==="unit"?decimal(s.price_override.value,2)+" 元/kWh":"¥"+decimal(s.price_override.value,2)}</span>`:nothing}</div>${priceEditor(s)}</section></div></details>`}):html`<p class="billNote">还没有驻车充电记录。记录从安装此版本后开始。</p>`}</section><p class="billNote">仅记录驻车且明确充电的采样区间；费用按当前或本次指定电价估算，已录入的实付金额单独计入。</p>`;
+  const yearStats=data.official_year_stats;
+  const officialYearBlock=yearStats&&yearStats.kwh!=null?html`<p class="chargeOfficial"><span>官方年度统计 · ${yearStats.year??""} 年 ${decimal(yearStats.kwh,1)} kWh${yearStats.sessions!=null?html` · ${yearStats.sessions} 次`:nothing}${yearStats.fast_charge_percent!=null?html` · 快充 ${decimal(yearStats.fast_charge_percent,0)}%`:nothing}</span><small>App 统计口径，可能延迟</small></p>`:nothing;
+  return html`<section class="chargePlot"><div class="plotHeading"><b>充电与行驶耗电</b><span>${[series.some(s=>s.key!=='cost')?'kWh':'',series.some(s=>s.key==='cost')?'元':''].filter(Boolean).join(' · ')} / 日</span></div>${graph}<div class="chargeCtrls"><div class="chargeSeries">${[['charge','充电','#40b49d'],['used','行驶耗电','#e6a15a'],['cost','电费','#6c86e8']].map(([key,label,color])=>html`<button aria-pressed=${plot.series.includes(key)} class=${plot.series.includes(key)?'on':''} @click=${()=>plot.toggle(key)}><i style=${'background:'+color}></i>${label}</button>`)}</div><div class="chargeRange">${rangeTools}<button class="chartSwitch" @click=${()=>plot.switchChart()}>${plot.chart==='bar'?'柱状':'折线'}</button></div></div></section>${officialYearBlock}<section class="chargeRecords"><div class="plotHeading"><b>充电记录</b><span>${data.summary.count} 次${data.active?" · 正在充电":""}</span>${recordTools}</div>${data.sessions.length?data.sessions.map(s=>{const mins=Math.max(0,(s.last_at-s.started_at)/60),soc=s.soc_start==null&&s.soc_end==null?"—":`${decimal(s.soc_start,0)}% → ${decimal(s.soc_end,0)}%`,costLabel=s.price_override?.mode==="total"?"实付费用":s.cost==null?"费用":"估算费用";return html`<details class="chargeRecord"><summary><span class="chargeWhen"><b>${clock(s.started_at,data.timezone)}</b><small>${s.active?"正在充电":clock(s.ended_at||s.last_at,data.timezone,false)}${s.partial?" · 部分记录":""} · ${chargeType(s.charge_type)}</small></span><span class="chargeAmount"><b>${decimal(officialKwhOf(s) ?? s.kwh,2)}<small> kWh</small>${officialKwhOf(s)!=null?html`<small class="chargeSrcTag"> · 官方</small>`:nothing}</b><small>${s.cost==null?"未设电价":(s.price_override?.mode==="total"?"实付 ¥":"约 ¥")+decimal(s.cost,2)}</small></span><ha-icon class="chargeChevron" icon="mdi:chevron-down"></ha-icon></summary><div class="chargeDetail">${powerChart(s,data.timezone,sessionSelected[s.id]??-1,chooseSession)}<section class="chargeDataCard"><header class="chargeDataHead"><div><b>充电详情</b><small>${clock(s.started_at,data.timezone)} — ${s.active?"进行中 · "+clock(s.last_at,data.timezone):clock(s.ended_at||s.last_at,data.timezone)}</small></div><span class="chargeTypeTag">${s.active?"正在充电":s.partial?"部分记录":"已结束"}</span></header><div class="chargeDataGrid">${metric("充电类型",chargeType(s.charge_type))}${metric("观测时长",decimal(mins,0),"分钟")}${metric("电量变化",soc)}${metric("电池侧充电",decimal(s.kwh,2),"kWh")}${officialKwhOf(s)!=null?metric("官方充入",decimal(officialKwhOf(s),2),"kWh"):nothing}${metric("估算取电",decimal(s.grid_kwh,2),"kWh")}${metric(costLabel,s.cost==null?"—":"¥"+decimal(s.cost,2))}${metric("平均功率",decimal(s.average_kw),"kW")}${metric("峰值功率",decimal(s.peak_kw),"kW")}</div><div class="chargeDataNotes"><span>${officialKwhOf(s)!=null?"电量来自官方充电记录（App 上报），费用仍按本地电价估算":s.sources.includes("soc")?"含 SOC 与电池容量折算":s.sources.length?"按充电功率采样估算":"暂无可用电量样本"}</span>${s.reason?html`<span>结束原因：${s.reason}</span>`:nothing}${s.partial?html`<span class="partialNote">存在中断或缺失采样，本次记录可能不完整</span>`:nothing}${s.price_override?html`<span>${s.price_override.mode==="total"?"本次实付总额":"本次独立电价"} · ${s.price_override.mode==="unit"?decimal(s.price_override.value,2)+" 元/kWh":"¥"+decimal(s.price_override.value,2)}</span>`:nothing}</div>${priceEditor(s)}</section></div></details>`}):html`<p class="billNote">还没有驻车充电记录。记录从安装此版本后开始。</p>`}</section><p class="billNote">仅记录驻车且明确充电的采样区间；费用按当前或本次指定电价估算，已录入的实付金额单独计入。</p>`;
 }
 
 export function tariffForm(draft: Record<string,string>, saving: boolean, error: string, timezone: string,
@@ -248,4 +267,7 @@ export const energyPanelStyles = `
   .gridline { stroke-dasharray:3 5;opacity:.7; }.line { stroke-width:2.5; }
   .tip { white-space:normal;max-width:calc(100% - 16px);box-sizing:border-box; }
   @container(max-width:300px) { .energyStat { padding:8px 6px; }.energyStat b { font-size:19px; }.head .sum { display:none; } }
+  .chargeOfficial{display:flex;gap:8px;flex-wrap:wrap;align-items:baseline;margin:6px 0 2px;font-size:12px;color:var(--secondary-text-color)}
+  .chargeOfficial small{opacity:.7}
+  .chargeSrcTag{color:#40b49d;font-weight:500}
 `;

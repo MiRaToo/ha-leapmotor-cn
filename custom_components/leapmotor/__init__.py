@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 # ⚠️ 必须用别名: 本包有 time.py(HA 的 time 平台)。首次 forward setup 导入平台模块后,
 # Python 会把子模块挂到**包对象**上 —— 那正是 __init__.py 的全局命名空间, 于是原先
@@ -43,7 +44,7 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 CARD_VERSION = "1.6.21"           # leapmotor-map.js
 TRIPS_CARD_VERSION = "1.6.28"     # leapmotor-trips.js
 CONTROL_CARD_VERSION = "1.9.77"   # leapmotor-control.js
-ENERGY_CARD_VERSION = "1.4.16"    # leapmotor-energy.js
+ENERGY_CARD_VERSION = "1.4.17"    # leapmotor-energy.js
 LASTWEEK_CARD_VERSION = "1.1.22"  # leapmotor-lastweek.js
 METRICS_CARD_VERSION = "1.0.9"    # leapmotor-metrics.js
 _CARDS = (
@@ -57,6 +58,7 @@ _CARDS = (
 _FRONTEND_KEY = "_frontend_registered"
 _SYNC_ARCHIVE_KEY = "_sync_archive_v1"
 _SYNC_ARCHIVE_STOP_KEY = "_sync_archive_stop_v1"
+_DAILY_ENERGY_V1_LOCKS_KEY = "_daily_energy_v1_locks"
 
 # ── 卡片"可启动窗口"投递 ──────────────────────────────
 # 症状: 卡片"经常"显示「配置错误 / Custom element doesn't exist」, 刷新后又正常。
@@ -236,6 +238,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = LeapmotorCoordinator(hass, entry)
     # Shared independent archive; its own single worker serializes every SQLite operation.
     data = hass.data.setdefault(DOMAIN, {})
+    vin_lock_key = str(coordinator.vin or "").strip().upper()
+    coordinator._daily_energy_v1_lock = (
+        data.setdefault(_DAILY_ENERGY_V1_LOCKS_KEY, {})
+        .setdefault(vin_lock_key, asyncio.Lock())
+    )
     archive = data.get(_SYNC_ARCHIVE_KEY)
     if archive is None:
         from .sync_archive import SyncArchive
@@ -303,7 +310,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         DEFAULT_BATTERY_KWH,
         DEFAULT_TRIP_STORE_MB,
     )
-    from .energy_daily import EnergyDayStore
+    from .energy_daily import DailyEnergyV1Store, EnergyDayStore
     from .trips import TripRecorder
     recorder = TripRecorder(
         hass, coordinator.vin,
@@ -321,12 +328,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     energy_days = EnergyDayStore(hass, coordinator.vin)
     await energy_days.async_load()
     coordinator.energy_days = energy_days
+    daily_energy_v1 = DailyEnergyV1Store(hass, coordinator.vin)
+    await daily_energy_v1.async_load()
+    coordinator.daily_energy_v1 = daily_energy_v1
     from .charging import ChargeRecorder
     charges = ChargeRecorder(hass, coordinator.vin,
                              capacity_kwh=float(entry.options.get(CONF_BATTERY_KWH) or DEFAULT_BATTERY_KWH),
                              timezone=hass.config.time_zone)
     await charges.async_load()
     coordinator.charges = charges
+    try:
+        from .charge_history import ChargeHistoryIndex
+        charge_history = ChargeHistoryIndex(hass, coordinator.vin)
+        await charge_history.async_load()
+        charge_history.reconcile_sessions(
+            charges.sessions, observed_at_ms=int(_time.time() * 1000))
+        charges.history_index = charge_history
+        coordinator.charge_history_index = charge_history
+    except Exception as err:  # noqa: BLE001
+        log.warning("充电历史索引未就绪(旧充电记录继续可用): %s", type(err).__name__)
+    # ── 官方充电记录(App 1.23.05「充电记录」; 见 official_charge.py)──
+    # 只读低频同步: 逐笔明细(近三个月) + 年度统计。匹配到本地已结束会话后,
+    # 官方「充入电量」优先, 本地估算兜底; 账号看不到车主记录时静默保留估算。
+    try:
+        from .official_charge import OfficialChargeStore
+        official_charges = OfficialChargeStore(hass, coordinator.vin, timezone=hass.config.time_zone)
+        await official_charges.async_load()
+        coordinator.official_charges = official_charges
+        entry.async_create_background_task(
+            hass, coordinator.async_sync_official_charges(force=True),
+            "leapmotor official charge sync")
+    except Exception as err:  # noqa: BLE001 - 官方数据是增强, 失败时保留本地估算
+        log.warning("官方充电记录未就绪(继续使用本地充电账本): %s", type(err).__name__)
     if archive.ready:
         # ⚠️ 用**条目级**后台任务: 卸载时 HA 会自动取消并等待它, 不要自己注册
         # `entry.async_on_unload(migration.cancel)` —— 那个回调的契约是

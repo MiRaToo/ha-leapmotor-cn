@@ -1,0 +1,39 @@
+{
+  "package": "A3",
+  "status": "code-complete-offline-verified",
+  "dailyEnergyV1Tests": {
+    "tests": 20,
+    "passed": 20,
+    "failed": 0
+  },
+  "legacyDailyEnergyTests": {
+    "tests": 11,
+    "passed": 11,
+    "failed": 0
+  },
+  "syncArchiveContractTests": {
+    "tests": 20,
+    "passed": 20,
+    "failed": 0
+  },
+  "syncWebSocketContractTests": {
+    "tests": 6,
+    "passed": 6,
+    "failed": 0
+  },
+  "pythonSyntaxCompile": true,
+  "strictThreeComponentOfficialEnergy": true,
+  "code100FabricatedZero": false,
+  "ianaTimezoneCalendarWindows": true,
+  "dst23And25HourDays": true,
+  "todayTrueEndCacheReuse": true,
+  "newStoreNamespaceAndVersion": true,
+  "legacyStoreMigration": false,
+  "perVinSingleflight": true,
+  "archiveVehicleIdentityFailsClosed": true,
+  "v1FailureFallsBackToLegacy": false,
+  "rawSyncProtocolVersion": 1,
+  "realHomeAssistant": false,
+  "realDataCompared": false,
+  "deviceTested": false
+}

@@ -7,6 +7,11 @@ import time
 from typing import Any
 from zoneinfo import ZoneInfo
 
+try:  # HA 运行时走包内相对导入
+    from .official_charge import scale_intervals
+except ImportError:  # pytest 以裸模块名导入 charging 时
+    from official_charge import scale_intervals
+
 MAX_GAP_SECONDS = 900
 KEEP_SESSIONS = 400
 DEFAULT_TARIFF = {"peak_price": None, "valley_price": None,
@@ -140,6 +145,7 @@ class ChargeRecorder:
         self._previous: dict | None = None
         self._seen = 0.0
         self.revision = 0
+        self.history_index = None
 
     async def async_load(self) -> None:
         data = await self._store.async_load() or {}
@@ -154,6 +160,49 @@ class ChargeRecorder:
         if self.active:
             self._finish(float(self.active.get("last_at") or self.active["started_at"]), "重启中断", partial=True)
 
+    def clear_official(self) -> int:
+        """解除所有会话的官方电量绑定(当前账号看不到官方数据时用, 避免旧账号数据残留)。"""
+        changed = 0
+        for session in self.sessions:
+            if session.pop("official", None) is not None:
+                changed += 1
+        if changed:
+            self.revision += 1
+            self._save()
+            self._publish_history()
+        return changed
+
+    def apply_official(self, matches: dict[str, dict]) -> int:
+        """把官方逐笔充电记录绑定到本地已结束会话(官方充入电量优先)。
+
+        `matches` = {session_id: official_record}(见 official_charge.match_official_to_sessions)。
+        只更新匹配到的会话, 不删除历史绑定(明细窗口滚走后官方值仍然有效);
+        返回发生变化的会话数。
+        """
+        changed = 0
+        for session in self.sessions:
+            sid = session.get("id")
+            official = matches.get(sid) if isinstance(sid, str) else None
+            if not isinstance(official, dict):
+                continue
+            trimmed = {
+                "key": official.get("key"),
+                "energy_kwh": official.get("energy_kwh"),
+                "charge_type": official.get("charge_type"),
+                "started_at": official.get("started_at"),
+                "ended_at": official.get("ended_at"),
+                "duration_seconds": official.get("duration_seconds"),
+                "zone": official.get("zone"),
+            }
+            if session.get("official") != trimmed:
+                session["official"] = trimmed
+                changed += 1
+        if changed:
+            self.revision += 1
+            self._save()
+            self._publish_history()
+        return changed
+
     def _dump(self) -> dict:
         return {"sessions": self.sessions[-KEEP_SESSIONS:], "active": self.active,
                 "seen": self._seen, "tariff": self.tariff}
@@ -162,12 +211,26 @@ class ChargeRecorder:
         self.revision += 1
         self._store.async_delay_save(self._dump, 5)
 
+    def _publish_history(self, sessions: list[dict] | None = None,
+                         *, now: float | None = None) -> None:
+        index = getattr(self, "history_index", None)
+        if index is None:
+            return
+        observed_at_ms = int((time.time() if now is None else now) * 1000)
+        for session in sessions if sessions is not None else [
+                *self.sessions, *([self.active] if self.active else [])]:
+            index.upsert_session(
+                self.session_record(session, now=now),
+                observed_at_ms=observed_at_ms,
+            )
+
     async def set_tariff(self, data: dict) -> dict:
         tariff = validate_tariff({**self.tariff, **data})
         # 保存成功再切换，失败时前端不会误以为电价已生效。
         await self._store.async_save({**self._dump(), "tariff": tariff})
         self.tariff = tariff
         self.revision += 1
+        self._publish_history()
         return tariff
 
     async def set_session_price(self, session_id: str, mode: str, value=None) -> None:
@@ -188,6 +251,7 @@ class ChargeRecorder:
             if s.get("id")==session_id:
                 if override is None:s.pop("price_override",None)
                 else:s["price_override"]=dict(override)
+        self._publish_history([s for s in self.sessions if s.get("id") == session_id])
         self._save()
 
     def _finish(self, at: float, reason: str, *, partial: bool = False) -> None:
@@ -195,8 +259,13 @@ class ChargeRecorder:
             self.active.update(ended_at=at, reason=reason, partial=partial or self.active.get("partial", False))
             self.sessions.append(self.active)
             self.sessions = self.sessions[-KEEP_SESSIONS:]
+            finished = self.sessions[-1]
+        else:
+            finished = None
         self.active = None
         self._previous = None
+        if finished is not None:
+            self._publish_history([finished], now=at)
         self._save()
 
     def process(self, state: Any, *, now: float | None = None) -> None:
@@ -236,12 +305,14 @@ class ChargeRecorder:
             self.active = {"id": f"charge-{int(at * 1000)}", "started_at": at, "last_at": at,
                            "soc_start": soc, "soc_end": soc, "intervals": [], "partial": False,
                            "power_samples": [], "soc_samples": [], "peak_kw": None, "charge_types": []}
+            self._publish_history([self.active], now=at)
         dc, plug = state.flag("dc_cable_connected"), state.flag("charge_plug")
         kind = "dc" if dc is True else "ac" if dc is False and plug is True else "unknown"
         known=[k for k in self.active.get("charge_types",[]) if k!="unknown"]
         if kind!="unknown" and known and kind not in known:
             self._finish(float(self.active["last_at"]),"充电枪类型改变")
             self.active={"id":f"charge-{int(at*1000)}","started_at":at,"last_at":at,"soc_start":soc,"soc_end":soc,"intervals":[],"partial":False,"power_samples":[],"soc_samples":[],"peak_kw":None,"charge_types":[]}
+            self._publish_history([self.active], now=at)
         kinds=self.active.setdefault("charge_types", [])
         if kind not in kinds: kinds.append(kind)
         samples=self.active.setdefault("power_samples", [])
@@ -293,6 +364,85 @@ class ChargeRecorder:
         if self.active and now - float(self.active["last_at"]) > MAX_GAP_SECONDS:
             self._finish(float(self.active["last_at"]), "遥测中断", partial=True)
 
+    def session_record(self, session: dict, *, now: float | None = None) -> dict:
+        """Serialize one session without claiming physical meter evidence."""
+        now = time.time() if now is None else now
+        configured = (
+            bool(self.tariff.get("dc_periods"))
+            or any(self.tariff.get(k) is not None
+                   for k in ("peak_price", "valley_price", "ac_peak_price", "ac_valley_price"))
+            or any(s.get("price_override") for s in self.sessions)
+        )
+        total = grid = cost = peak = valley = 0.0
+        sources: set[str] = set()
+        official = session.get("official") if isinstance(session.get("official"), dict) else None
+        official_kwh = number(official.get("energy_kwh")) if official else None
+        intervals = session.get("intervals", [])
+        estimated_kwh = sum(p[2] for p in intervals if len(p) > 2 and number(p[2]) is not None
+                            and number(p[2]) > 0) if intervals else 0.0
+        if official is not None:
+            intervals, scaled_kwh = scale_intervals(intervals, official_kwh)
+            if scaled_kwh is None:
+                official = None  # 没有可分配的本地采样时不声称官方口径
+        tariff = session_tariff(session, self.tariff)
+        override = session.get("price_override") or {}
+        total_grid = sum(p[2] for p in intervals) / tariff["efficiency"]
+        if override.get("mode") == "total" and total_grid > 0:
+            tariff.update(peak_price=override["value"] / total_grid,
+                          valley_price=override["value"] / total_grid, periods=None)
+        priced = configured
+        for interval in intervals:
+            a, b, kwh, source = interval
+            total += kwh
+            grid += kwh / tariff["efficiency"]
+            sources.add(source)
+            for row in interval_buckets(a, b, kwh, tariff, self.timezone):
+                if row["cost"] is None and row["kwh"] > 0:
+                    priced = False
+                if row["cost"] is not None:
+                    cost += row["cost"]
+                if row["band"] == "peak":
+                    peak += row["kwh"]
+                else:
+                    valley += row["kwh"]
+        expired = session is self.active and now - float(session["last_at"]) > MAX_GAP_SECONDS
+        known = [p for p in intervals if len(p) > 3 and p[3] == "power"]
+        hours = sum((p[1] - p[0]) / 3600 for p in known)
+        kinds = [k for k in session.get("charge_types", []) if k != "unknown"]
+        result = {k: session.get(k) for k in
+                  ("id", "started_at", "ended_at", "last_at", "soc_start", "soc_end", "reason", "partial")}
+        result.update({
+            "kwh": round(total, 3) if sources else None,
+            "grid_kwh": round(grid, 3) if sources else None,
+            "cost": override["value"] if override.get("mode") == "total"
+                    else round(cost, 2) if sources and priced else None,
+            "price_override": dict(override) if override else None,
+            "peak_kwh": round(peak, 3), "valley_kwh": round(valley, 3),
+            "sources": sorted(sources),
+            "active": session is self.active and not expired,
+            "charge_type": (official.get("charge_type")
+                            if official and official.get("charge_type") in ("ac", "dc")
+                            else kinds[0] if len(kinds) == 1 else "mixed" if kinds else "unknown"),
+            "energy_basis": "official" if official else "estimated",
+            "official_energy_kwh": round(official_kwh, 3) if official and official_kwh is not None else None,
+            "official": dict(official) if official else None,
+            "peak_kw": session.get("peak_kw"),
+            "average_kw": round(sum(p[2] for p in known) / hours, 2) if hours else None,
+            "power_samples": session.get("power_samples", []),
+            "soc_samples": session.get("soc_samples", []),
+            "partial": expired or session.get("partial", False),
+        })
+        if official:
+            # 官方「充入电量」是车端电量(kWh); 电网取电仍按当前充电效率估算。
+            result["kwh_estimate"] = round(estimated_kwh, 3) if estimated_kwh else None
+            result["kwh"] = round(official_kwh if official_kwh is not None else total, 3)
+            result["grid_kwh"] = round((official_kwh if official_kwh is not None else total)
+                                       / tariff["efficiency"], 3)
+        if override.get("mode") == "total" and total_grid <= 0:
+            # The amount belongs to the record even when no energy can be allocated.
+            result["cost"] = override["value"]
+        return result
+
     def view(self, days: int = 30, *, now: float | None = None) -> dict:
         from datetime import timedelta
         now = time.time() if now is None else now
@@ -308,30 +458,26 @@ class ChargeRecorder:
         for session in [*self.sessions, *([self.active] if self.active else [])]:
             if float(session.get("last_at", 0)) < begin:
                 continue
-            total = grid = cost = peak = valley = 0.0
-            sources = set()
+            session_intervals = session.get("intervals", [])
+            official = session.get("official") if isinstance(session.get("official"), dict) else None
+            if official is not None:
+                session_intervals, _ = scale_intervals(session_intervals, number(official.get("energy_kwh")))
             tariff=session_tariff(session,self.tariff)
             override=session.get("price_override") or {}
-            total_grid=sum(p[2] for p in session.get("intervals",[]))/tariff["efficiency"]
+            total_grid=sum(p[2] for p in session_intervals)/tariff["efficiency"]
             if override.get("mode")=="total" and total_grid>0:
                 tariff.update(peak_price=override["value"]/total_grid,valley_price=override["value"]/total_grid,periods=None)
-            priced=configured
-            for interval in session.get("intervals", []):
+            for interval in session_intervals:
                 a, b, kwh, source = interval
-                total += kwh
-                grid += kwh / tariff["efficiency"]
-                sources.add(source)
-                for row in interval_buckets(a, b, kwh, tariff, self.timezone):
-                    if row["cost"] is None and row["kwh"]>0:priced=False
-                    if row["cost"] is not None:
-                        cost += row["cost"]
-                    if row["band"] == "peak": peak += row["kwh"]
-                    else: valley += row["kwh"]
                 left, right = max(a, begin), min(b, end)
                 if right > left:
                     for row in interval_buckets(left, right, kwh * (right - left) / (b - a), tariff, self.timezone):
                         d = daily.get(row["day"])
                         if d:
+                            if official is not None:
+                                d["_official"] = True
+                            else:
+                                d["_estimated"] = True
                             for key in ("kwh", "grid_kwh"): d[key] += row[key]
                             d[row["band"] + "_kwh"] += row["kwh"]
                             if row["cost"] is not None: d["cost"] += row["cost"]
@@ -340,25 +486,21 @@ class ChargeRecorder:
                 # 实付已知但没有可分配的能量，归入结束日，不由费用倒算电量。
                 day=datetime.fromtimestamp(float(session.get("ended_at") or session["last_at"]),self.timezone).date().isoformat()
                 if day in daily:daily[day]["cost"]+=override["value"]
-            expired = session is self.active and now - float(session["last_at"]) > MAX_GAP_SECONDS
-            known=[p for p in session.get("intervals",[]) if p[3]=="power"]
-            hours=sum((p[1]-p[0])/3600 for p in known)
-            kinds=[k for k in session.get("charge_types",[]) if k!="unknown"]
-            records.append({k: session.get(k) for k in ("id", "started_at", "ended_at", "last_at", "soc_start", "soc_end", "reason", "partial")} |
-                           {"kwh": round(total, 3) if sources else None, "grid_kwh": round(grid, 3) if sources else None,
-                            "cost": override["value"] if override.get("mode")=="total" else round(cost, 2) if sources and priced else None,
-                            "price_override":dict(override) if override else None,
-                            "peak_kwh": round(peak, 3), "valley_kwh": round(valley, 3),
-                            "sources": sorted(sources), "active": session is self.active and not expired,
-                            "charge_type": kinds[0] if len(kinds)==1 else "mixed" if kinds else "unknown",
-                            "peak_kw": session.get("peak_kw"), "average_kw": round(sum(p[2] for p in known)/hours,2) if hours else None,
-                            "power_samples": session.get("power_samples",[]),
-                            "soc_samples": session.get("soc_samples",[]),
-                            "partial": expired or session.get("partial", False)})
+            records.append(self.session_record(session, now=now))
         for d in daily.values():
             for key in ("kwh", "grid_kwh", "peak_kwh", "valley_kwh", "cost"):
                 d[key] = round(d[key], 3)
             if not configured or d["day"] in unpriced: d["cost"] = None
+            official_flag = bool(d.pop("_official", False))
+            estimated_flag = bool(d.pop("_estimated", False))
+            if official_flag and estimated_flag:
+                d["kwh_src"] = "mixed"
+            elif official_flag:
+                d["kwh_src"] = "official"
+            elif estimated_flag:
+                d["kwh_src"] = "estimated"
+            if official_flag:
+                d["official_kwh"] = d["kwh"]
         rows = list(daily.values())
         return {"days": rows, "sessions": records[::-1], "tariff": dict(self.tariff), "revision": self.revision,
                 "summary": {"kwh": round(sum(d["kwh"] for d in rows), 2),

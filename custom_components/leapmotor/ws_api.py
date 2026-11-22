@@ -51,6 +51,7 @@ from homeassistant.helpers import entity_registry as er
 
 from . import car3d
 from .const import DOMAIN
+from .energy_daily import valid_iana_timezone
 from .vehicle_selector import VehicleSelectionError, coordinators, resolve_coordinator
 
 log = logging.getLogger(__name__)
@@ -84,10 +85,13 @@ def async_register(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_car3d_market_pictures)
     websocket_api.async_register_command(hass, ws_car3d_ensure)
     websocket_api.async_register_command(hass, ws_charging_history)
+    websocket_api.async_register_command(hass, ws_charging_records_v1)
     websocket_api.async_register_command(hass, ws_charging_tariff)
     websocket_api.async_register_command(hass, ws_charging_price)
+    websocket_api.async_register_command(hass, ws_charging_official)
+    websocket_api.async_register_command(hass, ws_charging_official_refresh)
     for command in (ws_sync_info, ws_sync_vehicles, ws_sync_bootstrap, ws_sync_pull,
-                    ws_sync_observations, ws_sync_records):
+                    ws_sync_observations, ws_sync_records, ws_sync_membership):
         websocket_api.async_register_command(hass, command)
     from .vehicle_tools import register
     register(hass)
@@ -99,6 +103,129 @@ def _sync_archive(hass):
     return hass.data.get(DOMAIN, {}).get("_sync_archive_v1")
 
 
+def _configured_sync_vehicles(hass: HomeAssistant) -> list[dict[str, Any]]:
+    configured = []
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        vin = str(entry.data.get("vin") or entry.data.get("car_vin") or "")
+        coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+        device = dr.async_get(hass).async_get_device(identifiers={(DOMAIN, vin)})
+        configured.append({
+            "vin": vin,
+            "name": str(entry.data.get("car_nickname") or ""),
+            "entry_id": entry.entry_id,
+            "device_id": device.id if device else None,
+            "loaded": coordinator is not None,
+        })
+    return configured
+
+
+def _daily_energy_capability(hass: HomeAssistant) -> dict[str, Any] | None:
+    """Advertise v1 only when every configured coordinator can serve it."""
+    time_zone = valid_iana_timezone(
+        getattr(getattr(hass, "config", None), "time_zone", None))
+    loaded = list(coordinators(hass).values())
+    if not time_zone or not loaded:
+        return None
+    for coordinator in loaded:
+        probe = getattr(coordinator, "daily_energy_v1_available", None)
+        if not callable(probe) or not probe():
+            return None
+    return {"contract_version": 1, "command": "leapmotor/energy/daily",
+            "time_zone": time_zone}
+
+
+def _charging_history_capability(hass: HomeAssistant) -> dict[str, Any] | None:
+    """Advertise the full retained charge index only when every vehicle is ready."""
+    loaded = list(coordinators(hass).values())
+    if not loaded:
+        return None
+    for coordinator in loaded:
+        probe = getattr(coordinator, "charge_history_v1_available", None)
+        if not callable(probe) or not probe():
+            return None
+    return {"contract_version": 1, "command": "leapmotor/charging/records/v1"}
+
+
+def _resolve_daily_archive_identity(info: Any, vehicles: Any, requested_vin: str,
+                                    expected_vehicle_id: str,
+                                    expected_entry_id: str) -> dict[str, str]:
+    """Resolve one normalized VIN through the complete archive vehicle list."""
+    vin = str(requested_vin or "").strip().upper()
+    if (not isinstance(info, dict) or info.get("ready") is not True
+            or not str(info.get("source_id") or "").strip()
+            or not str(info.get("dataset_id") or "").strip()
+            or not vin or not str(expected_vehicle_id or "").strip()
+            or not isinstance(vehicles, list)):
+        raise ValueError("vehicle_unavailable")
+    normalized: list[tuple[str, str, str]] = []
+    for row in vehicles:
+        if not isinstance(row, dict):
+            raise ValueError("vehicle_conflict")
+        row_vin = str(row.get("vin") or "").strip().upper()
+        vehicle_id = str(row.get("vehicle_id") or "").strip()
+        entry_id = str(row.get("entry_id") or "").strip()
+        if not row_vin or not vehicle_id:
+            raise ValueError("vehicle_conflict")
+        normalized.append((row_vin, vehicle_id, entry_id))
+    vin_counts: dict[str, int] = {}
+    for row_vin, _vehicle_id, _entry_id in normalized:
+        vin_counts[row_vin] = vin_counts.get(row_vin, 0) + 1
+    if len(vin_counts) != len(normalized):
+        raise ValueError("vehicle_conflict")
+    matches = [row for row in normalized if row[0] == vin]
+    if len(matches) != 1 or vin_counts.get(vin) != 1:
+        raise ValueError("vehicle_conflict")
+    _row_vin, vehicle_id, entry_id = matches[0]
+    if vehicle_id != str(expected_vehicle_id).strip():
+        raise ValueError("vehicle_conflict")
+    if entry_id and entry_id != str(expected_entry_id or "").strip():
+        raise ValueError("vehicle_conflict")
+    return {"source_id": str(info["source_id"]), "dataset_id": str(info["dataset_id"]),
+            "vehicle_id": vehicle_id, "vin": vin}
+
+
+async def _daily_archive_identity(hass: HomeAssistant, coordinator: Any,
+                                  requested_vin: str) -> dict[str, str]:
+    archive = getattr(coordinator, "sync_archive", None)
+    available = getattr(coordinator, "daily_energy_v1_available", None)
+    actual_vin = str(getattr(coordinator, "vin", "") or "").strip().upper()
+    if (not callable(available) or not available() or archive is None
+            or str(requested_vin or "").strip().upper() != actual_vin):
+        raise ValueError("vehicle_conflict")
+    try:
+        info = await hass.async_add_executor_job(archive.run, "info")
+        vehicles = await hass.async_add_executor_job(
+            archive.run, "vehicles", _configured_sync_vehicles(hass))
+    except Exception as err:
+        raise RuntimeError("archive_unavailable") from err
+    return _resolve_daily_archive_identity(
+        info, vehicles, requested_vin,
+        str(getattr(coordinator, "sync_vehicle_id", "") or ""),
+        str(coordinator.entry.entry_id),
+    )
+
+
+async def _charging_archive_identity(hass: HomeAssistant, coordinator: Any,
+                                     requested_vin: str) -> dict[str, str]:
+    archive = getattr(coordinator, "sync_archive", None)
+    available = getattr(coordinator, "charge_history_v1_available", None)
+    actual_vin = str(getattr(coordinator, "vin", "") or "").strip().upper()
+    if (not callable(available) or not available() or archive is None
+            or str(requested_vin or "").strip().upper() != actual_vin):
+        raise ValueError("vehicle_conflict")
+    try:
+        info = await hass.async_add_executor_job(archive.run, "info")
+        vehicles = await hass.async_add_executor_job(
+            archive.run, "vehicles", _configured_sync_vehicles(hass))
+    except Exception as err:
+        raise RuntimeError("archive_unavailable") from err
+    return _resolve_daily_archive_identity(
+        info, vehicles, requested_vin,
+        str(getattr(coordinator, "sync_vehicle_id", "") or ""),
+        str(coordinator.entry.entry_id),
+    )
+
+
 async def _sync_call(hass, connection, msg, method, *args):
     archive = _sync_archive(hass)
     if archive is None or not archive.ready:
@@ -107,8 +234,18 @@ async def _sync_call(hass, connection, msg, method, *args):
     try:
         result = await hass.async_add_executor_job(archive.run, method, *args)
         info = await hass.async_add_executor_job(archive.run, "info")
-        response={"protocol_version": 1, "source_id": info["source_id"],"dataset_id": info["dataset_id"], **result}
-        if method in ("bootstrap","pull","observations","records_page") and args:
+        response={"protocol_version": 2 if method=="membership_page" else 1,
+                  "source_id": info["source_id"],"dataset_id": info["dataset_id"], **result}
+        if method == "info":
+            capabilities=dict(info.get("capabilities") or {})
+            daily = _daily_energy_capability(hass)
+            if daily is not None:
+                capabilities["daily_energy"] = daily
+            charging = _charging_history_capability(hass)
+            if charging is not None:
+                capabilities["charging_history"] = charging
+            response["capabilities"]=capabilities
+        if method in ("bootstrap","pull","observations","records_page","membership_page") and args:
             response["vehicle_id"]=args[0]
         connection.send_result(msg["id"], response)
     except ValueError as err:
@@ -132,19 +269,13 @@ async def ws_sync_info(hass, connection, msg):
 @websocket_api.require_admin
 @websocket_api.async_response
 async def ws_sync_vehicles(hass, connection, msg):
-    configured=[]
-    from .const import DOMAIN
-    for entry in hass.config_entries.async_entries(DOMAIN):
-        vin=str(entry.data.get("vin") or entry.data.get("car_vin") or "")
-        c=hass.data.get(DOMAIN,{}).get(entry.entry_id)
-        device = dr.async_get(hass).async_get_device(identifiers={(DOMAIN, vin)})
-        configured.append({"vin":vin,"name":str(entry.data.get("car_nickname") or ""),"entry_id":entry.entry_id,"device_id":device.id if device else None,"loaded":c is not None})
     archive=_sync_archive(hass)
     if archive is None or not archive.ready:
         connection.send_error(msg["id"],"archive_unavailable","同步档案未就绪"); return
     try:
         info=await hass.async_add_executor_job(archive.run,"info")
-        vehicles=await hass.async_add_executor_job(archive.run,"vehicles",configured)
+        vehicles=await hass.async_add_executor_job(
+            archive.run,"vehicles",_configured_sync_vehicles(hass))
         connection.send_result(msg["id"],{"protocol_version":1,"source_id":info["source_id"],"dataset_id":info["dataset_id"],"vehicles":vehicles})
     except Exception:
         connection.send_error(msg["id"],"archive_unavailable","同步档案暂不可用")
@@ -177,6 +308,20 @@ async def ws_sync_observations(hass,connection,msg):
 @websocket_api.async_response
 async def ws_sync_records(hass,connection,msg):
     await _sync_call(hass,connection,msg,"records_page",msg["vehicle_id"],msg.get("after"),msg["limit"],msg.get("kind"))
+
+
+@websocket_api.websocket_command({vol.Required("type"):"leapmotor/sync/v2/membership",
+                                  **_SYNC_VID,
+                                  vol.Required("kind"):vol.In(["trip","charge"]),
+                                  vol.Required("record_id"):vol.All(str,vol.Length(min=1,max=128)),
+                                  vol.Optional("membership_revision"):vol.All(int,vol.Range(min=1)),
+                                  vol.Optional("page_token"):vol.All(str,vol.Length(min=1,max=4096)),
+                                  **_SYNC_LIMIT})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_sync_membership(hass,connection,msg):
+    await _sync_call(hass,connection,msg,"membership_page",msg["vehicle_id"],msg["kind"],
+                     msg["record_id"],msg.get("membership_revision"),msg.get("page_token"),msg["limit"])
 
 
 def _recorder(hass: HomeAssistant, msg: dict):
@@ -264,7 +409,82 @@ async def ws_charging_history(hass: HomeAssistant, connection, msg: dict) -> Non
     used = {d["day"]: d.get("kwh") for d in consumption.get("days", [])}
     for day in body["days"]:
         day["consumed_kwh"] = used.get(day["day"])
-    connection.send_result(msg["id"], {**body, "vin": coord.vin, "entry_id": coord.entry.entry_id})
+    store = getattr(coord, "official_charges", None)
+    official = store.view() if store is not None else None
+    year_view = store.year_view() if store is not None else None
+    official_year_stats = None
+    visible = bool(store is not None and store.available)
+    if visible and year_view is not None and (year_view.get("total_energy_kwh") or 0) > 0:
+        official_year_stats = {
+            "year": year_view.get("year"),
+            "kwh": year_view.get("total_energy_kwh"),
+            "sessions": year_view.get("total_count"),
+            "fast_charge_percent": year_view.get("fast_charge_percent"),
+            "updated_at": store.fetched_at,
+        }
+    connection.send_result(msg["id"], {**body, "vin": coord.vin, "entry_id": coord.entry.entry_id,
+                                       "official": official,
+                                       "official_year": year_view,
+                                       "official_year_stats": official_year_stats})
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "leapmotor/charging/records/v1",
+    **VEHICLE_SELECTOR_SCHEMA,
+    vol.Required("vin"): vol.All(str, vol.Length(min=1, max=64)),
+    vol.Required("from_ms"): vol.All(int, vol.Range(min=0, max=9_007_199_254_740_991)),
+    vol.Required("to_ms"): vol.All(int, vol.Range(min=0, max=9_007_199_254_740_991)),
+    vol.Optional("limit", default=100): vol.All(int, vol.Range(min=1, max=200)),
+    vol.Optional("page_token"): vol.All(str, vol.Length(min=1, max=8192)),
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_charging_records_v1(hass: HomeAssistant, connection, msg: dict) -> None:
+    coord = _coordinator(hass, msg)
+    if coord is None:
+        _send_vehicle_error(hass, connection, msg)
+        return
+    index = getattr(coord, "charge_history_index", None)
+    recorder = getattr(coord, "charges", None)
+    if index is None or recorder is None:
+        connection.send_error(msg["id"], "not_found", "充电历史索引尚未就绪")
+        return
+    try:
+        identity = await _charging_archive_identity(hass, coord, msg["vin"])
+        scope_key = "\0".join((
+            identity["source_id"], identity["dataset_id"], identity["vehicle_id"],
+        ))
+        body = index.query(
+            scope_key,
+            int(msg["from_ms"]),
+            int(msg["to_ms"]),
+            limit=int(msg["limit"]),
+            page_token=msg.get("page_token"),
+        )
+    except ValueError as err:
+        code = str(err) if str(err) in (
+            "vehicle_conflict", "vehicle_unavailable", "invalid_cursor",
+            "snapshot_expired", "invalid_format",
+        ) else "invalid_format"
+        connection.send_error(msg["id"], code, code)
+        return
+    except RuntimeError:
+        connection.send_error(msg["id"], "archive_unavailable", "同步档案暂不可用")
+        return
+    except Exception as err:  # noqa: BLE001
+        log.warning("充电历史索引读取失败: %s", type(err).__name__)
+        connection.send_error(msg["id"], "history_unavailable", "充电历史暂不可用")
+        return
+    connection.send_result(msg["id"], {
+        "protocol_version": 1,
+        "source_id": identity["source_id"],
+        "dataset_id": identity["dataset_id"],
+        "vehicle_id": identity["vehicle_id"],
+        "vin": identity["vin"],
+        "entry_id": coord.entry.entry_id,
+        "timezone": str(recorder.timezone),
+        **body,
+    })
 
 
 @websocket_api.websocket_command({
@@ -317,6 +537,51 @@ async def ws_charging_price(hass: HomeAssistant, connection, msg: dict) -> None:
     except Exception:connection.send_error(msg["id"],"save_failed","价格保存失败，请重试");return
     connection.send_result(msg["id"],{"saved":True,"vin":coord.vin,
                                         "entry_id":coord.entry.entry_id})
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "leapmotor/charging/official",
+    **VEHICLE_SELECTOR_SCHEMA,
+})
+@websocket_api.async_response
+async def ws_charging_official(hass: HomeAssistant, connection, msg: dict) -> None:
+    """官方充电记录缓存(逐笔明细 + 年度统计)只读视图。"""
+    coord = _coordinator(hass, msg)
+    if coord is None:
+        _send_vehicle_error(hass, connection, msg)
+        return
+    store = getattr(coord, "official_charges", None)
+    if store is None:
+        connection.send_error(msg["id"], "not_found", "官方充电记录尚未就绪")
+        return
+    connection.send_result(msg["id"], {**store.view(), "vin": coord.vin,
+                                        "entry_id": coord.entry.entry_id})
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "leapmotor/charging/official/refresh",
+    **VEHICLE_SELECTOR_SCHEMA,
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_charging_official_refresh(hass: HomeAssistant, connection, msg: dict) -> None:
+    """强制同步一次官方充电记录(调试/首次接入用)。"""
+    coord = _coordinator(hass, msg)
+    if coord is None:
+        _send_vehicle_error(hass, connection, msg)
+        return
+    store = getattr(coord, "official_charges", None)
+    if store is None:
+        connection.send_error(msg["id"], "not_found", "官方充电记录尚未就绪")
+        return
+    try:
+        result = await coord.async_sync_official_charges(force=True)
+    except Exception as err:  # noqa: BLE001
+        connection.send_error(msg["id"], "sync_failed", type(err).__name__)
+        return
+    connection.send_result(msg["id"], {**store.view(), "vin": coord.vin,
+                                        "entry_id": coord.entry.entry_id,
+                                        "sync": result})
 
 
 @websocket_api.websocket_command({
@@ -499,7 +764,36 @@ async def ws_energy_daily(hass: HomeAssistant, connection, msg: dict) -> None:
         connection.send_error(msg["id"], "not_found", "没有可用的车辆会话")
         return
     days = int(msg["days"])
-    body = await coord.ensure_energy_days(days)
+    v1_available = getattr(coord, "daily_energy_v1_available", None)
+    use_v1 = callable(v1_available) and v1_available()
+    identity = None
+    if use_v1:
+        requested_vin=str(msg.get("vin") or getattr(coord,"vin","") or "").strip().upper()
+        try:
+            identity=await _daily_archive_identity(hass, coord, requested_vin)
+        except ValueError as err:
+            connection.send_error(msg["id"],str(err),"daily_energy_identity_unknown")
+            return
+        except RuntimeError:
+            connection.send_error(msg["id"],"archive_unavailable","同步档案暂不可用")
+            return
+        try:
+            body=await coord.ensure_energy_days_v1(days)
+        except ValueError as err:
+            connection.send_error(msg["id"],"invalid_format",str(err))
+            return
+        except Exception:  # noqa: BLE001
+            connection.send_error(msg["id"],"daily_energy_unavailable",
+                                  "daily energy v1 unavailable")
+            return
+        if (body.get("daily_energy_version") != 1
+                or not isinstance(body.get("generated_at"), int)
+                or len(body.get("days") or []) != days):
+            connection.send_error(msg["id"],"daily_energy_unavailable",
+                                  "daily energy v1 invalid response")
+            return
+    else:
+        body = await coord.ensure_energy_days(days)
     reev = bool(getattr(coord,"reev",False))
     fuel_store = getattr(coord,"fuel_days",None)
     fuel = fuel_store.snapshot() if reev and fuel_store else {}
@@ -508,7 +802,7 @@ async def ws_energy_daily(hass: HomeAssistant, connection, msg: dict) -> None:
         day["fuel_src"] = "tank_delta" if day["fuel"] is not None else None
     km = [d["km"] for d in body["days"] if d.get("km") is not None]
     kwh = [d["kwh"] for d in body["days"] if d.get("kwh") is not None]
-    connection.send_result(msg["id"], {
+    response={
         "vin": getattr(coord, "vin", "") or "",
         "entry_id": coord.entry.entry_id,
         "days": days,
@@ -517,7 +811,11 @@ async def ws_energy_daily(hass: HomeAssistant, connection, msg: dict) -> None:
         **body,
         "summary": {"km": round(sum(km), 1), "kwh": round(sum(kwh), 2)},
         "generated_at": time.time(),
-    })
+    }
+    if identity is not None:
+        response.update(identity)
+        response["generated_at"]=int(body["generated_at"])
+    connection.send_result(msg["id"], response)
 
 
 # 3D 车模: 现状(读磁盘) / 确保素材就绪(按需装配, 后台跑)。

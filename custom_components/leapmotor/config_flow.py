@@ -27,6 +27,9 @@ from .const import (
     CONF_CAR3D_COLOR,
     CONF_CAR3D_IMAGE,
     CONF_ENERGY_TYPE,
+    CONF_OFFICIAL_CHARGE_SCOPE,
+    DEFAULT_OFFICIAL_CHARGE_SCOPE,
+    OFFICIAL_CHARGE_SCOPES,
     CONF_SHORT_STOP_SECONDS,
     DEFAULT_CAR3D_BG,
     DEFAULT_ENERGY_TYPE,
@@ -554,6 +557,21 @@ class LeapmotorOptionsFlow(_OptionsFlowBase):
                     selector.SelectSelectorConfig(
                         options=ENERGY_TYPES, mode=selector.SelectSelectorMode.DROPDOWN,
                         translation_key="energy_type",
+                    )
+                ),
+                # ── 官方充电记录作用域(App 1.23.05) ──
+                # 充电记录接口按「车端 token 所属账号」过滤: 子账号(车辆共享)读到空,
+                # 只有车主账号能看到。owner = 用车辆列表里的车主 accountId 单独交换一份
+                # **只读** token, 只用于读官方充电记录(不改车控/车况/其他数据)。
+                # 仅限本人车辆/本人账号; off = 不越权读取, 保持本地估算。
+                vol.Optional(
+                    CONF_OFFICIAL_CHARGE_SCOPE,
+                    default=opts.get(CONF_OFFICIAL_CHARGE_SCOPE, DEFAULT_OFFICIAL_CHARGE_SCOPE),
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=OFFICIAL_CHARGE_SCOPES,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                        translation_key="official_charge_scope",
                     )
                 ),
                 # ── 3D 车模(控制卡片的车辆区) ──

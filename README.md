@@ -9,14 +9,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/MiRaToo/ha-leapmotor-cn/releases/latest"><img alt="发布版 v0.3.2" src="https://img.shields.io/badge/%E7%A8%B3%E5%AE%9A%E7%89%88-v0.3.2-brightgreen.svg"></a>
+  <a href="https://github.com/MiRaToo/ha-leapmotor-cn/releases/latest"><img alt="发布版 v0.3.5" src="https://img.shields.io/badge/%E7%A8%B3%E5%AE%9A%E7%89%88-v0.3.5-brightgreen.svg"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-AGPL--3.0-blue"></a>
   <img alt="Home Assistant" src="https://img.shields.io/badge/Home%20Assistant-2024.11%2B-41BDF5?logo=homeassistant&logoColor=white">
 </p>
 
 这是一个非官方的 Home Assistant 自定义集成。集成通过零跑云端接口登录，提供车辆实体、行程与能耗记录，以及六张可直接加入 Lovelace 仪表盘的卡片。项目与零跑汽车及其关联公司无隶属、合作或背书关系。
 
-当前版本：**v0.3.2**。
+当前版本：**v0.3.5**。
 
 代码托管：[GitHub](https://github.com/MiRaToo/ha-leapmotor-cn) · [GitCode 同步仓库](https://gitcode.com/MiraRato/ha-leapmotor-cn)。日常更新以 GitHub 为准，GitCode 通过仓库镜像自动同步代码、分支和标签。
 
@@ -27,7 +27,7 @@
 | 车辆控制 | 车门锁、后备箱、车窗、寻车、空调、座椅加热与通风、方向盘与后视镜加热、电池预热、健康充电和预约充电。可用控件按车辆实际能力显示。 |
 | 车辆状态 | 位置、电量、续航、充电、空调、车身状态、车内温度和轮胎压力；增程车型显示燃油相关数据。 |
 | 行程与能耗 | 本机记录行程轨迹、里程和电量变化；提供每日能耗、近期统计与图表。 |
-| 充电 | 本地充电记录、充电与行驶能耗对照、交流峰谷价和直流分时价，以及单次价格修正。 |
+| 充电 | 本地充电记录与官方「充电记录」（充入电量、次数、年度统计）对照、充电与行驶能耗图表、交流峰谷价和直流分时价，以及单次价格修正。 |
 | 车机工具 | 预约充电与预热、发送目的地、全景壁纸上传、高德地图搜索和多投影面车衣。 |
 | 3D 车模 | 可旋转的整车模型、车漆与背景设置、车型素材采集，以及可导出的诊断信息。 |
 
@@ -88,9 +88,9 @@ https://gitcode.com/MiraRato/ha-leapmotor-cn
 
 ## 配置与数据
 
-集成选项可在“设置 → 设备与服务 → 零跑汽车 → 配置”中调整，包括轮询间隔、电池可用容量、轨迹存储上限和能源类型。高德地图 Web Key 与车机工具的使用方法见[预约与车机工具](docs/vehicle-tools.md)。
+集成选项可在“设置 → 设备与服务 → 零跑汽车 → 配置”中调整，包括轮询间隔、电池可用容量、轨迹存储上限、能源类型和官方充电记录作用域。高德地图 Web Key 与车机工具的使用方法见[预约与车机工具](docs/vehicle-tools.md)。
 
-行程摘要、轨迹和充电账本保存在 Home Assistant 本机。车辆状态和车控请求通过零跑云端接口传输；此项目不提供零跑官方云服务。
+行程摘要、轨迹、充电账本和官方充电记录缓存保存在 Home Assistant 本机；官方充电记录只保存时间、类型、电量与年度汇总，不保存充电位置。车辆状态和车控请求通过零跑云端接口传输；此项目不提供零跑官方云服务。
 
 ## 文档
 
@@ -104,6 +104,7 @@ https://gitcode.com/MiraRato/ha-leapmotor-cn
 - [车型能力与素材](docs/vehicle-capabilities.md)
 - [3D 车模诊断](docs/3D-TROUBLESHOOTING.md)
 - [云 API 协议说明](docs/PROTOCOL.md)
+- [HA / App 原始数据同步协议 v1](docs/APP-DATA-SYNC-V1.md)
 - [HomeKit 与语音平台](docs/homekit.md)
 
 ## 致谢

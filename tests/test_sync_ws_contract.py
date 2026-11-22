@@ -1,5 +1,6 @@
 """Exercise sync WebSocket responses offline, without importing Home Assistant."""
 import ast
+import __future__
 import importlib.util
 import logging
 from pathlib import Path
@@ -49,10 +50,15 @@ def context(tmp_path):
 
     hass = SimpleNamespace(async_add_executor_job=executor)
     tree = ast.parse(WS_PATH.read_text(encoding="utf-8-sig"))
-    functions = [node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)
-                 and node.name == "_sync_call"]
-    namespace = {"_sync_archive": lambda _: archive, "log": logging.getLogger(__name__)}
-    exec(compile(ast.Module(body=functions, type_ignores=[]), str(WS_PATH), "exec"), namespace)
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                 and node.name in ("_daily_energy_capability", "_charging_history_capability")]
+    functions += [node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)
+                  and node.name == "_sync_call"]
+    namespace = {"_sync_archive": lambda _: archive, "log": logging.getLogger(__name__),
+                 "coordinators": lambda _: {}, "valid_iana_timezone": lambda value: value}
+    module = ast.Module(body=functions, type_ignores=[])
+    exec(compile(module, str(WS_PATH), "exec",
+                 flags=__future__.annotations.compiler_flag), namespace)
     yield archive, va, vb, hass, namespace["_sync_call"]
     archive.run("close")
     archive.shutdown()
@@ -62,7 +68,7 @@ def test_every_public_sync_command_requires_admin():
     tree = ast.parse(WS_PATH.read_text(encoding="utf-8-sig"))
     commands = [node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)
                 and node.name.startswith("ws_sync_")]
-    assert len(commands) == 6
+    assert len(commands) == 7
     for node in commands:
         assert any(isinstance(decorator, ast.Attribute)
                    and decorator.attr == "require_admin"
@@ -111,3 +117,20 @@ def test_unknown_vehicle_returns_explicit_error(context):
              "observations", "absent"))
     assert not connection.results
     assert connection.errors[0][1] == "vehicle_unavailable"
+
+
+def test_membership_v2_response_is_scoped_and_capability_is_advertised(context):
+    archive, va, _, hass, call = context
+    archive.run("put_record",va,"trip","member",{"phase":"completed","revision":1})
+    ids=[archive.run("ingest",va,"signal_map",{"1204":i},{"sts":i+1},i+1) for i in range(3)]
+    archive.run("replace_record_membership",va,"trip","member",ids,"complete")
+    info=archive.run("info")
+    assert info["membership_contract_version"]==1
+    assert info["capabilities"]["membership_v1"]==1
+    connection=Connection()
+    run(call(hass,connection,{"id":12,"vehicle_id":va},"membership_page",va,"trip","member",None,None,2))
+    assert not connection.errors
+    _, result=connection.results[0]
+    assert result["protocol_version"]==2 and result["vehicle_id"]==va
+    assert result["coverage"]=="complete" and result["observation_count"]==3
+    assert result["observation_ids"]==ids[:2] and result["has_more"] is True

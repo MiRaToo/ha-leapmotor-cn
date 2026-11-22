@@ -1,0 +1,26 @@
+{
+  "package": "A1",
+  "status": "code-complete-offline-verified",
+  "syncArchiveContractTests": {
+    "tests": 20,
+    "passed": 20,
+    "failed": 0
+  },
+  "syncWebSocketContractTests": {
+    "tests": 6,
+    "passed": 6,
+    "failed": 0
+  },
+  "pythonSyntaxCompile": true,
+  "membershipRevisionStable": true,
+  "membershipCoverage": [
+    "complete",
+    "partial",
+    "unavailable"
+  ],
+  "crossScopeRejected": true,
+  "legacyBackfillConservative": true,
+  "realHomeAssistant": false,
+  "realDataCompared": false,
+  "deviceTested": false
+}

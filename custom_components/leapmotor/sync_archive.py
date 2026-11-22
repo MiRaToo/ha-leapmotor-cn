@@ -73,6 +73,8 @@ class SyncArchive:
         CREATE TABLE IF NOT EXISTS observations(observation_id TEXT PRIMARY KEY,vehicle_id TEXT NOT NULL REFERENCES vehicles(vehicle_id),origin TEXT NOT NULL,fidelity TEXT NOT NULL,field_schema TEXT NOT NULL,layout TEXT NOT NULL,coordinate_system TEXT NOT NULL,received_at_ms INTEGER NOT NULL,source_timestamps TEXT NOT NULL,signals_raw TEXT NOT NULL,legacy_record TEXT,source_key TEXT,deleted INTEGER NOT NULL DEFAULT 0,UNIQUE(vehicle_id,source_key));
         CREATE TABLE IF NOT EXISTS records(vehicle_id TEXT NOT NULL REFERENCES vehicles(vehicle_id),kind TEXT NOT NULL,record_id TEXT NOT NULL,data TEXT NOT NULL,deleted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(vehicle_id,kind,record_id));
         CREATE TABLE IF NOT EXISTS record_observations(vehicle_id TEXT NOT NULL,kind TEXT NOT NULL,record_id TEXT NOT NULL,observation_id TEXT NOT NULL,ordinal INTEGER NOT NULL,PRIMARY KEY(vehicle_id,kind,record_id,observation_id));
+        CREATE TABLE IF NOT EXISTS record_memberships(vehicle_id TEXT NOT NULL,kind TEXT NOT NULL,record_id TEXT NOT NULL,membership_revision INTEGER NOT NULL CHECK(membership_revision>=1),coverage TEXT NOT NULL CHECK(coverage IN ('complete','partial','unavailable')),observation_count INTEGER NOT NULL CHECK(observation_count>=0),snapshot_id TEXT NOT NULL UNIQUE,created_at_ms INTEGER NOT NULL,PRIMARY KEY(vehicle_id,kind,record_id,membership_revision));
+        CREATE TABLE IF NOT EXISTS record_membership_items(vehicle_id TEXT NOT NULL,kind TEXT NOT NULL,record_id TEXT NOT NULL,membership_revision INTEGER NOT NULL,ordinal INTEGER NOT NULL,observation_id TEXT NOT NULL,PRIMARY KEY(vehicle_id,kind,record_id,membership_revision,ordinal),UNIQUE(vehicle_id,kind,record_id,membership_revision,observation_id));
         CREATE TABLE IF NOT EXISTS capture_events(event_id TEXT PRIMARY KEY,vehicle_id TEXT NOT NULL REFERENCES vehicles(vehicle_id),data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS changes(vehicle_id TEXT NOT NULL,seq INTEGER NOT NULL,commit_id TEXT NOT NULL,op TEXT NOT NULL,entity_id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(vehicle_id,seq));
         CREATE TABLE IF NOT EXISTS snapshots(snapshot_id TEXT PRIMARY KEY,vehicle_id TEXT NOT NULL,head_seq INTEGER NOT NULL,expires INTEGER NOT NULL,items TEXT NOT NULL);
@@ -94,6 +96,7 @@ class SyncArchive:
                 c.execute("INSERT INTO metadata VALUES(?,?)", (key, uuid.uuid4().hex if key != "cursor_secret" else os.urandom(32).hex()))
         c.execute("DELETE FROM snapshots WHERE expires < ?",(int(time.time()),))
         c.commit(); self._conn = c; self.ready = True
+        self._backfill_memberships(c); c.commit()
 
     def close(self) -> None:
         if self._conn:
@@ -126,7 +129,7 @@ class SyncArchive:
     def info(self):
         rows=self._c().execute("SELECT status FROM migration_status").fetchall()
         migration="complete" if rows and all(r[0]=="complete" for r in rows) else "pending_or_partial"
-        return {"protocol_version":1,"source_id":self._meta("source_id"),"dataset_id":self._meta("dataset_id"),"ready":self.ready,"commands":["info","vehicles","bootstrap","pull","observations","records"],"field_schema":"leapmotor.raw.v1","fields":_FIELDS,
+        return {"protocol_version":1,"source_id":self._meta("source_id"),"dataset_id":self._meta("dataset_id"),"ready":self.ready,"commands":["info","vehicles","bootstrap","pull","observations","records","membership"],"membership_contract_version":1,"capabilities":{"membership_v1":1,"stable_membership_revisions":True,"membership_coverage":True,"membership_count":True},"field_schema":"leapmotor.raw.v1","fields":_FIELDS,
                 "schemas": {FIELD_SCHEMA:{"fields":_FIELDS,"source_timestamps":_TIME_FIELDS}, "leapmotor.legacy.v1":{"fields":_LEGACY_FIELDS,"source_timestamps":{"legacy_ha_sample_time_seconds":{"unit":"s"}}}},
                 "raw_full_retention":True,"retention":"unbounded; explicit deletion only","migration":{"status":migration,"fidelity":"legacy_processed/legacy_partial"},"limitations":["administrator_only","no_data_purge_command","legacy files already evicted by HA are unrecoverable","archive I/O failures retry on a later vehicle poll"]}
 
@@ -169,6 +172,63 @@ class SyncArchive:
         c.execute("INSERT INTO changes(vehicle_id,seq,commit_id,op,entity_id,data,kind) VALUES(?,?,?,?,?,?,?)",
                   (vid,seq,cid,op,eid,_json(data),data.get("kind", "") if op.startswith("record.") else "")); return seq
 
+    def _backfill_memberships(self, c):
+        rows=c.execute("""
+            SELECT r.vehicle_id,r.kind,r.record_id FROM records r
+            WHERE r.deleted=0 AND NOT EXISTS (
+                SELECT 1 FROM record_memberships m
+                WHERE m.vehicle_id=r.vehicle_id AND m.kind=r.kind AND m.record_id=r.record_id
+            )
+        """).fetchall()
+        for row in rows:
+            ids=[item[0] for item in c.execute("""
+                SELECT ro.observation_id FROM record_observations ro
+                JOIN observations o ON o.vehicle_id=ro.vehicle_id AND o.observation_id=ro.observation_id
+                WHERE o.deleted=0 AND ro.vehicle_id=? AND ro.kind=? AND ro.record_id=?
+                ORDER BY ro.ordinal,ro.observation_id
+            """,(row[0],row[1],row[2])).fetchall()]
+            self._write_membership(c,row[0],row[1],row[2],ids,
+                                   "unavailable" if not ids else "partial",1)
+            stored=c.execute("SELECT data FROM records WHERE vehicle_id=? AND kind=? AND record_id=?",
+                             (row[0],row[1],row[2])).fetchone()
+            if stored:
+                data=json.loads(stored[0])
+                data=self._record_with_membership(c,row[0],row[1],row[2],data)
+                c.execute("UPDATE records SET data=? WHERE vehicle_id=? AND kind=? AND record_id=?",
+                          (_json(data),row[0],row[1],row[2]))
+                self._event(row[0],"record.upsert",row[2],data)
+
+    def _write_membership(self, c, vid, kind, record_id, observation_ids, coverage, revision):
+        if coverage not in ("complete","partial","unavailable"):
+            raise ValueError("invalid_format")
+        ids=list(dict.fromkeys(observation_ids))
+        if coverage=="unavailable" and ids:
+            raise ValueError("invalid_format")
+        for observation_id in ids:
+            if not c.execute("SELECT 1 FROM observations WHERE vehicle_id=? AND observation_id=? AND deleted=0",
+                             (vid,observation_id)).fetchone():
+                raise ValueError("not_found")
+        snapshot_id=str(uuid.uuid4())
+        c.execute("INSERT INTO record_memberships VALUES(?,?,?,?,?,?,?,?)",
+                  (vid,kind,record_id,revision,coverage,len(ids),snapshot_id,int(time.time()*1000)))
+        for ordinal,observation_id in enumerate(ids):
+            c.execute("INSERT INTO record_membership_items VALUES(?,?,?,?,?,?)",
+                      (vid,kind,record_id,revision,ordinal,observation_id))
+        return snapshot_id
+
+    def _current_membership(self, c, vid, kind, record_id):
+        return c.execute("""
+            SELECT * FROM record_memberships WHERE vehicle_id=? AND kind=? AND record_id=?
+            ORDER BY membership_revision DESC LIMIT 1
+        """,(vid,kind,record_id)).fetchone()
+
+    def _record_with_membership(self, c, vid, kind, record_id, data):
+        membership=self._current_membership(c,vid,kind,record_id)
+        return {**data,
+                "membership_revision":int(membership["membership_revision"]) if membership else None,
+                "membership_coverage":membership["coverage"] if membership else "unavailable",
+                "observation_count":int(membership["observation_count"]) if membership else 0}
+
     def put_record(self, vid, kind, record_id, data):
         self._require_vehicle(vid)
         if kind not in ("trip", "charge") or not record_id: raise ValueError("invalid_format")
@@ -177,6 +237,9 @@ class SyncArchive:
         allowed.update(record_id=record_id,kind=kind)
         c=self._c()
         with c:
+            if not self._current_membership(c,vid,kind,record_id):
+                self._write_membership(c,vid,kind,record_id,[],"unavailable",1)
+            allowed=self._record_with_membership(c,vid,kind,record_id,allowed)
             c.execute("INSERT INTO records VALUES(?,?,?,?,0) ON CONFLICT(vehicle_id,kind,record_id) DO UPDATE SET data=excluded.data,deleted=0",(vid,kind,record_id,_json(allowed)))
             self._event(vid,"record.upsert",record_id,allowed)
 
@@ -195,12 +258,101 @@ class SyncArchive:
             boundary={"source":"HA grouping hint","started_at_ms":started_at_ms,"ended_at_ms":ended_at_ms}
             if not linked and old:
                 previous=json.loads(old[0])
-                if previous.get("phase")==phase and previous.get("boundary_hint")==boundary: return False
+                if (previous.get("phase")==phase and previous.get("boundary_hint")==boundary
+                        and self._current_membership(c,vid,kind,record_id)):
+                    return False
             rev=(int(json.loads(old[0]).get("revision",0))+1) if old else 1
             data={"record_id":record_id,"kind":kind,"phase":phase,"revision":rev,"algorithm_version":"ha-grouping-v1","legacy_source":json.loads(old[0]).get("legacy_source") if old else None,"boundary_hint":boundary}
+            membership=self._current_membership(c,vid,kind,record_id)
+            if linked or membership is None:
+                ids=[item[0] for item in c.execute("""
+                    SELECT ro.observation_id FROM record_observations ro
+                    JOIN observations o ON o.vehicle_id=ro.vehicle_id AND o.observation_id=ro.observation_id
+                    WHERE o.deleted=0 AND ro.vehicle_id=? AND ro.kind=? AND ro.record_id=?
+                    ORDER BY ro.ordinal,ro.observation_id
+                """,(vid,kind,record_id)).fetchall()]
+                membership_revision=(int(membership["membership_revision"])+1) if membership else 1
+                self._write_membership(c,vid,kind,record_id,ids,
+                                       "partial" if ids else "unavailable",membership_revision)
+            data=self._record_with_membership(c,vid,kind,record_id,data)
             c.execute("INSERT INTO records VALUES(?,?,?,?,0) ON CONFLICT(vehicle_id,kind,record_id) DO UPDATE SET data=excluded.data,deleted=0",(vid,kind,record_id,_json(data)))
             self._event(vid,"record.upsert",record_id,data)
         return True
+
+    def replace_record_membership(self, vid, kind, record_id, observation_ids, coverage):
+        self._require_vehicle(vid); c=self._c()
+        if kind not in ("trip","charge") or not record_id: raise ValueError("invalid_format")
+        if not isinstance(observation_ids,(list,tuple)): raise ValueError("invalid_format")
+        ids=[str(value) for value in observation_ids]
+        if any(not value or len(value)>192 or value.strip()!=value for value in ids):
+            raise ValueError("invalid_format")
+        if len(ids)!=len(set(ids)): raise ValueError("invalid_format")
+        with c:
+            old=c.execute("SELECT data FROM records WHERE vehicle_id=? AND kind=? AND record_id=? AND deleted=0",
+                          (vid,kind,record_id)).fetchone()
+            if not old: raise ValueError("not_found")
+            membership=self._current_membership(c,vid,kind,record_id)
+            revision=(int(membership["membership_revision"])+1) if membership else 1
+            self._write_membership(c,vid,kind,record_id,ids,coverage,revision)
+            c.execute("DELETE FROM record_observations WHERE vehicle_id=? AND kind=? AND record_id=?",
+                      (vid,kind,record_id))
+            for ordinal,observation_id in enumerate(ids):
+                c.execute("INSERT INTO record_observations VALUES(?,?,?,?,?)",
+                          (vid,kind,record_id,observation_id,ordinal))
+            data=json.loads(old[0]); data["revision"]=int(data.get("revision",0))+1
+            data=self._record_with_membership(c,vid,kind,record_id,data)
+            c.execute("UPDATE records SET data=?,deleted=0 WHERE vehicle_id=? AND kind=? AND record_id=?",
+                      (_json(data),vid,kind,record_id))
+            self._event(vid,"record.upsert",record_id,data)
+        return {"membership_revision":revision,"coverage":coverage,"observation_count":len(ids)}
+
+    def membership_page(self, vid, kind, record_id, membership_revision=None, page_token=None, limit=100):
+        self._require_vehicle(vid); c=self._c()
+        if kind not in ("trip","charge") or not record_id: raise ValueError("invalid_format")
+        if not c.execute("SELECT 1 FROM records WHERE vehicle_id=? AND kind=? AND record_id=? AND deleted=0",
+                         (vid,kind,record_id)).fetchone():
+            raise ValueError("not_found")
+        if self._current_membership(c,vid,kind,record_id) is None:
+            with c: self._backfill_memberships(c)
+        current=self._current_membership(c,vid,kind,record_id)
+        token_data=None
+        if page_token:
+            token_data=self._untoken(page_token)
+            if membership_revision is None:
+                membership_revision=token_data.get("membership_revision")
+        if membership_revision is None: membership_revision=int(current["membership_revision"])
+        if type(membership_revision) is not int or membership_revision<1:
+            raise ValueError("invalid_format")
+        membership=c.execute("""SELECT * FROM record_memberships
+                                WHERE vehicle_id=? AND kind=? AND record_id=? AND membership_revision=?""",
+                             (vid,kind,record_id,membership_revision)).fetchone()
+        if not membership: raise ValueError("not_found")
+        offset=0
+        scope=hashlib.sha256(_json([vid,kind,record_id,membership_revision,membership["snapshot_id"]]).encode()).hexdigest()
+        if page_token:
+            t=token_data
+            if (t.get("view")!="membership" or t.get("vehicle_id")!=vid or t.get("scope")!=scope
+                    or type(t.get("offset")) is not int or t["offset"]<0
+                    or t.get("kind")!=kind or t.get("record_id")!=record_id
+                    or t.get("membership_revision")!=membership_revision
+                    or t.get("source_id")!=self._meta("source_id")
+                    or t.get("dataset_id")!=self._meta("dataset_id")):
+                raise ValueError("invalid_cursor")
+            offset=t["offset"]
+        lim=min(max(int(limit),1),200)
+        rows=c.execute("""SELECT observation_id FROM record_membership_items
+                          WHERE vehicle_id=? AND kind=? AND record_id=? AND membership_revision=?
+                          ORDER BY ordinal LIMIT ? OFFSET ?""",
+                       (vid,kind,record_id,membership_revision,lim+1,offset)).fetchall()
+        more=len(rows)>lim; rows=rows[:lim]
+        token=self._token({"source_id":self._meta("source_id"),"dataset_id":self._meta("dataset_id"),
+                           "vehicle_id":vid,"view":"membership","scope":scope,"kind":kind,
+                           "record_id":record_id,"membership_revision":membership_revision,
+                           "offset":offset+len(rows)}) if more else None
+        return {"record_id":record_id,"kind":kind,"membership_revision":membership_revision,
+                "coverage":membership["coverage"],"observation_count":membership["observation_count"],
+                "snapshot_id":membership["snapshot_id"],"observation_ids":[row[0] for row in rows],
+                "next_page_token":token,"has_more":more}
 
     def import_legacy(self, vid, kind, record_id, points, meta):
         """Idempotently import actually retained legacy points; never promote derived charge power."""
@@ -239,6 +391,22 @@ class SyncArchive:
                     self._event(vid,"observation.upsert",oid,payload); count+=1
                 except (IndexError,TypeError,ValueError):
                     continue
+            ids=[item[0] for item in c.execute("""
+                SELECT observation_id FROM record_observations
+                WHERE vehicle_id=? AND kind=? AND record_id=? ORDER BY ordinal
+            """,(vid,kind,record_id)).fetchall()]
+            membership=self._current_membership(c,vid,kind,record_id)
+            revision=(int(membership["membership_revision"])+1) if membership else 1
+            self._write_membership(c,vid,kind,record_id,ids,
+                                   "partial" if ids else "unavailable",revision)
+            stored=c.execute("SELECT data FROM records WHERE vehicle_id=? AND kind=? AND record_id=?",
+                             (vid,kind,record_id)).fetchone()
+            if stored:
+                current=json.loads(stored[0])
+                current=self._record_with_membership(c,vid,kind,record_id,current)
+                c.execute("UPDATE records SET data=? WHERE vehicle_id=? AND kind=? AND record_id=?",
+                          (_json(current),vid,kind,record_id))
+                self._event(vid,"record.upsert",record_id,current)
             c.execute("INSERT INTO legacy_imports VALUES(?,?,?)",(vid,kind,record_id))
         return count
 
@@ -249,6 +417,33 @@ class SyncArchive:
                 row=c.execute("SELECT observation_id FROM observations WHERE vehicle_id=? AND observation_id=? AND deleted=0",(vid,entity_id)).fetchone()
                 if not row: raise ValueError("not_found")
                 c.execute("UPDATE observations SET deleted=1 WHERE vehicle_id=? AND observation_id=?",(vid,entity_id)); op="observation.delete"
+                affected=c.execute("""SELECT kind,record_id FROM record_observations
+                                      WHERE vehicle_id=? AND observation_id=?""",
+                                   (vid,entity_id)).fetchall()
+                for member_kind,record_id in affected:
+                    ids=[item[0] for item in c.execute("""
+                        SELECT ro.observation_id FROM record_observations ro
+                        JOIN observations o ON o.vehicle_id=ro.vehicle_id AND o.observation_id=ro.observation_id
+                        WHERE o.deleted=0 AND ro.vehicle_id=? AND ro.kind=? AND ro.record_id=?
+                        ORDER BY ro.ordinal,ro.observation_id
+                    """,(vid,member_kind,record_id)).fetchall()]
+                    current=self._current_membership(c,vid,member_kind,record_id)
+                    if current:
+                        next_revision=int(current["membership_revision"])+1
+                        coverage=current["coverage"]
+                        if not ids and coverage=="unavailable": coverage="unavailable"
+                        self._write_membership(c,vid,member_kind,record_id,ids,coverage,next_revision)
+                        stored=c.execute("""SELECT data FROM records
+                                            WHERE vehicle_id=? AND kind=? AND record_id=?""",
+                                         (vid,member_kind,record_id)).fetchone()
+                        if stored:
+                            data=json.loads(stored[0])
+                            data["revision"]=int(data.get("revision",0))+1
+                            data=self._record_with_membership(c,vid,member_kind,record_id,data)
+                            c.execute("""UPDATE records SET data=?
+                                         WHERE vehicle_id=? AND kind=? AND record_id=?""",
+                                      (_json(data),vid,member_kind,record_id))
+                            self._event(vid,"record.upsert",record_id,data)
             elif entity_type=="record":
                 if kind not in ("trip", "charge"): raise ValueError("invalid_format")
                 row=c.execute("SELECT record_id FROM records WHERE vehicle_id=? AND kind=? AND record_id=? AND deleted=0",(vid,kind,entity_id)).fetchone()
