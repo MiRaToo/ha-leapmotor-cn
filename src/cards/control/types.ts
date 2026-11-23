@@ -185,9 +185,7 @@ export const CAR_IMG: Record<string, string> = {
  * 其余是 3/4 视角, 沿用旧的"左上=左前"四角排布。 */
 export const CAR_IMG_TOP: Record<string, number> = { c10: 1, c01: 1, t: 1 };
 
-/* 车模图与卡片同一目录(集成的 www/ 被整目录暴露: /leapmotor-card/ 或 /local/leapmotor-card/)。
-   用**本模块自身的加载地址**推 base —— 这样卡片从哪个前缀加载, 车模图就走哪个前缀,
-   不会出现"卡片从 /local 来、车模图还去 /leapmotor-card 拿"的错配。 */
+/* 从卡片模块地址定位同一静态路径下的车模图。 */
 export const CAR_IMG_BASE = new URL("carimg/", import.meta.url).href;
 
 export const CAR_IMG_RETRY_MS = 5 * 60 * 1000; // 车辆外观图失败后的重试间隔

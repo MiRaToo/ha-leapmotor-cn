@@ -356,6 +356,7 @@ def install_wrapper(base: Path, src: Path, version: int | None = None) -> list[s
     就仍然是 ready, 包装页由集成在 setup 时顺手刷新。
     """
     version = ASSET_VERSION if version is None else version      # 取当前值(便于热改/单测)
+    base.mkdir(parents=True, exist_ok=True)
     prepare_static_assets(base)
     man = read_manifest(base)
     if int(man.get("asset_version") or 0) == version and all(

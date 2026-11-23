@@ -26,9 +26,9 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
+from homeassistant.setup import async_when_setup
 
-from .cardfiles import (CARD_URL_LOCAL, CARD_URL_STATIC, card_url_file_name,
-                        copy_tree, missing_files, MIRROR_DIR_NAME)
+from .cardfiles import CARD_URL_STATIC, async_ensure_card_resource
 from . import car3d
 from .const import DOMAIN, DEFAULT_POLL_SECONDS, PLATFORMS
 from .coordinator import LeapmotorCoordinator
@@ -59,41 +59,6 @@ _FRONTEND_KEY = "_frontend_registered"
 _SYNC_ARCHIVE_KEY = "_sync_archive_v1"
 _SYNC_ARCHIVE_STOP_KEY = "_sync_archive_stop_v1"
 _DAILY_ENERGY_V1_LOCKS_KEY = "_daily_energy_v1_locks"
-
-# ── 卡片"可启动窗口"投递 ──────────────────────────────
-# 症状: 卡片"经常"显示「配置错误 / Custom element doesn't exist」, 刷新后又正常。
-# 根因(实测 + 上游 issue): 集成的静态路径 `/leapmotor-card/` 要等集成 setup 才注册,
-# 而 HA 重启后前端恢复连接会自动刷新页面 —— 这个窗口里这些 URL 返回 404, 模块加载失败;
-# 前端的资源加载是 fire-and-forget(官方明确不阻塞 UI), 失败后本次页面不再重试 ——
-# 卡片就停在「配置错误」, 必须手动刷新才恢复。
-# 修法: 把卡片**镜像**到 config/www/leapmotor-card/(即核心早期注册、内容常驻磁盘的
-# /local 静态目录) —— 镜像存在后, 重启窗口内也能取到文件, 404 窗口被消除。
-# 首次写入镜像的那次启动仍先用旧路径(原因见 _mirror_cards_to_www), 下一次启动起生效;
-# 镜像失败(www 不可写等)永远退回 /leapmotor-card/, 行为与以前一致。
-# 说明见 cardfiles.py; 上游追踪: home-assistant/frontend#52570(竞态), core#181190(404 长缓存)。
-
-
-async def _mirror_cards_to_www(hass: HomeAssistant) -> bool:
-    """把卡片镜像到 config/www/leapmotor-card/, 返回"本次启动是否可以用 /local URL"。
-
-    判定规则: **镜像在本次写入前已完整存在** → True(用 /local); 否则 False(本次沿用
-    /leapmotor-card/, 但镜像已写好, 下次启动即生效)。
-    为什么"首次写入的那次不切": `/local` 的 404 响应带 31 天强缓存(HA 2026.9 已知缺陷,
-    上游 core#181190)。若上一轮曾在 .storage 里登记过 /local 资源、而镜像又被外部删掉,
-    这次启动到集成 setup 之间会有一段窗口, 前端按旧资源表请求 /local 拿到 404 并被长期
-    记住 —— 先判"本来就在"才切, 可以把这类陈旧引用的窗口彻底避开。
-    """
-    src = Path(__file__).parent / "www"
-    names = [n for n, _ver in _CARDS]
-    dst = Path(hass.config.path("www")) / MIRROR_DIR_NAME
-    complete_before = not missing_files(dst, names)   # 写盘前先判"是不是本来就有"
-    try:
-        await hass.async_add_executor_job(copy_tree, src, dst)
-    except Exception as err:  # noqa: BLE001
-        log.warning("卡片镜像到 www 失败(退回集成静态路径): %s", err)
-        return False
-    return complete_before
-
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """配置条目迁移(累积式: 老条目会一路补到最新版本)。
@@ -152,86 +117,64 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # 先置位再注册: 静态路径重复注册在有些 HA 版本会直接抛错, 宁可失败后等下个版本修
     data[_FRONTEND_KEY] = True
 
-    try:
-        from homeassistant.components.frontend import add_extra_js_url
-        from homeassistant.components.http import StaticPathConfig
+    from homeassistant.components.http import StaticPathConfig
 
-        base = Path(__file__).parent / "www"
-        # ① 集成自带静态路径: 始终注册 —— carimg 一直从这里取; 同时兜底"镜像失败/旧缓存页面"。
-        #    car3d = 3D 车模落盘目录(运行时才装配出来, 先建空目录以免注册报错;
-        #    内容见 car3d.py: 通用查看器 + 本车模型 + 包装页 view.html)。
-        car3d_dir = car3d.root(hass)
-        try:
-            car3d_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as err:
-            log.warning("3D 素材目录创建失败(3D 车模暂不可用): %s", err)
+    base = Path(__file__).parent / "www"
+    try:
+        # 先注册卡片路由，再将对应 URL 提供给首页和仪表盘。
         await hass.http.async_register_static_paths(
             [StaticPathConfig(CARD_URL_STATIC + name, str(base / name), cache_headers=False)
              for name, _ver in _CARDS]
-            # 车模图(按车型的官方外观图, 控制卡用): 目录映射, **不要**放进 _CARDS
-            # —— 上面那个循环会把每一项都当 JS 模块注入首页。
             + [StaticPathConfig(CARD_URL_STATIC + "carimg", str(base / "carimg"),
-                                cache_headers=False),
-               StaticPathConfig(CARD_URL_STATIC + car3d.URL_DIR, str(car3d_dir),
-                                cache_headers=True)]
+                                cache_headers=False)]
         )
-        # 顺手把包装页/星空贴图铺进落盘目录(纯本地复制, 不联网; 版本一致就跳过) ——
-        # 这样素材还没装配时 view.html 这个 URL 也已经有效(卡片下载完素材即可直接用)。
-        try:
-            await hass.async_add_executor_job(
-                car3d.install_wrapper, car3d_dir, car3d.wrapper_src())
-        except Exception as err:  # noqa: BLE001
-            log.warning("铺 3D 车模包装页失败(3D 暂不可用): %s", err)
-        # ② 镜像到 /local(把卡片文件常驻到核心早期注册的 www 目录, 消除重启窗口内的 404,
-        #    见 _mirror_cards_to_www 的说明); 镜像失败则退回 ① 的路径, 与以前一致。
-        prefix = CARD_URL_LOCAL if await _mirror_cards_to_www(hass) else CARD_URL_STATIC
-        # ③ 两个注册面(首页 extra module + 仪表盘资源)统一用镜像后的 URL。
-        for name, ver in _CARDS:
-            versioned = f"{prefix}{name}?v={ver}"
-            add_extra_js_url(hass, versioned)
-            await _ensure_lovelace_resource(hass, versioned)
-            log.debug("已注册卡片 %s", versioned)
+        urls = [f"{CARD_URL_STATIC}{name}?v={ver}" for name, ver in _CARDS]
+
+        async def _add_card_urls(hass: HomeAssistant, _component: str) -> None:
+            from homeassistant.components.frontend import add_extra_js_url
+
+            for url in urls:
+                add_extra_js_url(hass, url)
+
+        async_when_setup(hass, "frontend", _add_card_urls)
+        await _ensure_lovelace_resources(hass, urls)
     except Exception as err:  # noqa: BLE001
         log.warning("前端卡片注册失败(不影响控车): %s", err)
+
+    car3d_dir = car3d.root(hass)
+    try:
+        await hass.async_add_executor_job(car3d.install_wrapper, car3d_dir, car3d.wrapper_src())
+    except Exception as err:  # noqa: BLE001
+        log.warning("铺 3D 车模包装页失败: %s", err)
+    try:
+        await hass.http.async_register_static_paths(
+            [StaticPathConfig(CARD_URL_STATIC + car3d.URL_DIR, str(car3d_dir), cache_headers=True)]
+        )
+    except Exception as err:  # noqa: BLE001
+        log.warning("3D 车模静态路径注册失败: %s", err)
     return True
 
 
-async def _ensure_lovelace_resource(hass: HomeAssistant, url: str) -> None:
-    """把卡片同时登记成仪表盘"资源"(幂等; 按**文件名**匹配 → 旧 URL 直接迁移)。
-
-    为什么还要这条路: `add_extra_js_url` 那行 import 是写进首页 HTML 的, 浏览器若缓存了
-    旧首页(或用了缓存很凶的 App), 卡片模块永远不会被加载 —— 界面上表现为
-    "配置错误 / Custom element doesn't exist"。资源列表是前端每次渲染仪表盘时读取的,
-    因此这条路不受首页缓存影响。
-
-    匹配规则: 按 URL 文件名匹配而不是完整 URL —— 这样"路径前缀 + 版本号"
-    任一变化都只是**更新同一条**; 同名重复条目(历史遗留)会被顺手删掉, 避免同款卡片被
-    加载两次。
-    """
+async def _ensure_lovelace_resources(hass: HomeAssistant, urls: list[str]) -> None:
+    """登记存储模式的仪表盘资源，供使用缓存首页的客户端加载。"""
     try:
-        from homeassistant.components.lovelace import LOVELACE_DATA
+        from homeassistant.components import lovelace
 
-        data = hass.data.get(LOVELACE_DATA)
-        resources = getattr(data, "resources", None) if data else None
+        data = hass.data.get(getattr(lovelace, "LOVELACE_DATA", lovelace.DOMAIN))
+        resources = data.get("resources") if isinstance(data, dict) else getattr(data, "resources", None)
         if resources is None or not hasattr(resources, "async_create_item"):
             log.debug("lovelace 资源集合不可用, 跳过资源登记")
             return
-        if not getattr(resources, "loaded", True):
-            await resources.async_load()          # 资源是懒加载的, 先拉一次
-        name = card_url_file_name(url)
-        matches = [item for item in resources.async_items()
-                   if card_url_file_name(item.get("url", "")) == name]
-        if matches:
-            head = matches[0]
-            if head.get("url") != url:            # 路径/版本变了 → 更新同一条
-                await resources.async_update_item(head["id"], {"url": url})
-            for extra in matches[1:]:             # 同名重复条目 → 清掉
-                await resources.async_delete_item(extra["id"])
-            return
-        await resources.async_create_item({"res_type": "module", "url": url})
-        log.debug("已登记仪表盘资源 %s", url)
+        await resources.async_get_info()
     except Exception as err:  # noqa: BLE001
-        log.debug("登记仪表盘资源失败(不影响 add_extra_js_url 那条路): %s", err)
+        log.debug("加载仪表盘资源失败: %s", err)
+        return
+
+    for url in urls:
+        try:
+            await async_ensure_card_resource(resources, url)
+        except Exception as err:  # noqa: BLE001
+            log.debug("登记仪表盘资源 %s 失败: %s", url, err)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

@@ -18,5 +18,5 @@
   "loggers": [
     "custom_components.leapmotor"
   ],
-  "version": "0.3.6"
+  "version": "0.3.7"
 }
