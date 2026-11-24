@@ -43,7 +43,7 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 # CARD_VERSION 与各自 JS 文件头里的同名常量保持一致(改 JS 记得一起升, 好让浏览器拿到新文件)。
 CARD_VERSION = "1.6.21"           # leapmotor-map.js
 TRIPS_CARD_VERSION = "1.6.28"     # leapmotor-trips.js
-CONTROL_CARD_VERSION = "1.9.77"   # leapmotor-control.js
+CONTROL_CARD_VERSION = "1.9.78"   # leapmotor-control.js
 ENERGY_CARD_VERSION = "1.4.17"    # leapmotor-energy.js
 LASTWEEK_CARD_VERSION = "1.1.22"  # leapmotor-lastweek.js
 METRICS_CARD_VERSION = "1.0.9"    # leapmotor-metrics.js
@@ -178,7 +178,12 @@ async def _ensure_lovelace_resources(hass: HomeAssistant, urls: list[str]) -> No
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    coordinator = LeapmotorCoordinator(hass, entry)
+    from homeassistant.util import dt as dt_util
+
+    zone = await dt_util.async_get_time_zone(hass.config.time_zone)
+    if zone is None:
+        raise ConfigEntryNotReady("无法加载 Home Assistant 配置的时区")
+    coordinator = LeapmotorCoordinator(hass, entry, zone)
     # Shared independent archive; its own single worker serializes every SQLite operation.
     data = hass.data.setdefault(DOMAIN, {})
     vin_lock_key = str(coordinator.vin or "").strip().upper()
@@ -265,44 +270,48 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if coordinator.update_interval else DEFAULT_POLL_SECONDS),
     )
     await recorder.async_load()
+    await recorder.async_sync_discards(archive, coordinator.sync_vehicle_id)
     coordinator.trips = recorder
     # ── 官方逐日能耗缓存(getEC; 见 energy_daily.py)──
     # 卡片/传感器的「每日耗电」数据源。已完结的日子拉一次进持久缓存, 历史不变。
     energy_days = EnergyDayStore(hass, coordinator.vin)
     await energy_days.async_load()
     coordinator.energy_days = energy_days
-    daily_energy_v1 = DailyEnergyV1Store(hass, coordinator.vin)
+    daily_energy_v1 = DailyEnergyV1Store(hass, coordinator.vin, time_zone=zone.key)
     await daily_energy_v1.async_load()
     coordinator.daily_energy_v1 = daily_energy_v1
     from .charging import ChargeRecorder
+    from .official_charge import OfficialChargeStore, official_cache_scope
+    scope = official_cache_scope(coordinator.session.account_id, coordinator.vin)
     charges = ChargeRecorder(hass, coordinator.vin,
                              capacity_kwh=float(entry.options.get(CONF_BATTERY_KWH) or DEFAULT_BATTERY_KWH),
-                             timezone=hass.config.time_zone)
+                             timezone=zone, account_scope=scope)
     await charges.async_load()
+    official_charges = OfficialChargeStore(hass, coordinator.vin, account_scope=scope)
+    try:
+        await official_charges.async_load()
+    except Exception as err:  # the live account can fetch a fresh snapshot
+        log.warning("官方充电缓存加载失败: %s", type(err).__name__)
+        official_charges = OfficialChargeStore(hass, coordinator.vin, account_scope=scope)
+    coordinator.official_charges = official_charges
+    if official_charges.available:
+        charges.apply_official(official_charges.match(charges.sessions))
+    else:
+        charges.clear_official()
     coordinator.charges = charges
+    coordinator.sync_official_account()
     try:
         from .charge_history import ChargeHistoryIndex
         charge_history = ChargeHistoryIndex(hass, coordinator.vin)
         await charge_history.async_load()
-        charge_history.reconcile_sessions(
-            charges.sessions, observed_at_ms=int(_time.time() * 1000))
-        charges.history_index = charge_history
+        charges.attach_history(charge_history, official_available=bool(coordinator.official_charges.available))
         coordinator.charge_history_index = charge_history
     except Exception as err:  # noqa: BLE001
         log.warning("充电历史索引未就绪(旧充电记录继续可用): %s", type(err).__name__)
-    # ── 官方充电记录(App 1.23.05「充电记录」; 见 official_charge.py)──
-    # 只读低频同步: 逐笔明细(近三个月) + 年度统计。匹配到本地已结束会话后,
-    # 官方「充入电量」优先, 本地估算兜底; 账号看不到车主记录时静默保留估算。
-    try:
-        from .official_charge import OfficialChargeStore
-        official_charges = OfficialChargeStore(hass, coordinator.vin, timezone=hass.config.time_zone)
-        await official_charges.async_load()
-        coordinator.official_charges = official_charges
+    if charges.account_scope:
         entry.async_create_background_task(
             hass, coordinator.async_sync_official_charges(force=True),
             "leapmotor official charge sync")
-    except Exception as err:  # noqa: BLE001 - 官方数据是增强, 失败时保留本地估算
-        log.warning("官方充电记录未就绪(继续使用本地充电账本): %s", type(err).__name__)
     if archive.ready:
         # ⚠️ 用**条目级**后台任务: 卸载时 HA 会自动取消并等待它, 不要自己注册
         # `entry.async_on_unload(migration.cancel)` —— 那个回调的契约是
@@ -314,7 +323,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass, _async_import_sync_history(hass, coordinator),
             "leapmotor raw history migration")
     from .fuel_daily import FuelDayRecorder
-    fuel_days = FuelDayRecorder(hass, coordinator.vin, hass.config.time_zone)
+    fuel_days = FuelDayRecorder(hass, coordinator.vin, zone)
     await fuel_days.async_load()
     coordinator.fuel_days = fuel_days
     if coordinator.state is not None:

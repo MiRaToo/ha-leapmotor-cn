@@ -244,7 +244,7 @@ def test_real_charge_recorder_publishes_recording_completed_price_and_tariff_cha
     store = MemoryStore()
     idx = index(clock=lambda: now)
     recorder = ChargeRecorder(
-        None, "TEST", 70, store=store, timezone="Asia/Hong_Kong")
+        None, "TEST", 70, store=store, timezone=ZONE)
     recorder.history_index = idx
 
     def frame(at, charging=1):
@@ -258,6 +258,7 @@ def test_real_charge_recorder_publishes_recording_completed_price_and_tariff_cha
     record_id = recorder.active["id"]
     assert idx.rows[record_id]["phase"] == "recording"
     recorder.process(frame(now + 60), now=now + 60)
+    assert idx.rows[record_id]["energy"]["kwh"] == 0.1
     recorder.process(frame(now + 120, charging=0), now=now + 120)
     completed = idx.rows[record_id]
     assert completed["phase"] == "completed"
@@ -276,3 +277,29 @@ def test_real_charge_recorder_publishes_recording_completed_price_and_tariff_cha
     auto = idx.rows[record_id]
     assert auto["money"]["basis"] == "ha_current_tariff_estimate"
     assert auto["money"]["amount"] == pytest.approx(.2)
+
+
+def test_visibility_change_hides_official_index_only_rows_and_expires_snapshots():
+    idx = index()
+    start = stamp("2026-10-30T10:00:00")
+    cloud = {**session("official", start), "energy_basis": "official"}
+    local = session("local", start)
+    idx.reconcile_sessions([cloud, local])
+    idx.restrict_official("account-a", True, {"official", "local"})
+    assert idx.rows["official"]["energy"]["evidence"] == "reported"
+    assert idx.rows["official"]["energy"]["sources"] == ["official"]
+    end_ms = int((start + 7200) * 1000)
+    token = idx.query("scope", 0, end_ms, limit=1)["next_page_token"]
+    assert token
+    idx.restrict_official("account-b", True, set())
+    with pytest.raises(ValueError, match="snapshot_expired"):
+        idx.query("scope", 0, end_ms, page_token=token)
+    masked = next(row for row in idx.query("scope", 0, end_ms)["rows"] if row["record_id"] == "official")
+    assert "_official_hidden" not in masked
+    assert masked["energy"]["kwh"] is masked["average_kw"] is None
+    assert masked["grid_energy"]["kwh"] is masked["money"]["amount"] is None
+    assert idx._public_row(idx.rows["local"])["energy"]["kwh"] == local["kwh"]
+    assert idx.rows["official"]["energy"]["kwh"] == cloud["kwh"]
+    revision = idx.rows["official"]["row_revision"]
+    idx.restrict_official("account-b", False, set())
+    assert idx.rows["official"]["row_revision"] == revision

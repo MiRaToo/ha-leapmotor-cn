@@ -9,14 +9,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/MiRaToo/ha-leapmotor-cn/releases/latest"><img alt="发布版 v0.3.7" src="https://img.shields.io/badge/%E7%A8%B3%E5%AE%9A%E7%89%88-v0.3.7-brightgreen.svg"></a>
+  <a href="https://github.com/MiRaToo/ha-leapmotor-cn/releases/latest"><img alt="发布版 v0.3.8" src="https://img.shields.io/badge/%E7%A8%B3%E5%AE%9A%E7%89%88-v0.3.8-brightgreen.svg"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-AGPL--3.0-blue"></a>
   <img alt="Home Assistant" src="https://img.shields.io/badge/Home%20Assistant-2024.11%2B-41BDF5?logo=homeassistant&logoColor=white">
 </p>
 
 这是一个非官方的 Home Assistant 自定义集成。集成通过零跑云端接口登录，提供车辆实体、行程与能耗记录，以及六张可直接加入 Lovelace 仪表盘的卡片。项目与零跑汽车及其关联公司无隶属、合作或背书关系。
 
-当前版本为 **v0.3.7**。
+当前版本为 **v0.3.8**。
 
 代码托管：[GitHub](https://github.com/MiRaToo/ha-leapmotor-cn) · [GitCode 同步仓库](https://gitcode.com/MiraRato/ha-leapmotor-cn)。日常更新以 GitHub 为准，GitCode 通过仓库镜像自动同步代码、分支和标签。
 
@@ -88,7 +88,7 @@ https://gitcode.com/MiraRato/ha-leapmotor-cn
 
 ## 配置与数据
 
-集成选项可在“设置 → 设备与服务 → 零跑汽车 → 配置”中调整，包括轮询间隔、电池可用容量、轨迹存储上限、能源类型和官方充电记录作用域。高德地图 Web Key 与车机工具的使用方法见[预约与车机工具](docs/vehicle-tools.md)。
+集成选项可在“设置 → 设备与服务 → 零跑汽车 → 配置”中调整，包括轮询间隔、电池可用容量、轨迹存储上限和能源类型。高德地图 Web Key 与车机工具的使用方法见[预约与车机工具](docs/vehicle-tools.md)。
 
 行程摘要、轨迹、充电账本和官方充电记录缓存保存在 Home Assistant 本机；官方充电记录只保存时间、类型、电量与年度汇总，不保存充电位置。车辆状态和车控请求通过零跑云端接口传输；此项目不提供零跑官方云服务。
 

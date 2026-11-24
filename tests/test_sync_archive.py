@@ -357,3 +357,19 @@ def test_existing_links_are_backfilled_as_conservative_partial_membership(tmp_pa
     assert migrated["observation_count"]==1
     b.close(); b.shutdown()
 
+
+
+def test_discarded_trip_retries_keep_native_observations(tmp_path):
+    a, vid, _ = archive(tmp_path)
+    oid = a.ingest(vid, "signal_map", {"1204": 40}, {"collectTime": 1}, 1)
+    a.associate_observation(vid, "trip", "short", oid, "recording", 1)
+    cursor = a.bootstrap(vid)["cursor"]
+    a.discard_trip_groups(vid, ["short"])
+    a.discard_trip_groups(vid, ["short"])
+    assert len(a.pull(vid, cursor)["changes"]) == 1
+    assert not a.associate_observation(vid, "trip", "short", oid, "recording", 1)
+    assert a.import_legacy(vid, "trip", "short", [], {}) == 0
+    assert a.records_page(vid)["records"] == []
+    assert len(a.observations(vid)["points"]) == 1
+    a.close()
+    a.shutdown()

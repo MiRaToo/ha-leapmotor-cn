@@ -87,7 +87,7 @@ def test_day_windows_cross_month_and_today_is_frozen_at_generated_at():
     # 2026-04-01 12:00 Asia/Hong_Kong
     now = int(datetime(2026, 4, 1, 12, 0,
                        tzinfo=ZoneInfo("Asia/Hong_Kong")).timestamp())
-    windows = day_windows_v1(2, "Asia/Hong_Kong", now)
+    windows = day_windows_v1(2, ZoneInfo("Asia/Hong_Kong"), now)
     assert [row[0] for row in windows] == ["2026-03-31", "2026-04-01"]
     assert windows[0][2] + 1 == windows[1][1]
     assert windows[1][2] == now
@@ -95,8 +95,8 @@ def test_day_windows_cross_month_and_today_is_frozen_at_generated_at():
 
 def test_day_windows_use_configured_zone_not_process_timezone():
     stamp = int(datetime(2026, 1, 1, 0, 30, tzinfo=ZoneInfo("UTC")).timestamp())
-    utc = day_windows_v1(1, "UTC", stamp)
-    hong_kong = day_windows_v1(1, "Asia/Hong_Kong", stamp)
+    utc = day_windows_v1(1, ZoneInfo("UTC"), stamp)
+    hong_kong = day_windows_v1(1, ZoneInfo("Asia/Hong_Kong"), stamp)
     assert utc[0][0] == "2026-01-01"
     assert hong_kong[0][0] == "2026-01-01"
     assert utc[0][1] != hong_kong[0][1]
@@ -105,13 +105,13 @@ def test_day_windows_use_configured_zone_not_process_timezone():
 def test_day_windows_cover_dst_23_and_25_hour_historical_days():
     spring_now = int(datetime(2026, 3, 9, 12, 0,
                               tzinfo=ZoneInfo("America/New_York")).timestamp())
-    spring = day_windows_v1(3, "America/New_York", spring_now)
+    spring = day_windows_v1(3, ZoneInfo("America/New_York"), spring_now)
     spring_day = next(row for row in spring if row[0] == "2026-03-08")
     assert spring_day[2] - spring_day[1] + 1 == 23 * 3600
 
     fall_now = int(datetime(2026, 11, 2, 12, 0,
                             tzinfo=ZoneInfo("America/New_York")).timestamp())
-    fall = day_windows_v1(3, "America/New_York", fall_now)
+    fall = day_windows_v1(3, ZoneInfo("America/New_York"), fall_now)
     fall_day = next(row for row in fall if row[0] == "2026-11-01")
     assert fall_day[2] - fall_day[1] + 1 == 25 * 3600
     assert all(left[2] + 1 == right[1] for left, right in zip(spring, spring[1:]))
@@ -143,7 +143,7 @@ def test_v1_store_uses_new_storage_namespace_and_does_not_migrate_legacy_rows():
     sys.modules["homeassistant.helpers"] = fake_helpers
     sys.modules["homeassistant.helpers.storage"] = fake_storage
     try:
-        DailyEnergyV1Store(None, " lp-test-vin ")
+        DailyEnergyV1Store(None, " lp-test-vin ", time_zone="UTC")
     finally:
         for name, module in saved.items():
             if module is None:
@@ -156,7 +156,7 @@ def test_v1_store_uses_new_storage_namespace_and_does_not_migrate_legacy_rows():
         "days": {"2026-10-01": {"driver": 1.0, "ac": None, "other": None,
                                 "total": 1.0, "empty": True, "at": 1.0}},
         "tried": {},
-    }))
+    }), time_zone="UTC")
     run(legacy.async_load())
     assert legacy.get("2026-10-01", "UTC", 0, 0) is None
 
@@ -164,8 +164,8 @@ def test_v1_store_uses_new_storage_namespace_and_does_not_migrate_legacy_rows():
 def test_today_cache_reuses_rows_with_frozen_window_and_marks_stale_after_ttl():
     now = int(datetime(2026, 10, 31, 12, 0,
                        tzinfo=ZoneInfo("Asia/Hong_Kong")).timestamp())
-    _day, start, end = day_windows_v1(1, "Asia/Hong_Kong", now)[0]
-    store = DailyEnergyV1Store(None, "TESTVIN", FakeStore())
+    _day, start, end = day_windows_v1(1, ZoneInfo("Asia/Hong_Kong"), now)[0]
+    store = DailyEnergyV1Store(None, "TESTVIN", FakeStore(), time_zone="Asia/Hong_Kong")
     store.record("2026-10-31", {"driver": 0, "ac": 1, "other": 0},
                  "Asia/Hong_Kong", start, end, now)
     at_later_end = end + 60
@@ -182,9 +182,9 @@ def test_today_cache_reuses_rows_with_frozen_window_and_marks_stale_after_ttl():
 def test_historical_cache_requires_exact_bounds_and_failed_refresh_is_stale_not_zero():
     now = int(datetime(2026, 10, 31, 12, 0,
                        tzinfo=ZoneInfo("Asia/Hong_Kong")).timestamp())
-    windows = day_windows_v1(2, "Asia/Hong_Kong", now)
+    windows = day_windows_v1(2, ZoneInfo("Asia/Hong_Kong"), now)
     day, start, end = windows[0]
-    store = DailyEnergyV1Store(None, "TESTVIN", FakeStore())
+    store = DailyEnergyV1Store(None, "TESTVIN", FakeStore(), time_zone="Asia/Hong_Kong")
     store.record(day, {"driver": 2, "ac": 1, "other": 0.5},
                  "Asia/Hong_Kong", start, end, now)
     assert store.get(day, "Asia/Hong_Kong", start, end, now=now) is not None
@@ -247,14 +247,14 @@ def test_compose_v1_marks_only_valid_cached_official_values_stale():
 def test_trip_bucketing_uses_same_configured_dst_day():
     zone = ZoneInfo("America/New_York")
     now = int(datetime(2026, 3, 9, 12, 0, tzinfo=zone).timestamp())
-    windows = day_windows_v1(3, "America/New_York", now)
+    windows = day_windows_v1(3, ZoneInfo("America/New_York"), now)
     trips = [
         SimpleNamespace(ended_at=int(datetime(2026, 3, 8, 1, 30, tzinfo=zone).timestamp()),
                         distance_km=4.0, energy_kwh=1.0),
         SimpleNamespace(ended_at=int(datetime(2026, 3, 8, 3, 30, tzinfo=zone).timestamp()),
                         distance_km=6.0, energy_kwh=1.5),
     ]
-    rows = trip_rows_by_windows_v1(trips, windows, "America/New_York")
+    rows = trip_rows_by_windows_v1(trips, windows, ZoneInfo("America/New_York"))
     assert rows["2026-03-07"]["km"] is None
     assert rows["2026-03-08"] == {"km": 10.0, "kwh": 2.5}
     assert rows["2026-03-09"] == {"km": 0.0, "kwh": 0.0}
@@ -304,14 +304,12 @@ def test_ws_vehicle_identity_requires_one_normalized_unique_vin():
 
 def test_capability_requires_every_coordinator_and_valid_timezone():
     path = ROOT / "custom_components" / "leapmotor" / "ws_api.py"
-    from energy_daily import valid_iana_timezone
 
-    ready = SimpleNamespace(daily_energy_v1_available=lambda: True)
+    ready = SimpleNamespace(daily_energy_v1_available=lambda: hass.config.time_zone == "Asia/Hong_Kong")
     not_ready = SimpleNamespace(daily_energy_v1_available=lambda: False)
     state = {"coordinators": {"a": ready}}
     namespace = _extract(path, {"_daily_energy_capability"}, {
         "coordinators": lambda hass: state["coordinators"],
-        "valid_iana_timezone": valid_iana_timezone,
     })
     capability = namespace["_daily_energy_capability"]
     hass = SimpleNamespace(config=SimpleNamespace(time_zone="Asia/Hong_Kong"))
@@ -529,7 +527,6 @@ def test_ensure_v1_serializes_ws_and_poll_callers_for_same_windows():
         "__name__": "coordinator_daily_energy_extract",
         "time": types.SimpleNamespace(time=lambda: 1_785_376_800),
         "day_windows_v1": day_windows_v1,
-        "valid_iana_timezone": lambda value: value if value else None,
         "parse_getec_day_v1": parse_getec_day_v1,
         "is_rate_limited": lambda response: False,
         "ENERGY_FETCH_BUDGET_WS": 10,
@@ -555,6 +552,7 @@ def test_ensure_v1_serializes_ws_and_poll_callers_for_same_windows():
         def __init__(self):
             import asyncio
             self._daily_energy_v1_lock = asyncio.Lock()
+            self.timezone = ZoneInfo("Asia/Hong_Kong")
             self.daily_energy_v1 = LockedStore()
             self.vin = "VIN-A"
             self.hass = SimpleNamespace(
@@ -614,7 +612,6 @@ def test_ensure_v1_refreezes_generated_at_and_today_after_network_crosses_midnig
         "__name__": "coordinator_midnight_extract",
         "time": types.SimpleNamespace(time=lambda: next(clock)),
         "day_windows_v1": day_windows_v1,
-        "valid_iana_timezone": lambda value: value if value else None,
         "parse_getec_day_v1": parse_getec_day_v1,
         "is_rate_limited": lambda response: False,
         "ENERGY_FETCH_BUDGET_WS": 10,
@@ -636,6 +633,7 @@ def test_ensure_v1_refreezes_generated_at_and_today_after_network_crosses_midnig
         def __init__(self):
             import asyncio
             self._daily_energy_v1_lock = asyncio.Lock()
+            self.timezone = ZoneInfo("Asia/Hong_Kong")
             self.daily_energy_v1 = Store()
             self.vin = "VIN-A"
             self.hass = SimpleNamespace(

@@ -170,6 +170,26 @@ def test_short_trip_is_dropped():
         rec.process(frame(T0 + 40 + i * 6, odo=1000.1, soc=80, gear=0, speed=0),
                     now=T0 + 40 + i * 6)
     assert rec.trips == [], "0.1 km 的挪车不该记成行程"
+    ids = tuple(rec.discarded_trip_ids)
+    assert len(ids) == 1
+    restored = recorder()
+    restored._store.data = rec._dump()
+    asyncio.run(restored.async_load())
+    assert restored.discarded_trip_ids == set(ids)
+    from types import SimpleNamespace
+    calls = []
+    async def enqueue(fn, *args):
+        calls.append(args)
+        if len(calls) == 1:
+            raise OSError("unavailable")
+    restored.hass = SimpleNamespace(async_add_executor_job=enqueue)
+    archive = SimpleNamespace(ready=True, run=object())
+    asyncio.run(restored.async_sync_discards(archive, "vehicle"))
+    assert not archive.ready and restored.discarded_trip_ids == set(ids)
+    archive.ready = True
+    asyncio.run(restored.async_sync_discards(archive, "vehicle"))
+    assert calls == [("discard_trip_groups", "vehicle", ids)] * 2
+    assert restored._dump()["discarded_trip_ids"] == []
 
 
 def test_stale_frames_do_not_add_points_but_still_end_trip():

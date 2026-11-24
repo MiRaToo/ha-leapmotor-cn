@@ -17,10 +17,10 @@ def test_schedule_parse_unknown_fails_closed_and_keeps_ids():
 
 def test_weekdays_and_preheat_use_sunday_zero_and_ha_timezone():
     now=datetime(2026,10,15,20,tzinfo=ZoneInfo('Asia/Hong_Kong'))
-    row=mod.preheat_entry({'enabled':True,'start':'07:00','days':[0,6]},'Asia/Hong_Kong',now=now,vin='TEST')
+    row=mod.preheat_entry({'enabled':True,'start':'07:00','days':[0,6]},now.tzinfo,now=now,vin='TEST')
     assert row['start_time']=='2026-10-17 07:00:00' and row['days']==[0,6] and row['on']=='1'
     assert row['set_id'].startswith('Android_TEST_') and 'end_time' not in row
-    single=mod.preheat_entry({'id':'keep','enabled':False,'start':'07:00','days':[]},'Asia/Hong_Kong',now=now)
+    single=mod.preheat_entry({'id':'keep','enabled':False,'start':'07:00','days':[]},now.tzinfo,now=now)
     assert single['set_id']=='keep' and single['start_time']=='2026-10-16 07:00:00'
     for bad in [[7],[0,0],[False],None]:
         with pytest.raises(ValueError):mod.weekdays(bad)

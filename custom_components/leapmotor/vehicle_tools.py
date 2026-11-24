@@ -2,7 +2,6 @@
 from __future__ import annotations
 import base64,io,json,math,time,uuid
 from datetime import datetime,timedelta
-from zoneinfo import ZoneInfo
 
 def weekdays(value):
     if not isinstance(value,list) or any(type(x)is not int or not 0<=x<=6 for x in value) or len(set(value))!=len(value):
@@ -23,7 +22,7 @@ def preheat_entry(data,timezone,*,now=None,vin=""):
     from .charging import minute_of
     minute_of(clock)
     if type(data.get("enabled"))is not bool:raise ValueError("预约开关无效")
-    current=datetime.now(ZoneInfo(timezone)) if now is None else now
+    current=datetime.now(timezone) if now is None else now
     start=current.replace(hour=int(clock[:2]),minute=int(clock[3:]),second=0,microsecond=0)
     if start<=current:start+=timedelta(days=1)
     if days:
@@ -107,7 +106,7 @@ def register(hass):
             elif kind=="preheat":
                 require(c,161)
                 controls=preheat_controls(await hass.async_add_executor_job(c.client.get_preheat_schedule,c.vin))
-                entry=preheat_entry(data,hass.config.time_zone,vin=c.vin)
+                entry=preheat_entry(data,c.timezone,vin=c.vin)
                 if data.get("id") and not any(x.get("set_id")==data["id"] for x in controls):raise ValueError("该预约已改变，请重新读取")
                 updated=[{**x,**entry} if x.get("set_id")==entry["set_id"] else x for x in controls]
                 if not data.get("id"):updated.append(entry)

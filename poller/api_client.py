@@ -1531,10 +1531,10 @@ class LeapmotorClient:
                 raw = resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             raw = e.read().decode("utf-8", "replace")
-            log.warning("HTTP %s %s -> %s", e.code, url, raw[:200])
+            log.warning("HTTP %s %s", e.code, url.partition("?")[0])
         except Exception as e:  # 网络层异常也给调用方一个可判断的结构
-            log.warning("请求失败 %s: %s", url, e)
-            return {"code": -1, "message": f"网络错误: {e}", "data": None}
+            log.warning("请求失败 %s: %s", url.partition("?")[0], type(e).__name__)
+            return {"code": -1, "message": f"网络错误: {type(e).__name__}", "data": None}
 
         try:
             return json.loads(raw)
@@ -1842,49 +1842,6 @@ class LeapmotorClient:
             headers["digest"] = headers["sign"]
         return self._http("POST", url, headers, body, form=False)
 
-    def car_login_as(self, account_id: str | int, tries: int = 4) -> dict:
-        """**按指定账号 ID 交换车端 token**(写回当前会话)。
-
-        与 `car_login()` 完全相同的请求/签名, 只把 body 的 `identifier` 换成传入的
-        账号 ID。用于把「只读数据源」与主会话隔离: 调用方应先在**会话副本**上调用本
-        方法, 再用得到的独立 client 读数据, 不要污染主会话(token/密钥会变)。
-
-        实测(2026-11-21): 车辆共享给子账号时, 车辆列表 raw 里的 `userid` 是**车主**
-        账号 ID。子账号用自己的账号 token 以该 accountId 交换, 会拿到车主作用域的车端
-        JWT, 官方充电记录等「车主可见」的只读数据即可读取。这是云端未公开的作用域
-        行为, 可能随版本失效; 仅限本人所有车辆/账号使用, 且只能用于只读数据。
-        """
-        s = self.session
-        if not s.token:
-            raise RuntimeError("需要先完成账号登录(缺少账号 token)")
-        body = {
-            "identifier": str(account_id),
-            "security": s.token,
-            "identifierType": "1",
-        }
-        variants = [(True, True), (True, False), (False, False)][:max(1, tries)]
-        last: dict = {}
-        for with_sign, upper in variants:
-            resp = self._exchange_once(body, with_sign=with_sign, upper=upper)
-            last = resp
-            data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
-            if data.get("accessToken"):
-                s.car_token = str(data.get("accessToken") or s.car_token)
-                s.car_refresh_token = str(data.get("refreshToken") or s.car_refresh_token)
-                if isinstance(data.get("signParam"), dict):
-                    s.sign_param = data["signParam"]
-                if isinstance(data.get("encryptParam"), dict):
-                    s.encrypt_param = data["encryptParam"]
-                uid = data.get("accountId")
-                if uid not in (None, ""):
-                    s.user_id = str(uid)
-                s.hkdf_key_hex = ""          # 会话更新, 旧密钥作废
-                s.seal_key()
-                return resp
-            if resp.get("code") not in SIGNATURE_ERROR_CODES:
-                break
-        return last
-
     def car_login(self, tries: int = 4) -> dict:
         """**车端登录**: 用账号 token 换取车端 JWT 与签名密钥材料。
 
@@ -1917,10 +1874,33 @@ class LeapmotorClient:
         account_id = s.account_id or s.user_id
         if not s.token or not account_id:
             raise RuntimeError("需要先完成账号登录(缺少 token 或 userId)")
-        resp = self.car_login_as(account_id, tries=tries)
-        if (resp.get("data") or {}).get("accessToken"):
-            log.info("车端交换成功(账号 %s)", str(account_id)[-6:])
-        return resp
+        body = {
+            "identifier": str(account_id),
+            "security": s.token,
+            "identifierType": "1",
+        }
+        variants = [(True, True), (True, False), (False, False)][:max(1, tries)]
+        last: dict = {}
+        for with_sign, upper in variants:
+            resp = self._exchange_once(body, with_sign=with_sign, upper=upper)
+            last = resp
+            data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+            if data.get("accessToken"):
+                s.car_token = str(data.get("accessToken") or s.car_token)
+                s.car_refresh_token = str(data.get("refreshToken") or s.car_refresh_token)
+                if isinstance(data.get("signParam"), dict):
+                    s.sign_param = data["signParam"]
+                if isinstance(data.get("encryptParam"), dict):
+                    s.encrypt_param = data["encryptParam"]
+                uid = data.get("accountId")
+                if uid not in (None, ""):
+                    s.user_id = str(uid)
+                s.hkdf_key_hex = ""          # 会话更新, 旧密钥作废
+                s.seal_key()
+                return resp
+            if resp.get("code") not in SIGNATURE_ERROR_CODES:
+                break
+        return last
 
     def refresh_car_token(self) -> dict:
         """**车端 token 刷新**: 用 refreshToken 换新的 accessToken/refreshToken。

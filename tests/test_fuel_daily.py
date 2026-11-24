@@ -8,7 +8,7 @@ pkg=types.ModuleType("_fuel_test");pkg.__path__=[str(Path(__file__).resolve().pa
 sys.modules["_fuel_test"]=pkg
 FuelDayRecorder=importlib.import_module("_fuel_test.fuel_daily").FuelDayRecorder
 T=datetime(2026,10,14,23,59,30,tzinfo=ZoneInfo("Asia/Hong_Kong")).timestamp()
-def recorder():return FuelDayRecorder(None,"TEST","Asia/Hong_Kong",store=MemoryStore())
+def recorder():return FuelDayRecorder(None,"TEST",ZoneInfo("Asia/Hong_Kong"),store=MemoryStore())
 def send(rec,at,ml,*,reev=True,gear=1):
     st=frame(at,gear=gear);st.signals["fuel_ml"]=ml;rec.process(st,reev=reev,now=at)
 

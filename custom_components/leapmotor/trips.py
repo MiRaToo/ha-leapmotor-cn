@@ -373,6 +373,7 @@ class TripRecorder:
         self._usage_cache: tuple[float, dict[str, Any]] | None = None
         self._enforcing = False
         self.trips: list[Trip] = []
+        self.discarded_trip_ids: set[str] = set()
         self.gaps: list[dict[str, Any]] = []          # 无法归属的里程(期间充过电)
         self._active: Trip | None = None
         self._points: list[list[float]] = []
@@ -410,6 +411,7 @@ class TripRecorder:
         if fixed:
             log.warning("行程记录: 规整了 %d 段历史补记行程(标注时间近似)", fixed)
             self._save_soon(delay=1)      # 立刻回写, 免得每次启动都重做一遍
+        self.discarded_trip_ids = set(data.get("discarded_trip_ids") or [])
         self.gaps = list(data.get("gaps") or [])
         self._last_odo = data.get("last_odo")
         self._last_soc = data.get("last_soc")
@@ -457,6 +459,7 @@ class TripRecorder:
             trips_out.append(d)
         return {
             "trips": trips_out,
+            "discarded_trip_ids": sorted(self.discarded_trip_ids),
             "gaps": self.gaps,
             "last_odo": self._last_odo,
             "last_soc": self._last_soc,
@@ -612,6 +615,20 @@ class TripRecorder:
         log.warning("行程记录: 轨迹已迁移到按月分片 —— %d 个点 / %d 个月(旧布局不再往索引里写点)",
                     total, len(buckets))
         return total
+
+    async def async_sync_discards(self, archive, vehicle_id: str) -> None:
+        if not self.discarded_trip_ids or not archive.ready:
+            return
+        ids = tuple(self.discarded_trip_ids)
+        try:
+            await self.hass.async_add_executor_job(archive.run, "discard_trip_groups", vehicle_id, ids)
+        except Exception as err:
+            archive.error = type(err).__name__
+            archive.ready = False
+            log.warning("同步行程分组待重试: %s", archive.error)
+            return
+        self.discarded_trip_ids.difference_update(ids)
+        self._save_soon()
 
     # ── 主入口: 每帧调用 ──
     def process(self, st, now: float | None = None) -> None:
@@ -819,6 +836,7 @@ class TripRecorder:
             trip.efficiency = trip.energy_kwh / trip.distance_km * 100.0
 
         if trip.distance_km is not None and trip.distance_km < MIN_TRIP_KM:
+            self.discarded_trip_ids.add(trip.id)
             log.info("行程 %s 只有 %.2f km(< %.1f km), 丢弃(挪车)", trip.id,
                      trip.distance_km, MIN_TRIP_KM)
             self._save_soon()

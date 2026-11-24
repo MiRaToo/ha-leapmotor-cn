@@ -96,6 +96,8 @@ def _replace_session(coordinator: Any, snapshot: dict[str, Any]) -> None:
         client = copy.copy(client)
         client.session = session
         coordinator.client = client
+    if getattr(coordinator, "official_charges", None) is not None:
+        coordinator.sync_official_account()
 
 
 def _run_auth_operation(coordinator: Any, method_name: str,
@@ -123,6 +125,8 @@ def _adopt_auth_operation(coordinator: Any, result: tuple[bool, Any, float, Any,
     coordinator.client.session = session
     coordinator._last_renew = last_renew
     coordinator.state = state
+    if getattr(coordinator, "official_charges", None) is not None:
+        coordinator.sync_official_account()
     return True
 
 

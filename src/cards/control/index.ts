@@ -719,15 +719,8 @@ class LeapmotorControlCard extends LitElement implements ControlCtx {
     return this._deviceName || "零跑";
   }
 
-  /** 驻车照片地址: 优先 image 实体的 entity_picture(走 HA 自己的鉴权), 退回 parking_url */
-  /** @internal 供 render-* / handlers 取用(对应 types.ts 的 ControlCtx); 运行时行为不变 */
   public _photoSrc(): string {
-    let src = this._attr("parking", "entity_picture") || "";
-    if (!src) {
-      const raw = this._val("parking_url");
-      if (raw && /^https?:\/\//.test(String(raw))) src = String(raw);
-    }
-    return src;
+    return this._attr("parking", "entity_picture") || "";
   }
 
   /** @internal 供 render-* / handlers 取用(对应 types.ts 的 ControlCtx); 运行时行为不变 */

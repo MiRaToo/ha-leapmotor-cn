@@ -60,7 +60,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry,
         LeapmotorTripTrack(c),
         LeapmotorTripStats(c),
         # ── 诊断 / 杂项(设备页里会归到"诊断"区) ──
-        LeapmotorParkingUrl(c),
         LeapmotorChargeConfig(c),
         LeapmotorLastResult(c),
         LeapmotorSession(c),
@@ -358,35 +357,6 @@ class LeapmotorChargeConfig(_Base):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return {"charge": (self.coordinator.data or {}).get("charge_plan") or {}}
-
-
-class LeapmotorParkingUrl(_Base):
-    """驻车/底盘照片的 OSS 地址 + 照片新旧信息(upload_time / pending)。"""
-
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-    key = "parking_url"
-
-    def __init__(self, c: LeapmotorCoordinator) -> None:
-        super().__init__(c, "驻车照片地址")
-
-    @property
-    def native_value(self) -> str | None:
-        return (self.coordinator.data or {}).get("parking_url") or None
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """照片的新旧信息: uploadTime(车端拍照/上传时刻)与 pending(还在等新照片)。
-
-        用途: 一眼看出"这张照片是什么时候拍的、是不是还在等上传" —— 车端拍照是异步上传的,
-        停车后可能需要几分钟才会换成新照片(见 coordinator 的照片重试窗口)。
-        """
-        d = self.coordinator.data or {}
-        ms = d.get("photo_upload_ms") or 0
-        return {
-            "upload_time": (datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
-                            .astimezone().isoformat(timespec="seconds")) if ms else None,
-            "pending": bool(d.get("photo_pending")),
-        }
 
 
 class LeapmotorTotalMileage(_Base):

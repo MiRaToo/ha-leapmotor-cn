@@ -132,13 +132,13 @@ def interval_buckets(begin: float, end: float, kwh: float, tariff: dict, tz: Zon
 
 class ChargeRecorder:
     def __init__(self, hass: Any, vin: str, capacity_kwh: float, *, store: Any = None,
-                 timezone: str = "Asia/Shanghai") -> None:
+                 timezone: ZoneInfo, account_scope: str = "") -> None:
         if store is None:
             from homeassistant.helpers.storage import Store
             store = Store(hass, 1, f"leapmotor_{vin}_charges")
         self._store = store
         self.capacity = capacity_kwh
-        self.timezone = ZoneInfo(timezone)
+        self.timezone = timezone
         self.tariff = dict(DEFAULT_TARIFF)
         self.sessions: list[dict] = []
         self.active: dict | None = None
@@ -146,6 +146,7 @@ class ChargeRecorder:
         self._seen = 0.0
         self.revision = 0
         self.history_index = None
+        self.account_scope = account_scope
 
     async def async_load(self) -> None:
         data = await self._store.async_load() or {}
@@ -159,6 +160,9 @@ class ChargeRecorder:
         # 重启前最后一帧与重启后之间可能漏掉开车/停充，绝不跨重启积分。
         if self.active:
             self._finish(float(self.active.get("last_at") or self.active["started_at"]), "重启中断", partial=True)
+
+        if not self.account_scope or data.get("account_scope") != self.account_scope:
+            self.clear_official()
 
     def clear_official(self) -> int:
         """解除所有会话的官方电量绑定(当前账号看不到官方数据时用, 避免旧账号数据残留)。"""
@@ -205,11 +209,17 @@ class ChargeRecorder:
 
     def _dump(self) -> dict:
         return {"sessions": self.sessions[-KEEP_SESSIONS:], "active": self.active,
-                "seen": self._seen, "tariff": self.tariff}
+                "seen": self._seen, "tariff": self.tariff, "account_scope": self.account_scope}
 
     def _save(self) -> None:
         self.revision += 1
         self._store.async_delay_save(self._dump, 5)
+
+    def attach_history(self, index, *, official_available: bool) -> None:
+        rows = [self.session_record(session) for session in self.sessions]
+        index.reconcile_sessions(rows)
+        index.restrict_official(self.account_scope, official_available, {row["id"] for row in rows})
+        self.history_index = index
 
     def _publish_history(self, sessions: list[dict] | None = None,
                          *, now: float | None = None) -> None:
@@ -305,14 +315,12 @@ class ChargeRecorder:
             self.active = {"id": f"charge-{int(at * 1000)}", "started_at": at, "last_at": at,
                            "soc_start": soc, "soc_end": soc, "intervals": [], "partial": False,
                            "power_samples": [], "soc_samples": [], "peak_kw": None, "charge_types": []}
-            self._publish_history([self.active], now=at)
         dc, plug = state.flag("dc_cable_connected"), state.flag("charge_plug")
         kind = "dc" if dc is True else "ac" if dc is False and plug is True else "unknown"
         known=[k for k in self.active.get("charge_types",[]) if k!="unknown"]
         if kind!="unknown" and known and kind not in known:
             self._finish(float(self.active["last_at"]),"充电枪类型改变")
             self.active={"id":f"charge-{int(at*1000)}","started_at":at,"last_at":at,"soc_start":soc,"soc_end":soc,"intervals":[],"partial":False,"power_samples":[],"soc_samples":[],"peak_kw":None,"charge_types":[]}
-            self._publish_history([self.active], now=at)
         kinds=self.active.setdefault("charge_types", [])
         if kind not in kinds: kinds.append(kind)
         samples=self.active.setdefault("power_samples", [])
@@ -359,6 +367,7 @@ class ChargeRecorder:
         self.active.update(last_at=at, soc_end=soc)
         self._previous = sample
         self._save()
+        self._publish_history([self.active], now=at)
 
     def expire(self, now: float) -> None:
         if self.active and now - float(self.active["last_at"]) > MAX_GAP_SECONDS:

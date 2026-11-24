@@ -52,11 +52,6 @@ CONF_ENERGY_TYPE = "energy_type"          # auto(按车端信号自动判定) / 
 # off   = 只用当前账号(子账号看不到车主充电记录 → 官方数据为空, 本地估算兜底)
 # owner = 子账号(车辆共享)用车辆列表里的车主 accountId 交换一份**只读**车端 token,
 #         用于读取车主账号才能看到的官方充电记录。仅限本人车辆/本人账号使用。
-CONF_OFFICIAL_CHARGE_SCOPE = "official_charge_scope"
-OFFICIAL_SCOPE_OFF = "off"
-OFFICIAL_SCOPE_OWNER = "owner"
-OFFICIAL_CHARGE_SCOPES = [OFFICIAL_SCOPE_OFF, OFFICIAL_SCOPE_OWNER]
-DEFAULT_OFFICIAL_CHARGE_SCOPE = OFFICIAL_SCOPE_OFF
 ENERGY_AUTO = "auto"
 ENERGY_BEV = "bev"
 ENERGY_REEV = "reev"

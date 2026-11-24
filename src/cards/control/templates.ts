@@ -358,7 +358,7 @@ export function locationPanel(ctx: ControlCtx): TemplateResult {
   // 时间显示"这张照片是什么时候拿到的" —— 用驻车照片的 upload_time(车端拍照/上传时刻)。
   // 不能用 tracker.last_updated: 每轮轮询都会刷新它, 于是永远显示"刚刚";
   // 照片没换时 upload_time 不变, 时间也就稳定不动。
-  const photoAt = ctx._attr("parking_url", "upload_time");
+  const photoAt = ctx._attr("parking", "upload_time");
   const mode = locationMode(ctx);
   const rel = relTime(mode === "photo" ? photoAt : ctx._val("state_updated"));
   const hasFix = Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180;
@@ -378,7 +378,7 @@ export function locationPanel(ctx: ControlCtx): TemplateResult {
     ? "车辆位置"
     : "没有定位信息"}</span>${rel ? html`<span class="halfS dim">${rel}</span>` : nothing}</div><div class="floatRow">${ctx._entId(
     "parking",
-  ) || ctx._entId("parking_url")
+  )
     ? html`<button class="floatPill" data-act="photo" aria-label="查看驻车照片" title="查看驻车照片"><ha-icon class="ico" icon="mdi:camera-outline"></ha-icon></button>`
     : nothing}${findId
     ? html`<button class="floatPill" data-act="press" data-entity="${findId}" aria-label="${fBusy ? "鸣笛中" : "鸣笛寻车"}" title="${driving

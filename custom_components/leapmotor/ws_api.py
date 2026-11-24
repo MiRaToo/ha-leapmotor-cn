@@ -51,7 +51,6 @@ from homeassistant.helpers import entity_registry as er
 
 from . import car3d
 from .const import DOMAIN
-from .energy_daily import valid_iana_timezone
 from .vehicle_selector import VehicleSelectionError, coordinators, resolve_coordinator
 
 log = logging.getLogger(__name__)
@@ -121,8 +120,7 @@ def _configured_sync_vehicles(hass: HomeAssistant) -> list[dict[str, Any]]:
 
 def _daily_energy_capability(hass: HomeAssistant) -> dict[str, Any] | None:
     """Advertise v1 only when every configured coordinator can serve it."""
-    time_zone = valid_iana_timezone(
-        getattr(getattr(hass, "config", None), "time_zone", None))
+    time_zone = hass.config.time_zone
     loaded = list(coordinators(hass).values())
     if not time_zone or not loaded:
         return None

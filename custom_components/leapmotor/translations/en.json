@@ -64,8 +64,7 @@
           "car3d_bg": "3D car background",
           "car3d_image": "Custom car picture (set = skip 3D)",
           "energy_type": "Energy type (controls whether fuel data is shown)",
-          "amap_web_key": "AMap Web Service API Key (optional)",
-          "official_charge_scope": "Official charging records scope"
+          "amap_web_key": "AMap Web Service API Key (optional)"
         },
         "description": "Polling: 60 s parked, 6 s driving (same as the official app), and only the vehicle-state frame is fetched each round; mileage/energy/photo are fetched on demand.\n\nBattery capacity is only used to turn SoC delta into kWh for trips.\n\nTrip storage: {usage}. Tracks are kept per month; when the limit is exceeded the OLDEST months' tracks are cleared (trip records themselves are kept forever; 0 = unlimited).",
         "data_description": {
@@ -75,8 +74,7 @@
           "car3d_bg": "auto = follow the dashboard theme; day = always day; night = always night. Only affects the 3D car scene.",
           "car3d_image": "https://… or /local/….png; empty = use the 3D model.",
           "energy_type": "Auto = decide from the car's own signals (fuel range > 0, or total range > EV range). Some BEVs report a bogus fuel percentage - pick \"BEV\" to hide fuel data; if a range-extender car is misdetected, pick \"REEV\".",
-          "amap_web_key": "Web Service key, not a JavaScript key. Stored in HA; used only for manual place searches. Leave empty to disable.",
-          "official_charge_scope": "Charging-record endpoints return only records of the account behind the car token, so a shared sub-account reads nothing. With \"Read owner records\", the integration mints a separate READ-ONLY car token for the owner accountId found in the vehicle list, used solely for official charging records. It does not affect control, status or other data. This relies on undocumented cloud scoping and may break; use only with vehicles/accounts you own."
+          "amap_web_key": "Web Service key, not a JavaScript key. Stored in HA; used only for manual place searches. Leave empty to disable."
         }
       }
     },
@@ -90,12 +88,6 @@
         "auto": "Auto (from car signals)",
         "bev": "BEV (hide fuel data)",
         "reev": "REEV (show fuel data)"
-      }
-    },
-    "official_charge_scope": {
-      "options": {
-        "off": "Current account only (shared accounts cannot see owner records)",
-        "owner": "Read owner records (own vehicles / own accounts only)"
       }
     }
   }

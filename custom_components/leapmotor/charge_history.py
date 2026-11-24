@@ -46,6 +46,7 @@ class ChargeHistoryIndex:
     def __init__(self, hass: Any, vin: str, store: Any = None,
                  *, now: Any = None) -> None:
         self.vin = str(vin or "").strip().upper()
+        self.account_scope: str | None = None
         self._now = now or time.time
         if store is not None:
             self._store = store
@@ -125,6 +126,7 @@ class ChargeHistoryIndex:
         self.change_seq = change_seq
         self.initialized = data.get("initialized") is True
         self.known_complete_from_ms = known_from
+        self.account_scope = data.get("account_scope")
         self.rows = validated
         self.revision_high_water = high
         self.tombstones = deepcopy(tombstones)
@@ -160,6 +162,7 @@ class ChargeHistoryIndex:
                 "change_seq": self.change_seq,
                 "initialized": self.initialized,
                 "known_complete_from_ms": self.known_complete_from_ms,
+                "account_scope": self.account_scope,
                 "rows": deepcopy(self.rows),
                 "revision_high_water": dict(self.revision_high_water),
                 "tombstones": deepcopy(self.tombstones),
@@ -184,7 +187,10 @@ class ChargeHistoryIndex:
         sources = session.get("sources")
         sources = ([source for source in sources if source in ("power", "soc", "mixed")]
                    if isinstance(sources, list) else [])
-        if not sources:
+        official = kwh is not None and session.get("energy_basis") == "official"
+        if official:
+            sources = ["official"]
+        elif not sources:
             kwh = None
         energy_coverage = "partial" if kwh is not None and partial else (
             "complete" if kwh is not None else "unavailable")
@@ -214,8 +220,8 @@ class ChargeHistoryIndex:
             "charge_type": charge_type,
             "energy": {
                 "kwh": kwh,
-                "basis": "battery_vehicle_estimate",
-                "evidence": "estimated" if kwh is not None else "unknown",
+                "basis": "official_charge_record" if official else "battery_vehicle_estimate",
+                "evidence": "reported" if official else "estimated" if kwh is not None else "unknown",
                 "coverage": energy_coverage,
                 "sources": sources,
             },
@@ -249,6 +255,9 @@ class ChargeHistoryIndex:
         candidate = self._row_from_session(session, observed)
         if candidate is None:
             return False
+        return self._upsert_row(candidate)
+
+    def _upsert_row(self, candidate: dict) -> bool:
         record_id = candidate["record_id"]
         previous = self.rows.get(record_id)
         if previous:
@@ -268,6 +277,38 @@ class ChargeHistoryIndex:
         self.tombstones.pop(record_id, None)
         self._save()
         return True
+
+    def restrict_official(self, scope: str, visible: bool, rebuilt_ids: set[str]) -> None:
+        """Guard retained index-only records and already-issued pagination snapshots."""
+        scope_changed = self.account_scope != scope
+        if visible and not scope_changed:
+            return
+        self._snapshots.clear()
+        now = int(self._now() * 1000)
+        for rid, row in self.rows.items():
+            if rid in rebuilt_ids:
+                continue
+            # Older index versions did not distinguish local and cloud evidence.
+            legacy = self.account_scope is None
+            if not legacy and row["energy"]["basis"] != "official_charge_record":
+                continue
+            if not row.get("_official_hidden"):
+                self._upsert_row({**row, "_official_hidden": True, "observed_at_ms": now})
+        if scope_changed:
+            self.account_scope = scope
+            self._save()
+
+    @staticmethod
+    def _public_row(row: dict) -> dict:
+        view = deepcopy(row)
+        if view.pop("_official_hidden", False):
+            view.update(energy={"kwh": None, "basis": "battery_vehicle_estimate", "evidence": "unknown",
+                                "coverage": "unavailable", "sources": []},
+                        grid_energy={"kwh": None, "basis": "unknown", "evidence": "unknown"},
+                        charge_type="unknown", average_kw=None)
+            if view["money"]["basis"] != "manual_total_estimate":
+                view["money"] = {"amount": None, "currency": None, "basis": "unknown", "evidence": "unknown"}
+        return view
 
     def reconcile_sessions(
         self,
@@ -382,7 +423,7 @@ class ChargeHistoryIndex:
             if to_ms < from_ms:
                 raise ValueError("invalid_format")
             selected = [
-                deepcopy(row) for row in self.rows.values()
+                self._public_row(row) for row in self.rows.values()
                 if row["started_at_ms"] <= to_ms and row["ended_at_ms"] >= from_ms
             ]
             selected.sort(key=lambda row: (-row["started_at_ms"], row["record_id"]))

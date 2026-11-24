@@ -1,4 +1,5 @@
 """官方充电记录(1.23.05 充电记录)解析/匹配/合并的回归。无网络与 HA 运行时依赖。"""
+import asyncio
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -160,7 +161,7 @@ class MemoryStore:
 
 
 def recorder_with_session():
-    rec = ChargeRecorder(None, "TESTVIN", 70, store=MemoryStore(), timezone="Asia/Hong_Kong")
+    rec = ChargeRecorder(None, "TESTVIN", 70, store=MemoryStore(), timezone=ZONE)
     rec.sessions = [session("charge-1", "2026-11-01 22:10:08", "2026-11-01 22:59:23",
                             intervals=[[stamp("2026-11-01 22:10:08"),
                                         stamp("2026-11-01 22:30:00"), 7.0, "power"],
@@ -198,7 +199,7 @@ def test_official_energy_flows_into_daily_view():
 # API 客户端: 分页/请求形状(用假 car_call, 不发网络请求)
 # ---------------------------------------------------------------------------
 from api_client import LeapmotorClient, Session  # noqa: E402
-from official_charge import fetch_snapshot  # noqa: E402
+from official_charge import fetch_snapshot, snapshot_is_invisible  # noqa: E402
 
 
 class FakeClient(LeapmotorClient):
@@ -270,15 +271,8 @@ def test_fetch_snapshot_normalizes_and_reports_error():
 def test_invisible_account_keeps_cached_official_data():
     from official_charge import OfficialChargeStore
 
-    class DummyStore:
-        def __init__(self): self.saved = []
-        def async_delay_save(self, fn, _delay): self.saved.append(fn())
-
-    store = OfficialChargeStore.__new__(OfficialChargeStore)
-    store.vin = "TESTVIN"; store.timezone = "Asia/Hong_Kong"
-    store._store = DummyStore()
-    store.records = []; store.year_stats = {}; store.fetched_at = None
-    store.window = None; store.last_error = None; store.available = None
+    disk = MemoryStore()
+    store = OfficialChargeStore(None, "TESTVIN", account_scope="account-a", store=disk)
     visible = {
         "records": [normalize_record(raw_record())],
         "year_stats": {2026: {"total_energy_kwh": 1612.0, "total_count": 35,
@@ -289,95 +283,28 @@ def test_invisible_account_keeps_cached_official_data():
     assert len(store.apply_snapshot(visible)) == 1
     assert store.available is True
     assert store.year_stats[2026]["total_count"] == 35
+    for scope, expected in (("account-a", True), ("account-b", False), ("", False)):
+        restored = OfficialChargeStore(None, "TESTVIN", account_scope=scope, store=disk)
+        asyncio.run(restored.async_load())
+        assert bool(restored.view()["records"]) == expected
+        assert bool(restored.year_view()) == expected
+    disk.data.pop("account_scope")
+    legacy = OfficialChargeStore(None, "TESTVIN", account_scope="account-a", store=disk)
+    asyncio.run(legacy.async_load())
+    assert legacy.view()["records"] == [] and legacy.year_view() is None
     invisible = {"records": [], "year_stats": {2026: {"total_energy_kwh": 0.0, "total_count": 0,
                                                      "fast_charge_percent": 0.0, "months": []}},
                  "fetched_at": 2000.0}
     kept = store.apply_snapshot(invisible)
-    assert len(kept) == 1                      # 缓存保留
+    assert kept == []
+    assert store.view()["records"] == [] and store.view()["years"] == {}
+    assert store.year_view() is None and store.match([]) == {}
     assert store.available is False            # 但标记为当前账号不可见
     assert store.year_stats[2026]["total_count"] == 35
     assert store.fetched_at == 2000.0
 
 
 # ---------------------------------------------------------------------------
-# 车主账号只读作用域(共享车): 车辆列表 raw.userid → 独立 client
-# ---------------------------------------------------------------------------
-from official_charge import (  # noqa: E402
-    vehicle_owner_account_id,
-    is_shared_vehicle,
-    make_owner_scope_client,
-    snapshot_is_invisible,
-)
-
-
-class FakeVehicle:
-    def __init__(self, raw, source="shared"):
-        self.raw = raw
-        self.source = source
-
-
-def test_vehicle_owner_account_id_reads_raw_userid():
-    assert vehicle_owner_account_id(FakeVehicle({"userid": 736069345016291328})) == "736069345016291328"
-    assert vehicle_owner_account_id(FakeVehicle({"userid": "42"})) == "42"
-    assert vehicle_owner_account_id(FakeVehicle({"userId": "43"})) == "43"
-    assert vehicle_owner_account_id(FakeVehicle({})) == ""
-    assert vehicle_owner_account_id(None) == ""
-    assert is_shared_vehicle(FakeVehicle({}, "shared")) is True
-    assert is_shared_vehicle(FakeVehicle({}, "owner")) is False
-
-
-class ExchangeClient(LeapmotorClient):
-    """不联网: 直接给 car_login_as 一个可控结果。"""
-
-    def __init__(self, session=None, timeout=20, ok=True):
-        super().__init__(session or Session(), timeout=timeout)
-        self.session.token = "account-token"
-        self.session.user_id = "sub-account"
-        self.session.car_token = "sub-car-token"
-        self.session.hkdf_key_hex = "aa" * 32
-        self.ok = ok
-        self.calls = []
-
-    JWT = "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyX25hbWUiOiJvd25lciJ9.c2lnbmF0dXJl"
-
-    def car_login_as(self, account_id, tries=4):
-        self.calls.append(str(account_id))
-        if not self.ok:
-            return {"code": 302010108, "message": "用户名密码错误"}
-        self.session.car_token = self.JWT
-        self.session.sign_param = {"r2": "eA==", "r3": "eQ=="}
-        self.session.user_id = str(account_id)
-        self.session.hkdf_key_hex = ""
-        self.session.seal_key()
-        return {"code": 0, "data": {"accessToken": self.JWT,
-                                    "accountId": int(account_id),
-                                    "signParam": {"r2": "eA==", "r3": "eQ=="}}}
-
-
-def test_make_owner_scope_client_isolates_main_session():
-    main = ExchangeClient()
-    scoped, resp = make_owner_scope_client(main, "736069345016291328")
-    assert scoped is not None and resp.get("code") == 0
-    assert scoped is not main
-    assert main.calls == []                                  # 主会话没被交换
-    assert main.session.car_token == "sub-car-token"
-    assert main.session.hkdf_key_hex == "aa" * 32
-    assert main.session.user_id == "sub-account"
-    assert scoped.session.user_id == "736069345016291328"
-    assert scoped.session.car_token == ExchangeClient.JWT
-    assert scoped.calls == ["736069345016291328"]
-
-
-def test_make_owner_scope_client_failure_returns_none():
-    class FailClient(ExchangeClient):
-        def car_login_as(self, account_id, tries=4):
-            return {"code": 302010108, "message": "用户名密码错误"}
-
-    scoped, resp = make_owner_scope_client(FailClient(), "42")
-    assert scoped is None
-    assert resp.get("code") == 302010108
-
-
 def test_snapshot_is_invisible_detection():
     assert snapshot_is_invisible({"records": [], "year_stats": {2026: {"total_count": 0,
                                                                      "total_energy_kwh": 0.0}}}) is True

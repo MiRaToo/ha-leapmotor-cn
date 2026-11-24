@@ -567,3 +567,43 @@ def test_fetch_asset_zip_prefix_read_for_probe(monkeypatch):
 
     out = client.fetch_asset_zip("V", "K", max_bytes=64)
     assert len(out) == 64 and client.last_asset_meta["looks_zip"] is True
+
+
+def test_login_http_errors_do_not_log_query_or_echoed_url(monkeypatch, caplog):
+    import io
+    from urllib.error import HTTPError, URLError
+
+    url = "https://example.invalid/login?smsCode=private-test-code"
+    errors = iter([
+        HTTPError(url, 403, "Forbidden", {}, io.BytesIO(url.encode())),
+        URLError(url),
+    ])
+
+    class FailedOpener:
+        def open(self, request, timeout):
+            raise next(errors)
+
+    monkeypatch.setattr(api_client, "_build_opener", lambda ctx: FailedOpener())
+    client = _client_for_asset_test()
+    client._http("GET", url, {})
+    result = client._http("GET", url, {})
+    assert "403" in caplog.text and "URLError" in caplog.text
+    assert "https://example.invalid/login" in caplog.text
+    assert "smsCode" not in caplog.text
+    assert "private-test-code" not in caplog.text
+    assert "private-test-code" not in result["message"]
+
+
+def test_car_login_uses_signed_in_account(monkeypatch):
+    client = _client_for_asset_test()
+    client.session.account_id = "current-test-account"
+    identifiers = []
+
+    def exchange(body, **kwargs):
+        identifiers.append(body["identifier"])
+        return {"code": 1, "data": {}}
+
+    monkeypatch.setattr(client, "_exchange_once", exchange)
+    client.car_login()
+    assert identifiers == [client.session.account_id]
+    assert not hasattr(client, "car_login_as")

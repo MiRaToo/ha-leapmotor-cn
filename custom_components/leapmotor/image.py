@@ -42,6 +42,15 @@ class LeapmotorParkingImage(LeapmotorEntity, ImageEntity):
     def image_last_updated(self):
         return self.coordinator.last_update_success and dt_util.utcnow() or None
 
+    @property
+    def extra_state_attributes(self):
+        data = self.coordinator.data or {}
+        uploaded = data.get("photo_upload_ms")
+        return {
+            "upload_time": dt_util.utc_from_timestamp(uploaded / 1000).isoformat() if uploaded else None,
+            "pending": bool(data.get("photo_pending")),
+        }
+
     async def async_image(self) -> bytes | None:
         url = (self.coordinator.data or {}).get("parking_url") or ""
         if not url:
@@ -56,7 +65,7 @@ class LeapmotorParkingImage(LeapmotorEntity, ImageEntity):
             self._cached_url, self._cached = url, data
             return data
         except Exception as err:  # noqa: BLE001
-            log.warning("下载驻车照片失败: %s", err)
+            log.warning("下载驻车照片失败: %s", type(err).__name__)
             return self._cached
 
 

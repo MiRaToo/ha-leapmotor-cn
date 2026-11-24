@@ -55,7 +55,7 @@ def context(tmp_path):
     functions += [node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)
                   and node.name == "_sync_call"]
     namespace = {"_sync_archive": lambda _: archive, "log": logging.getLogger(__name__),
-                 "coordinators": lambda _: {}, "valid_iana_timezone": lambda value: value}
+                 "coordinators": lambda _: {}}
     module = ast.Module(body=functions, type_ignores=[])
     exec(compile(module, str(WS_PATH), "exec",
                  flags=__future__.annotations.compiler_flag), namespace)

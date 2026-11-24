@@ -248,13 +248,16 @@ class SyncArchive:
         if kind not in ("trip","charge"): raise ValueError("invalid_format")
         c=self._c()
         with c:
+            old = c.execute("SELECT data,deleted FROM records WHERE vehicle_id=? AND kind=? AND record_id=?",
+                            (vid, kind, record_id)).fetchone()
+            if old and old["deleted"]:
+                return False
             linked = False
             if observation_id:
                 if not c.execute("SELECT 1 FROM observations WHERE vehicle_id=? AND observation_id=? AND deleted=0",(vid,observation_id)).fetchone(): raise ValueError("not_found")
                 ordinal=c.execute("SELECT COALESCE(MAX(ordinal),-1)+1 FROM record_observations WHERE vehicle_id=? AND kind=? AND record_id=?",(vid,kind,record_id)).fetchone()[0]
                 cur=c.execute("INSERT OR IGNORE INTO record_observations VALUES(?,?,?,?,?)",(vid,kind,record_id,observation_id,ordinal))
                 linked = bool(cur.rowcount)
-            old=c.execute("SELECT data FROM records WHERE vehicle_id=? AND kind=? AND record_id=?",(vid,kind,record_id)).fetchone()
             boundary={"source":"HA grouping hint","started_at_ms":started_at_ms,"ended_at_ms":ended_at_ms}
             if not linked and old:
                 previous=json.loads(old[0])
@@ -353,6 +356,23 @@ class SyncArchive:
                 "coverage":membership["coverage"],"observation_count":membership["observation_count"],
                 "snapshot_id":membership["snapshot_id"],"observation_ids":[row[0] for row in rows],
                 "next_page_token":token,"has_more":more}
+
+    def discard_trip_groups(self, vid, ids):
+        """Publish recorder-confirmed discards, preserving the underlying observations."""
+        self._require_vehicle(vid)
+        c = self._c()
+        with c:
+            for rid in ids:
+                row = c.execute(
+                    "SELECT deleted,data FROM records WHERE vehicle_id=? AND kind='trip' AND record_id=?",
+                    (vid, rid)).fetchone()
+                if row and (row["deleted"] or json.loads(row["data"]).get("phase") != "recording"):
+                    continue
+                data = _json({"record_id": rid, "kind": "trip"})
+                c.execute("INSERT INTO records VALUES(?,'trip',?,?,1) "
+                          "ON CONFLICT(vehicle_id,kind,record_id) DO UPDATE SET deleted=1",
+                          (vid, rid, data))
+                self._event(vid, "record.delete", rid, {"vehicle_id": vid, "kind": "trip"})
 
     def import_legacy(self, vid, kind, record_id, points, meta):
         """Idempotently import actually retained legacy points; never promote derived charge power."""

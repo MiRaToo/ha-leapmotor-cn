@@ -40,7 +40,7 @@ class MemoryStore:
     def async_delay_save(self, fn, _delay): self.data = fn()
 
 def recorder():
-    return ChargeRecorder(None, "TEST", 70, store=MemoryStore(), timezone="Asia/Hong_Kong")
+    return ChargeRecorder(None, "TEST", 70, store=MemoryStore(), timezone=ZONE)
 
 def test_dc_periods_split_at_boundaries_and_do_not_change_ac_or_overrides():
     tariff=validate_tariff({'peak_price':2,'valley_price':1,'ac_peak_price':.8,'ac_valley_price':.3,'efficiency':1,
@@ -70,7 +70,7 @@ def test_dc_periods_survive_storage_and_total_override():
     asyncio.run(rec.set_tariff({'efficiency':1,'dc_periods':[{'start':'00:00','end':'00:00','price':2}]}))
     ident=rec.sessions[0]['id'];rec.sessions[0]['charge_types']=['dc']
     asyncio.run(rec.set_session_price(ident,'total',5))
-    restored=ChargeRecorder(None,'TEST',70,store=rec._store,timezone='Asia/Hong_Kong');asyncio.run(restored.async_load())
+    restored=ChargeRecorder(None,'TEST',70,store=rec._store,timezone=ZONE);asyncio.run(restored.async_load())
     view=restored.view(now=T0+180)
     assert view['summary']['cost']==5 and view['sessions'][0]['cost']==5
     assert view['tariff']['dc_periods'][0]['price']==2
@@ -88,7 +88,7 @@ def test_ac_tariff_and_per_session_overrides_survive_reload():
     assert [r["cost"] for r in v["days"] if r["kwh"]>0]==[1.5,1.5]
     asyncio.run(rec.set_tariff({"peak_price":10,"ac_valley_price":8}))
     assert rec.view(now=at+180)["sessions"][0]["cost"]==3
-    other=ChargeRecorder(None,"TEST",70,store=rec._store,timezone="Asia/Hong_Kong");asyncio.run(other.async_load())
+    other=ChargeRecorder(None,"TEST",70,store=rec._store,timezone=ZONE);asyncio.run(other.async_load())
     assert other.view(now=at+180)["sessions"][0]["price_override"]=={"mode":"total","value":3}
     asyncio.run(other.set_session_price(ident,"unit",.9))
     assert other.view(now=at+180)["summary"]["cost"]==.2
@@ -256,7 +256,7 @@ def test_reprice_history_and_persist():
 
 def test_restart_ends_active_and_never_integrates_across_restart():
     rec=recorder();feed(rec,frame(T0),frame(T0+60))
-    other=ChargeRecorder(None,"TEST",70,store=rec._store,timezone="Asia/Hong_Kong")
+    other=ChargeRecorder(None,"TEST",70,store=rec._store,timezone=ZONE)
     asyncio.run(other.async_load())
     feed(other,frame(T0+120))
     v=other.view(now=T0+120)

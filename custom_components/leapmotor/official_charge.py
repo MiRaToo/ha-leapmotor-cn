@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+import hashlib
 import logging
 from typing import Any
 
@@ -206,84 +207,6 @@ def scale_intervals(intervals: list, official_kwh: float | None) -> tuple[list, 
     return scaled, official_kwh
 
 
-def vehicle_owner_account_id(vehicle: Any) -> str:
-    """从车辆列表条目里取出「车主账号 ID」。
-
-    实测 `/app/app-global-service/v1/vehicle/list` 的每辆车 raw 字段里有 `userid`
-    (= 车主 accountId; 共享车也一样), 另有 `mobileNumber`(车主手机号, 已打码)。
-    这里只取账号 ID —— 它是官方充电记录接口的实际作用域键。
-    """
-    raw = getattr(vehicle, "raw", None)
-    if not isinstance(raw, dict):
-        return ""
-    for key in ("userid", "userId", "ownerId", "ownerUserId", "carOwnerId"):
-        value = raw.get(key)
-        if value not in (None, ""):
-            return str(value)
-    return ""
-
-
-def is_shared_vehicle(vehicle: Any) -> bool:
-    """车辆是否由主账号共享给当前账号(车主账号 ≠ 当前账号)。"""
-    return str(getattr(vehicle, "source", "") or "") == "shared"
-
-
-def _base_client_class():
-    """集成内的 LeapmotorClient 类(测试里可能用别的模块路径导入)。"""
-    try:
-        from .api import LeapmotorClient as _C  # type: ignore
-    except ImportError:  # pytest 以裸模块名导入
-        from api_client import LeapmotorClient as _C  # type: ignore
-    return _C
-
-
-def make_owner_scope_client(client: Any, account_id: str | int,
-                            timeout: float | None = None) -> tuple[Any, dict]:
-    """构造一个**只读专用**的车端客户端: 用车主 accountId 交换独立 token。
-
-    关键点: 会话是**副本**(`dataclasses.replace`), 交换只发生在副本上, 主会话的
-    token/签名密钥完全不受影响。返回的 client 只应用于读官方充电记录。
-    """
-    from dataclasses import replace
-
-    base = getattr(client, "session", None)
-    if base is None:
-        return None, {"code": -1, "message": "缺少会话"}
-    try:
-        clone = replace(base)
-    except Exception as err:  # noqa: BLE001 - 会话不可复制时放弃, 不影响本地账本
-        return None, {"code": -1, "message": f"会话不可复制: {type(err).__name__}"}
-    clone.car_token = ""
-    clone.car_refresh_token = ""
-    clone.sign_param = {}
-    clone.encrypt_param = {}
-    clone.hkdf_key_hex = ""
-    clone.user_id = ""
-    scoped = None
-    for build in (
-        lambda: type(client)(clone, timeout=timeout if timeout is not None
-                             else getattr(client, "timeout", 20)),
-        lambda: type(client)(clone),
-        lambda: _base_client_class()(clone, timeout=timeout if timeout is not None
-                                     else getattr(client, "timeout", 20)),
-    ):
-        try:
-            scoped = build()
-            break
-        except TypeError:
-            continue
-    if scoped is None:
-        return None, {"code": -1, "message": "无法构造只读客户端"}
-    try:
-        resp = scoped.car_login_as(str(account_id))
-    except Exception as err:  # noqa: BLE001 - 读不到就用本地估算
-        return None, {"code": -1, "message": f"交换失败: {type(err).__name__}"}
-    data = resp.get("data") if isinstance(resp, dict) and isinstance(resp.get("data"), dict) else {}
-    if not data.get("accessToken"):
-        return None, resp if isinstance(resp, dict) else {"code": -1}
-    return scoped, resp
-
-
 def snapshot_is_invisible(snapshot: dict[str, Any] | None) -> bool:
     """同步结果是否"空但成功"(当前账号看不到车主充电记录)。"""
     if not isinstance(snapshot, dict) or snapshot.get("error"):
@@ -300,6 +223,13 @@ def snapshot_is_invisible(snapshot: dict[str, Any] | None) -> bool:
     return True
 
 
+def official_cache_scope(account_id: str, vin: str) -> str:
+    """Bind persisted evidence to the signed-in account without storing its identifier."""
+    if not account_id:
+        return ""
+    return hashlib.sha256(f"{vin.strip().upper()}:{account_id}".encode()).hexdigest()
+
+
 class OfficialChargeStore:
     """官方充电记录的持久缓存(逐笔明细 + 年度统计)。
 
@@ -309,13 +239,15 @@ class OfficialChargeStore:
 
     STORAGE_VERSION = 1
 
-    def __init__(self, hass: Any, vin: str, timezone: str = "Asia/Shanghai") -> None:
-        from homeassistant.helpers.storage import Store
+    def __init__(self, hass: Any, vin: str, *, account_scope: str, store: Any = None) -> None:
+        if store is None:
+            from homeassistant.helpers.storage import Store
+            store = Store(hass, self.STORAGE_VERSION, f"leapmotor_{vin}_official_charges")
 
         self.hass = hass
         self.vin = vin
-        self.timezone = timezone
-        self._store = Store(hass, self.STORAGE_VERSION, f"leapmotor_{vin}_official_charges")
+        self.account_scope = account_scope
+        self._store = store
         self.records: list[dict[str, Any]] = []
         self.year_stats: dict[int, dict[str, Any]] = {}
         self.fetched_at: float | None = None
@@ -325,6 +257,8 @@ class OfficialChargeStore:
 
     async def async_load(self) -> None:
         data = await self._store.async_load() or {}
+        if not self.account_scope or data.get("account_scope") != self.account_scope:
+            return
         records = data.get("records")
         self.records = [r for r in records if isinstance(r, dict) and r.get("key")] if isinstance(records, list) else []
         stats = data.get("year_stats")
@@ -344,6 +278,7 @@ class OfficialChargeStore:
 
     def _dump(self) -> dict[str, Any]:
         return {
+            "account_scope": self.account_scope,
             "records": self.records,
             "year_stats": {str(year): stat for year, stat in self.year_stats.items()},
             "fetched_at": self.fetched_at,
@@ -387,11 +322,13 @@ class OfficialChargeStore:
         self.fetched_at = float(snapshot.get("fetched_at") or 0) or None
         self.window = snapshot.get("window") if isinstance(snapshot.get("window"), dict) else self.window
         self.last_error = snapshot.get("error") if isinstance(snapshot.get("error"), str) else None
-        if invisible and has_cache:
+        if not self.account_scope or (invisible and has_cache):
             # 无权限/不可见: 保留上次的官方缓存, 不把"看不见"当成"没有充电"。
             self.available = False
             self._save()
-            return list(self.records)
+            return []
+        if self.available is False:
+            self.year_stats.clear()
         self.records = records
         for year, value in stats_in.items():
             try:
@@ -408,10 +345,10 @@ class OfficialChargeStore:
 
     # ---- 对外视图 ----
     def match(self, sessions: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-        return match_official_to_sessions(self.records, sessions)
+        return match_official_to_sessions(self.records, sessions) if self.available else {}
 
     def year_view(self, year: int | None = None) -> dict[str, Any] | None:
-        if not self.year_stats:
+        if not self.available or not self.year_stats:
             return None
         if year is None:
             year = max(self.year_stats)
@@ -428,9 +365,9 @@ class OfficialChargeStore:
             "fetched_at": self.fetched_at,
             "window": self.window,
             "last_error": self.last_error,
-            "record_count": len(self.records),
-            "records": list(self.records),
-            "years": {str(year): stat for year, stat in sorted(self.year_stats.items())},
+            "record_count": len(self.records) if self.available else 0,
+            "records": list(self.records) if self.available else [],
+            "years": {str(year): stat for year, stat in sorted(self.year_stats.items())} if self.available else {},
         }
 
 

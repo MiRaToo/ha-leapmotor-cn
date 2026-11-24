@@ -123,7 +123,10 @@ Each row contains `record_id`, `row_revision`, `change_seq`, `phase`, observed s
 milliseconds, charge type, SOC endpoints, peak/average power, energy, grid energy, and
 money.
 
-- Energy uses `basis=battery_vehicle_estimate` and `evidence=estimated` only when the
+- A matched official charging record uses `basis=official_charge_record`,
+  `evidence=reported` and `sources=["official"]`. Grid draw and charges still use
+  the local efficiency and tariff.
+- Local energy uses `basis=battery_vehicle_estimate` and `evidence=estimated` only when the
   HA recorder has an explicit power/SOC source. A known zero with a source stays zero;
   missing source/value remains null.
 - `phase=recording` or a partial recorder result has `energy.coverage=partial`, even

@@ -1,7 +1,6 @@
 """增程车逐日耗油估算：只用有效行车燃油量差值，不使用油量百分比或均值造日数据。"""
 from datetime import datetime
 import time
-from zoneinfo import ZoneInfo
 from .charging import number, MAX_GAP_SECONDS
 
 
@@ -10,7 +9,7 @@ class FuelDayRecorder:
         if store is None:
             from homeassistant.helpers.storage import Store
             store=Store(hass,1,f"leapmotor_{vin}_fuel_days")
-        self.store=store;self.timezone=ZoneInfo(timezone);self.days={};self.previous=None;self.seen=0
+        self.store=store;self.timezone=timezone;self.days={};self.previous=None;self.seen=0
 
     async def async_load(self):
         self.days=(await self.store.async_load() or {}).get("days",{})

@@ -24,7 +24,7 @@ import math
 import time
 from datetime import date, datetime, time as datetime_time, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger(__name__)
 
@@ -110,22 +110,10 @@ def parse_getec_day_v1(resp: Any) -> dict[str, float] | str | None:
     return {"driver": driver, "ac": ac, "other": other, "total": total}
 
 
-def valid_iana_timezone(value: Any) -> str | None:
-    if not isinstance(value, str) or not value or value != value.strip():
-        return None
-    try:
-        ZoneInfo(value)
-    except (ZoneInfoNotFoundError, ValueError):
-        return None
-    return value
-
-
-def day_windows_v1(days: int, time_zone: str, now: float | None = None) -> list[tuple[str, int, int]]:
+def day_windows_v1(days: int, zone: ZoneInfo, now: float | None = None) -> list[tuple[str, int, int]]:
     """HA-configured local calendar windows as closed integer-second ranges."""
-    zone_name = valid_iana_timezone(time_zone)
-    if zone_name is None or not isinstance(days, int) or days < 1 or days > 31:
+    if not isinstance(days, int) or days < 1 or days > 31:
         raise ValueError("invalid_format")
-    zone = ZoneInfo(zone_name)
     generated = int(time.time() if now is None else now)
     today = datetime.fromtimestamp(generated, zone).date()
     out: list[tuple[str, int, int]] = []
@@ -143,7 +131,8 @@ def day_windows_v1(days: int, time_zone: str, now: float | None = None) -> list[
 class DailyEnergyV1Store:
     """Isolated strict cache; old EnergyDayStore values are never promoted."""
 
-    def __init__(self, hass: Any, vin: str, store: Any = None) -> None:
+    def __init__(self, hass: Any, vin: str, store: Any = None, *, time_zone: str) -> None:
+        self.time_zone = time_zone
         self.vin = str(vin or "").strip().upper()
         if store is not None:
             self._store = store
@@ -188,7 +177,7 @@ class DailyEnergyV1Store:
             return False
         time_zone = value.get("time_zone")
         if (str(value.get("vin") or "").strip().upper() != self.vin
-                or value.get("day") != day or valid_iana_timezone(time_zone) is None
+                or value.get("day") != day or not isinstance(time_zone, str) or not time_zone
                 or not all(self._number(value.get(key))
                            for key in ("driver", "ac", "other", "total"))
                 or not all(self._integer(value.get(key))
@@ -210,7 +199,7 @@ class DailyEnergyV1Store:
 
     def record(self, day: str, parsed: dict[str, float], time_zone: str, start: int, end: int,
                now: float | None = None) -> None:
-        if (not self._valid_day(day) or valid_iana_timezone(time_zone) is None
+        if (not self._valid_day(day) or time_zone != self.time_zone
                 or not isinstance(parsed, dict)):
             raise ValueError("invalid_format")
         components = [parsed.get(key) for key in ("driver", "ac", "other")]
@@ -242,7 +231,7 @@ class DailyEnergyV1Store:
     def _cached(self, day: str, time_zone: str, start: int, end: int,
                 *, today: bool) -> dict | None:
         value = self._days.get(day)
-        if (not value or not self._valid_record(day, value)
+        if (time_zone != self.time_zone or not value or not self._valid_record(day, value)
                 or value.get("time_zone") != time_zone or value.get("start_ts") != start):
             return None
         if today:
@@ -351,12 +340,8 @@ def compose_days_v1(windows: list[tuple[str, int, int]], parsed_days: dict[str, 
 
 
 def trip_rows_by_windows_v1(trips: list[Any], windows: list[tuple[str, int, int]],
-                            time_zone: str) -> dict[str, dict[str, float | None]]:
+                            zone: ZoneInfo) -> dict[str, dict[str, float | None]]:
     """Bucket completed trips by HA-configured local day, with same-zone windows."""
-    zone_name = valid_iana_timezone(time_zone)
-    if zone_name is None:
-        raise ValueError("invalid_format")
-    zone = ZoneInfo(zone_name)
     ended: list[tuple[Any, int]] = []
     for trip in trips:
         value = getattr(trip, "ended_at", None)
