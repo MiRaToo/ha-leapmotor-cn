@@ -74,17 +74,26 @@ GitCode 同步仓库：
 https://gitcode.com/MiraRato/ha-leapmotor-cn
 ```
 
-### HACS 默认目录（推荐）
+### Marketplace / HACS 默认目录（推荐）
 
-本集成已收录到 HACS 默认目录，无需添加自定义仓库。
+本集成已收录到 Home Assistant Marketplace 与 HACS 共用的社区目录，无需添加自定义仓库。请按 Home Assistant Core 版本选择入口：
+
+**2026.11 及更新版本：[Marketplace](https://www.home-assistant.io/integrations/marketplace/#installing-a-repository)**
+
+1. 打开“设置 → Marketplace”，搜索 `ha-leapmotor-cn`，打开对应条目并点击“安装”。
+2. 安装后按弹出的配置向导登录。如果没有弹出向导，前往“设置 → 设备与服务 → 添加集成”，搜索“零跑汽车”。如果系统提示需要重启，先按提示重启。
+
+**2026.10 及更早版本：HACS**
 
 1. 打开 HACS，搜索 `ha-leapmotor-cn`，打开对应条目并点击“下载”。
 2. 下载完成后，重启 Home Assistant。
 3. 前往“设置 → 设备与服务 → 添加集成”，搜索“零跑汽车”并完成登录。
 
-如果暂时搜不到，请等 HACS 同步目录，或使用下方的自定义仓库方式。
+如果暂时搜不到，请等目录同步，或使用下方的手动安装方式。旧版 HACS 用户也可以使用自定义仓库方式。
 
 ### HACS 自定义仓库
+
+适用于 2026.10 及更早版本中已安装 HACS 的用户。2026.11 及更新版本请优先使用上方的 Marketplace 默认目录。
 
 1. 在 HACS 的集成页面添加[自定义仓库](https://github.com/MiRaToo/ha-leapmotor-cn)，类型选择“集成”。
 2. 下载“零跑汽车”并重启 Home Assistant。
