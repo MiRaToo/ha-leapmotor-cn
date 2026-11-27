@@ -61,6 +61,7 @@ log = logging.getLogger(__name__)
 
 RISK_COOLDOWN = 1023      # 环境疑似高风险(冷却中)
 SMS_TOO_OFTEN = 36        # 验证码发送频繁
+SMS_CODE_EXPIRED = 100116  # 验证码已过期(超过 5 分钟)
 
 
 class LeapmotorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -277,23 +278,31 @@ class LeapmotorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data=data,
         )
 
+    # ── 验证码: 输入 / 重新发送 ──
+    #
+    # 教训(别改回去): 「重新发送验证码」曾经是验证码表单里的一个勾选框, 而验证码字段是必填。
+    # 验证码超时后用户清空输入框、勾上勾选框再提交, 会被 HA 前端拦下
+    # (ui.panel.config.integrations.config_flow.not_all_required_fields),
+    # 请求根本到不了这里。HA 的配置表单只有一个提交按钮, 所以:
+    #   * 验证码字段必须是**可选**的 —— 留空提交 = 我要一条新验证码;
+    #   * 重发必须是**单独的一步**(菜单按钮), 不能塞回表单里。
+
+    def _code_form(self, errors: dict[str, str] | None = None,
+                   step_id: str = "code") -> ConfigFlowResult:
+        return self.async_show_form(
+            step_id=step_id,
+            data_schema=vol.Schema({vol.Optional(CONF_SMS_CODE): str}),
+            errors=errors or {},
+            description_placeholders={"phone": self._phone},
+        )
+
     async def async_step_code(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         errors: dict[str, str] = {}
-        if user_input is not None and user_input.get("resend"):
-            sess = Session(**self._session)
-            client = LeapmotorClient(sess)
-            try:
-                resp = await self.hass.async_add_executor_job(client.request_sms_code, self._phone)
-                if resp.get("code") != 200:
-                    errors["base"] = ("sms_too_often" if resp.get("code") == SMS_TOO_OFTEN
-                                      else "sms_failed")
-                    log.warning("重发验证码返回: %s", str(resp)[:200])
-            except Exception:  # noqa: BLE001
-                log.exception("重发验证码失败")
-                errors["base"] = "cannot_connect"
-            user_input = None
         if user_input is not None:
-            code = str(user_input[CONF_SMS_CODE]).strip()
+            code = str(user_input.get(CONF_SMS_CODE) or "").strip()
+            if not code:
+                # 没填验证码就提交 → 用户要的是重发(验证码过期/没收到), 直接给按钮。
+                return await self.async_step_code_resend()
             sess = Session(**self._session)
             client = LeapmotorClient(sess)
             try:
@@ -304,6 +313,10 @@ class LeapmotorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 r = {}
             if not errors:
                 if r.get("code") != 200 or not sess.token:
+                    if r.get("code") == SMS_CODE_EXPIRED:
+                        # 服务端明确说已过期: 直接进重发菜单, 不让用户重填一遍。
+                        log.info("验证码已过期, 进入重新发送菜单")
+                        return await self.async_step_code_resend()
                     errors["base"] = ("risk_cooldown" if r.get("code") == RISK_COOLDOWN
                                       else "invalid_auth")
                     log.warning("登录返回: %s", str(r)[:200])
@@ -362,15 +375,45 @@ class LeapmotorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         self._vehicles = available
                         return await self.async_step_vehicle()
 
-        return self.async_show_form(
-            step_id="code",
-            data_schema=vol.Schema({
-                vol.Required(CONF_SMS_CODE): str,
-                vol.Optional("resend", default=False): bool,
-            }),
-            errors=errors,
+        return self._code_form(errors)
+
+    async def async_step_code_resend(self,
+                                     user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """重发验证码菜单: 重发是单独按钮, 不需要先填验证码。"""
+        return self.async_show_menu(
+            step_id="code_resend",
+            menu_options=["resend", "code"],
             description_placeholders={"phone": self._phone},
         )
+
+    async def async_step_resend(self,
+                                user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """菜单里的「重新发送验证码」; 成功后停在验证码表单上。"""
+        sess = Session(**self._session)
+        client = LeapmotorClient(sess)
+        try:
+            resp = await self.hass.async_add_executor_job(client.request_sms_code, self._phone)
+        except Exception:  # noqa: BLE001
+            log.exception("重新发送验证码失败")
+            return self._code_form({"base": "cannot_connect"})
+        status = resp.get("code")
+        if status == 200:
+            log.info("已重新发送验证码")
+            return self._code_form(step_id="code_resent")
+        log.warning("重新发送验证码返回: %s", str(resp)[:200])
+        if status == RISK_COOLDOWN:
+            return self._code_form({"base": "risk_cooldown"})
+        if status == SMS_TOO_OFTEN:
+            return self._code_form({"base": "sms_too_often"})
+        return self._code_form({"base": "sms_failed"})
+
+    async def async_step_code_resent(self,
+                                     user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """重发成功后的验证码表单(文案不同), 提交后走正常校验。"""
+        if user_input is None:
+            return self._code_form(step_id="code_resent")
+        return await self.async_step_code(user_input)
+
     # ── 重新认证: 账号 token(约 6 小时)过期后, HA 会弹出「重新认证」 ──
     async def async_step_reauth(self, entry_data: dict[str, Any]) -> ConfigFlowResult:
         """重新登录: 手机号已知, 直接发验证码, 用户只填 6 位数字即可。

@@ -18,16 +18,30 @@
       },
       "code": {
         "title": "Enter SMS code",
-        "description": "A code was sent to {phone} and is **valid for 5 minutes**.\n\nExpired or never arrived? Tick “Resend code” below and submit again.",
+        "description": "A code was sent to {phone} and is **valid for 5 minutes**.\n\nExpired or never arrived? Leave the code empty and submit, then choose “Resend code” — no need to restart the flow.",
         "data": {
-          "sms_code": "Code",
-          "resend": "Resend code"
+          "sms_code": "Code"
+        }
+      },
+      "code_resend": {
+        "title": "Resend SMS code",
+        "description": "A code was sent to {phone} and is **valid for 5 minutes**.\n\nResending sends a new SMS immediately and invalidates the previous code.",
+        "menu_options": {
+          "resend": "Resend code",
+          "code": "Back to code entry"
+        }
+      },
+      "code_resent": {
+        "title": "Enter SMS code",
+        "description": "A new code was sent to {phone} and is **valid for 5 minutes**.",
+        "data": {
+          "sms_code": "Code"
         }
       }
     },
     "error": {
       "cannot_connect": "Network error, please retry",
-      "invalid_auth": "Wrong or expired code (valid 5 minutes). Tick “Resend code” and submit again.",
+      "invalid_auth": "Wrong code. Re-enter it; if the code expired, leave it empty and submit to resend.",
       "risk_cooldown": "Account flagged by risk control (1023). Wait 30+ minutes silently; retrying extends the cooldown",
       "sms_too_often": "SMS requested too often (36), retry in a few minutes",
       "sms_failed": "Failed to request SMS code, see logs",
